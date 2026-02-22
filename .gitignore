@@ -1,0 +1,20 @@
+# Database
+products.db
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# Ignore SQLite database
+*.db
+
+# Ignore environment files
+.env
+categories_with_embeddings.csv 
+category_embeddings.pkl 
+*.db 
+*.pkl 
+__pycache__/ 
+env/ 
+.venv/ 
+.env 
