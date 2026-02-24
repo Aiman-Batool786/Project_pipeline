@@ -59,11 +59,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # Set environment secrets
-      - name: Set environment variables
+      # Set OpenAI API key (single-line secret)
+      - name: Set OpenAI API key
         run: |
           echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> $GITHUB_ENV
-          echo "GCP_SA_KEY=${{ secrets.GCP_SA_KEY }}" >> $GITHUB_ENV
 
       # Deploy via SSH to your VM
       - name: Deploy to VM via SSH
@@ -87,7 +86,7 @@ jobs:
             pip install --upgrade pip
             pip install -r requirements.txt
 
-            # Set OpenAI API key and GCP key for this session
+            # Set OpenAI API key and write GCP key to file
             export OPENAI_API_KEY=${OPENAI_API_KEY}
             echo "$GCP_SA_KEY" > gcp-service-account.json
             export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/gcp-service-account.json"
