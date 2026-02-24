@@ -86,6 +86,8 @@ jobs:
             nohup /home/aimanbatool114/Project_pipeline/env/bin/python -m uvicorn main:app \
               --host 0.0.0.0 \
               --port 8686 \
+              --log-level info \
+              --access-log \
               > uvicorn.log 2>&1 &
 
             NEW_PID=$!
@@ -93,4 +95,4 @@ jobs:
             disown
 
             echo "Deployment complete. New uvicorn started with PID $NEW_PID"
-            echo "Check logs: tail -f uvicorn.log"
+            echo "Check all logs (requests + info + errors): tail -f uvicorn.log"
