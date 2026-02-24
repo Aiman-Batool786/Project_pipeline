@@ -1,4 +1,4 @@
-name:  CI/CD Pipeline
+name: CI/CD Pipeline
 
 on:
   push:
@@ -37,7 +37,6 @@ jobs:
         run: |
           echo "No tests yet"
 
-
   # -----------------------------
   # Step 2: Deploy to VM
   # -----------------------------
@@ -59,6 +58,12 @@ jobs:
       # Install dependencies
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # Set environment secrets
+      - name: Set environment variables
+        run: |
+          echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> $GITHUB_ENV
+          echo "GCP_SA_KEY=${{ secrets.GCP_SA_KEY }}" >> $GITHUB_ENV
 
       # Deploy via SSH to your VM
       - name: Deploy to VM via SSH
@@ -82,8 +87,10 @@ jobs:
             pip install --upgrade pip
             pip install -r requirements.txt
 
-            # Set OpenAI API key safely
-            export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            # Set OpenAI API key and GCP key for this session
+            export OPENAI_API_KEY=${OPENAI_API_KEY}
+            echo "$GCP_SA_KEY" > gcp-service-account.json
+            export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/gcp-service-account.json"
 
             # Stop any running FastAPI process
             pkill -f "uvicorn main:app" || true
