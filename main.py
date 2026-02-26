@@ -1,5 +1,7 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
 from scraper import get_product_info
 from utils import clean_text
 from openai_client import improve_product_content
@@ -9,99 +11,276 @@ from db import create_table, insert_product, create_categories_table
 import json
 import uvicorn
 import os
+import sqlite3
 
-app = FastAPI(title="AliExpress Product AI Enhancer")
+
+# =============================
+# FastAPI App Initialization
+# =============================
+
+app = FastAPI(
+    title="AliExpress Product AI Enhancer",
+    version="1.0"
+)
 
 
-#  Run at startup
+# =============================
+# CORS FIX (IMPORTANT)
+# =============================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =============================
+# Startup Event
+# =============================
+
 @app.on_event("startup")
 def startup():
-    create_table()
-    create_categories_table()
-    print("Database ready")
+
+    print("Starting server...")
+
+    try:
+
+        create_table()
+
+        create_categories_table()
+
+        print("Database ready")
+
+    except Exception as e:
+
+        print("Database error:", e)
 
 
-#  Root path
+# =============================
+# Root Endpoint
+# =============================
+
 @app.get("/")
 def root():
-    return {"message": "FastAPI Product AI Enhancer is running!"}
+
+    return {
+
+        "status": "running",
+
+        "message": "FastAPI Product AI Enhancer is running"
+
+    }
 
 
-#  Request model
+# =============================
+# Request Model
+# =============================
+
 class ProductRequest(BaseModel):
+
     url: str
 
 
-#  MAIN API
+# =============================
+# MAIN API
+# =============================
+
 @app.post("/generate-product")
 def generate_product(req: ProductRequest):
-    try:
-        data = get_product_info(req.url)
-        if not data:
-            return {"error": "Scraping failed"}
 
-        original_title = clean_text(data["title"])
-        original_description = clean_text(data["description"])
+    try:
+
+        print("Processing URL:", req.url)
+
+
+        # Step 1: Scrape
+
+        data = get_product_info(req.url)
+
+        if not data:
+
+            return {
+
+                "success": False,
+
+                "error": "Scraping failed (CAPTCHA or blocked)"
+
+            }
+
+
+        # Step 2: Clean text
+
+        original_title = clean_text(data.get("title", ""))
+
+        original_description = clean_text(data.get("description", ""))
+
+
+        # Step 3: Improve with OpenAI
 
         improved = improve_product_content(
+
             original_title,
+
             original_description
+
         )
+
+
         if not improved:
-            return {"error": "OpenAI failed"}
+
+            return {
+
+                "success": False,
+
+                "error": "OpenAI improvement failed"
+
+            }
+
+
+        # Step 4: Assign category
 
         category = assign_category(
+
             improved["title"],
+
             improved["description"]
+
         )
+
+
+        # Step 5: Save in DB
 
         insert_product(
+
             (
+
                 req.url,
+
                 original_title,
+
                 original_description,
+
                 improved["title"],
+
                 improved["description"],
+
                 json.dumps(improved["bullet_points"]),
+
                 category["category_id"],
+
                 category["category_name"],
+
                 category["confidence"]
+
             )
+
         )
 
+
+        # Step 6: Return response
+
         return {
-            "saved": True,
+
+            "success": True,
+
             "url": req.url,
+
             "original": {
+
                 "title": original_title,
+
                 "description": original_description
+
             },
+
             "enhanced": {
+
                 "title": improved["title"],
+
                 "description": improved["description"],
+
                 "bullet_points": improved["bullet_points"]
+
             },
+
             "category": category
+
+        }
+
+
+    except Exception as e:
+
+        print("API ERROR:", e)
+
+        return {
+
+            "success": False,
+
+            "error": str(e)
+
+        }
+
+
+# =============================
+# View saved products
+# =============================
+
+@app.get("/products")
+def view_products():
+
+    try:
+
+        conn = sqlite3.connect("products.db")
+
+        conn.row_factory = sqlite3.Row
+
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT * FROM products")
+
+        rows = cursor.fetchall()
+
+        conn.close()
+
+        return {
+
+            "success": True,
+
+            "count": len(rows),
+
+            "products": [dict(row) for row in rows]
+
         }
 
     except Exception as e:
-        return {"error": str(e)}
 
+        return {
 
-#  View saved products
-@app.get("/products")
-def view_products():
-    import sqlite3
-    conn = sqlite3.connect("products.db")
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products")
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
+            "success": False,
 
+            "error": str(e)
+
+        }
+
+# =============================
+# Run Server
+# =============================
 
 if __name__ == "__main__":
-    # Get port from environment variable, default to 8686
+
     port = int(os.environ.get("PORT", 8686))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    uvicorn.run(
+
+        app,
+
+        host="0.0.0.0",
+
+        port=port,
+
+        reload=True
+
+    )
