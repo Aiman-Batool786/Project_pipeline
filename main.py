@@ -17,13 +17,14 @@ from db import create_table, insert_product, create_categories_table
 # ==============================
 app = FastAPI(title="AliExpress Product AI Enhancer")
 
-# CORS middleware (fixes Swagger / browser errors)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # allow all origins
+    allow_origins=["*"],             # or ["http://34.10.186.46:8686", "*"]
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=600,
 )
 
 # ==============================
@@ -59,7 +60,7 @@ def generate_product(req: ProductRequest):
         # Step 1: Scrape
         data = get_product_info(req.url)
         if not data:
-            return {"success": False, "error": "Scraping failed (CAPTCHA or blocked)"}
+            return {"success": False, "error": "Scraping failed"}
 
         # Step 2: Clean text
         original_title = clean_text(data.get("title", ""))
