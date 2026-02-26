@@ -1,5 +1,4 @@
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 import random
 
 
@@ -20,7 +19,9 @@ def get_product_info(url):
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
-                    "--disable-dev-shm-usage"
+                    "--disable-dev-shm-usage",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process"
                 ]
 
             )
@@ -36,42 +37,42 @@ def get_product_info(url):
 
                 locale="en-US",
 
-                timezone_id="Asia/Karachi"
+                timezone_id="Asia/Karachi",
+
+                java_script_enabled=True
 
             )
 
             page = context.new_page()
 
-
-            # ✅ APPLY STEALTH HERE
-            stealth_sync(page)
-
-
             print("Opening URL:", url)
-
 
             page.goto(
 
                 url,
 
-                timeout=90000
+                timeout=90000,
+
+                wait_until="networkidle"
 
             )
 
 
-            page.wait_for_timeout(8000)
+            # wait for page fully load
+            page.wait_for_timeout(7000)
 
 
+            # scroll to load everything
             page.mouse.wheel(0, 3000)
 
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(3000)
 
 
-            # DEBUG
+            # SAVE DEBUG SCREENSHOT
             page.screenshot(path="debug.png")
 
 
-            # CAPTCHA CHECK
+            # CHECK CAPTCHA
             if "captcha" in page.url.lower():
 
                 print("CAPTCHA detected")
@@ -84,41 +85,48 @@ def get_product_info(url):
             # TITLE
             title = ""
 
-            if page.locator("h1").count() > 0:
+            if page.locator('h1[data-pl="product-title"]').count() > 0:
 
-                title = page.locator("h1").first.inner_text()
+                title = page.locator(
+                    'h1[data-pl="product-title"]'
+                ).first.inner_text()
 
 
             # IMAGE
             image = ""
 
-            if page.locator("img").count() > 0:
+            if page.locator('img[src*="alicdn"]').count() > 0:
 
-                image = page.locator("img").first.get_attribute("src")
+                image = page.locator(
+                    'img[src*="alicdn"]'
+                ).first.get_attribute("src")
 
 
-            # DESCRIPTION
+            # DESCRIPTION FROM IFRAME
             description = ""
 
             for frame in page.frames:
 
-                try:
+                if "description" in frame.url:
 
-                    text = frame.locator("body").inner_text()
+                    try:
 
-                    if len(text) > 200:
-
-                        description = text
+                        description = frame.locator("body").inner_text()
 
                         break
 
-                except:
+                    except:
+                        pass
 
-                    pass
 
+            # BULLET POINTS
+            bullet_points = []
 
-            # BULLETS
-            bullet_points = page.locator("ul li").all_text_contents()[:5]
+            bullets = page.locator("ul li").all_text_contents()
+
+            if bullets:
+
+                bullet_points = bullets[:5]
 
 
             browser.close()
@@ -126,7 +134,7 @@ def get_product_info(url):
 
             if title == "":
 
-                print("Blocked by AliExpress")
+                print("Scraping blocked")
 
                 return None
 
