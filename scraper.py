@@ -1,4 +1,5 @@
 from playwright.sync_api import sync_playwright
+import random
 
 
 def get_product_info(url):
@@ -10,25 +11,35 @@ def get_product_info(url):
             browser = p.chromium.launch(
 
                 headless=True,
-                proxy={"server": "socks5://127.0.0.1:9050"},
+
+                proxy={
+                    "server": "socks5://127.0.0.1:9050"
+                },
 
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
-                    "--disable-dev-shm-usage"
+                    "--disable-dev-shm-usage",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process"
                 ]
 
             )
 
             context = browser.new_context(
 
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+                user_agent=random.choice([
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/119 Safari/537.36"
+                ]),
 
                 viewport={"width": 1366, "height": 768},
 
                 locale="en-US",
 
-                timezone_id="Asia/Karachi"
+                timezone_id="Asia/Karachi",
+
+                java_script_enabled=True
 
             )
 
@@ -40,55 +51,91 @@ def get_product_info(url):
 
                 url,
 
-                timeout=60000,
+                timeout=90000,
 
-                wait_until="domcontentloaded"
+                wait_until="networkidle"
 
             )
 
-            # simulate human behaviour
+
+            # wait for page fully load
+            page.wait_for_timeout(7000)
+
+
+            # scroll to load everything
+            page.mouse.wheel(0, 3000)
+
             page.wait_for_timeout(3000)
 
-            page.mouse.move(200, 300)
 
-            page.mouse.wheel(0, 2000)
-
-            page.wait_for_timeout(3000)
+            # SAVE DEBUG SCREENSHOT
+            page.screenshot(path="debug.png")
 
 
-            # safer title extraction
+            # CHECK CAPTCHA
+            if "captcha" in page.url.lower():
+
+                print("CAPTCHA detected")
+
+                browser.close()
+
+                return None
+
+
+            # TITLE
             title = ""
 
-            if page.locator("h1").count() > 0:
+            if page.locator('h1[data-pl="product-title"]').count() > 0:
 
-                title = page.locator("h1").first.inner_text()
-
-
-            # description extraction
-            paragraphs = page.locator("p").all_text_contents()
-
-            description = " ".join(paragraphs[:5]) if paragraphs else ""
+                title = page.locator(
+                    'h1[data-pl="product-title"]'
+                ).first.inner_text()
 
 
-            # bullet points
-            bullets = page.locator("li").all_text_contents()
-
-            bullet_points = bullets[:5] if bullets else []
-
-
-            # image
+            # IMAGE
             image = ""
 
-            if page.locator("img").count() > 0:
+            if page.locator('img[src*="alicdn"]').count() > 0:
 
-                image = page.locator("img").first.get_attribute("src")
+                image = page.locator(
+                    'img[src*="alicdn"]'
+                ).first.get_attribute("src")
+
+
+            # DESCRIPTION FROM IFRAME
+            description = ""
+
+            for frame in page.frames:
+
+                if "description" in frame.url:
+
+                    try:
+
+                        description = frame.locator("body").inner_text()
+
+                        break
+
+                    except:
+                        pass
+
+
+            # BULLET POINTS
+            bullet_points = []
+
+            bullets = page.locator("ul li").all_text_contents()
+
+            if bullets:
+
+                bullet_points = bullets[:5]
 
 
             browser.close()
 
 
             if title == "":
-                print("Login page detected or scraping blocked")
+
+                print("Scraping blocked")
+
                 return None
 
 
@@ -107,8 +154,6 @@ def get_product_info(url):
 
     except Exception as e:
 
-        print("Scraping failed for URL:", url)
-
-        print("Error:", e)
+        print("SCRAPER ERROR:", e)
 
         return None
