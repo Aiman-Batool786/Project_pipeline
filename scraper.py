@@ -31,23 +31,13 @@ def get_product_info(url):
             page.wait_for_timeout(3000)
             # safer title extraction
             
-           # Scroll to description tab
-if page.locator("a[href='#nav-description']").count() > 0:
-    page.locator("a[href='#nav-description']").click()
-    page.wait_for_timeout(3000)
-
-# Title
-title = ""
-title_locator = page.locator('h1[data-pl="product-title"]')
-if title_locator.count() > 0:
-    title = title_locator.first.inner_text().strip()
-
-# Description
-description = ""
-if page.locator("#nav-description").count() > 0:
-    desc_section = page.locator("#nav-description")
-    paragraphs = desc_section.locator("p").all_text_contents()
-    description = " ".join([p.strip() for p in paragraphs if p.strip()])
+         # safer title extraction
+            title = ""
+            if page.locator("h1").count() > 0:
+                title = page.locator("h1").first.inner_text()
+            # description extraction
+            paragraphs = page.locator("p").all_text_contents()
+            description = " ".join(paragraphs[:5]) if paragraphs else ""
 
         # bullet points
             bullets = page.locator("li").all_text_contents()
