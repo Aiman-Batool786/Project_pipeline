@@ -7,10 +7,12 @@ def get_product_info(url):
 
         with sync_playwright() as p:
 
+            print("[scraper] Launching browser...")
+
             browser = p.chromium.launch(
 
                 headless=True,
-                proxy={"server": "socks5://127.0.0.1:9050"},  # Tor proxy (unchanged)
+                proxy={"server": "socks5://127.0.0.1:9050"},
 
                 args=[
                     "--disable-blink-features=AutomationControlled",
@@ -20,19 +22,18 @@ def get_product_info(url):
 
             )
 
+            print("[scraper] Browser launched OK")
+
             context = browser.new_context(
 
-                # FIX 1: Updated Chrome version (115 is 2 years old, gets flagged)
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 
                 viewport={"width": 1366, "height": 768},
 
                 locale="en-US",
 
-                # FIX 2: Timezone now matches en-US locale (Karachi + en-US = bot signal)
                 timezone_id="America/New_York",
 
-                # FIX 3: Added real browser headers (missing headers = bot signal)
                 extra_http_headers={
                     "Accept-Language": "en-US,en;q=0.9",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -41,7 +42,6 @@ def get_product_info(url):
 
             )
 
-            # FIX 4: Mask navigator.webdriver (the #1 thing bot detectors check)
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 window.chrome = { runtime: {} };
@@ -51,7 +51,7 @@ def get_product_info(url):
 
             page = context.new_page()
 
-            print("Opening URL:", url)
+            print("[scraper] Navigating to:", url)
 
             page.goto(
 
@@ -59,14 +59,14 @@ def get_product_info(url):
 
                 timeout=60000,
 
-                # FIX 5: networkidle instead of domcontentloaded
-                # AliExpress is JS-rendered — domcontentloaded fires before
-                # product data loads. networkidle waits for JS to finish.
                 wait_until="networkidle"
 
             )
 
-            # simulate human behaviour (unchanged)
+            print("[scraper] Page loaded. Current URL:", page.url)
+            print("[scraper] Page title tag:", page.title())
+
+            # simulate human behaviour
             page.wait_for_timeout(3000)
 
             page.mouse.move(200, 300)
@@ -75,42 +75,48 @@ def get_product_info(url):
 
             page.wait_for_timeout(3000)
 
+            # DEBUG: Print first 500 chars of page body to see what actually loaded
+            try:
+                body_text = page.locator("body").inner_text()
+                print("[scraper] Body preview (first 500 chars):")
+                print(body_text[:500])
+                print("[scraper] ---")
+            except Exception as body_err:
+                print("[scraper] Could not read body:", body_err)
 
-            # safer title extraction (unchanged)
+            # title extraction
             title = ""
 
-            if page.locator("h1").count() > 0:
+            h1_count = page.locator("h1").count()
+            print(f"[scraper] h1 elements found: {h1_count}")
+
+            if h1_count > 0:
 
                 title = page.locator("h1").first.inner_text()
+                print("[scraper] Title extracted:", title[:100])
 
-
-            # description extraction (unchanged)
+            # description extraction
             paragraphs = page.locator("p").all_text_contents()
 
             description = " ".join(paragraphs[:5]) if paragraphs else ""
 
-
-            # bullet points (unchanged)
+            # bullet points
             bullets = page.locator("li").all_text_contents()
 
             bullet_points = bullets[:5] if bullets else []
 
-
-            # image (unchanged)
+            # image
             image = ""
 
             if page.locator("img").count() > 0:
 
                 image = page.locator("img").first.get_attribute("src")
 
-
             browser.close()
 
-
             if title == "":
-                print("Login page detected or scraping blocked")
+                print("[scraper] BLOCKED: title is empty - likely CAPTCHA or login wall")
                 return None
-
 
             return {
 
@@ -127,7 +133,6 @@ def get_product_info(url):
 
     except Exception as e:
 
-        print("Scraping failed for URL:", url)
-        print("Error:", e)
-
+        print(f"[scraper] EXCEPTION TYPE: {type(e).__name__}")
+        print(f"[scraper] EXCEPTION MESSAGE: {e}")
         return None
