@@ -8,7 +8,7 @@ def get_product_info(url):
             browser = p.chromium.launch(
                 headless=True,
                 # 🔴 Disable proxy for now (Tor causes timeout)
-                # proxy={"server": "socks5://127.0.0.1:9050"},
+                proxy={"server": "socks5://127.0.0.1:9050"},
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
