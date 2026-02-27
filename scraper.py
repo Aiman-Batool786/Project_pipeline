@@ -1,4 +1,8 @@
- from playwright.sync_api import sync_playwright
+this is my original code:
+ 
+i just update 2 things so give me output of two things
+ 
+from playwright.sync_api import sync_playwright
 def get_product_info(url):
     try:
         with sync_playwright() as p:
@@ -30,16 +34,13 @@ def get_product_info(url):
             page.mouse.wheel(0, 2000)
             page.wait_for_timeout(3000)
             # safer title extraction
-            
-         # safer title extraction
-            title = ""
-            if page.locator("h1").count() > 0:
-                title = page.locator("h1").first.inner_text()
-            # description extraction
-            paragraphs = page.locator("p").all_text_contents()
-            description = " ".join(paragraphs[:5]) if paragraphs else ""
-
-        # bullet points
+            title = ""
+            if page.locator("h1").count() > 0:
+                title = page.locator("h1").first.inner_text()
+            # description extraction
+            paragraphs = page.locator("p").all_text_contents()
+            description = " ".join(paragraphs[:5]) if paragraphs else ""
+            # bullet points
             bullets = page.locator("li").all_text_contents()
             bullet_points = bullets[:5] if bullets else []
             # image
