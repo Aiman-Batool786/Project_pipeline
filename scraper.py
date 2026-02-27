@@ -22,33 +22,15 @@ def get_product_info(url):
 
             context = browser.new_context(
 
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
 
                 viewport={"width": 1366, "height": 768},
 
                 locale="en-US",
 
-                timezone_id="America/New_York",
-
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "Referer": "https://www.google.com/",
-                }
+                timezone_id="Asia/Karachi"
 
             )
-
-            context.add_cookies([
-                {"name": "aep_usuc_f", "value": "site=glo&c_tp=USD&region=US&b_locale=en_US", "domain": ".aliexpress.com", "path": "/"},
-                {"name": "intl_locale", "value": "en_US", "domain": ".aliexpress.com", "path": "/"},
-            ])
-
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            """)
 
             page = context.new_page()
 
@@ -58,7 +40,7 @@ def get_product_info(url):
 
                 url,
 
-                timeout=120000,
+                timeout=60000,
 
                 wait_until="domcontentloaded"
 
@@ -74,48 +56,27 @@ def get_product_info(url):
             page.wait_for_timeout(3000)
 
 
-            # CHANGE 1: Title from data-pl="product-title" attribute
+            # safer title extraction
             title = ""
 
-            if page.locator("[data-pl='product-title']").count() > 0:
-                title = page.locator("[data-pl='product-title']").first.inner_text().strip()
+            if page.locator("h1").count() > 0:
 
-            # Fallback to h1 if data-pl not found
-            if not title and page.locator("h1").count() > 0:
-                title = page.locator("h1").first.inner_text().strip()
+                title = page.locator("h1").first.inner_text()
 
 
-            # CHANGE 2: Description by clicking nav Description link then fetching content
-            description = ""
+            # description extraction
+            paragraphs = page.locator("p").all_text_contents()
 
-            try:
-                # Click the Description link in the nav bar
-                desc_link = page.locator("a[href='#nav-description']")
-                if desc_link.count() > 0:
-                    desc_link.first.click()
-                    page.wait_for_timeout(2000)
-
-                # Fetch content from the description section
-                desc_section = page.locator("#nav-description")
-                if desc_section.count() > 0:
-                    description = desc_section.first.inner_text(timeout=5000).strip()[:2000]
-
-            except Exception as e:
-                print("Description section error:", e)
-
-            # Fallback to paragraphs if description section not found
-            if not description:
-                paragraphs = page.locator("p").all_text_contents()
-                description = " ".join(paragraphs[:5]) if paragraphs else ""
+            description = " ".join(paragraphs[:5]) if paragraphs else ""
 
 
-            # bullet points (unchanged)
+            # bullet points
             bullets = page.locator("li").all_text_contents()
 
             bullet_points = bullets[:5] if bullets else []
 
 
-            # image (unchanged)
+            # image
             image = ""
 
             if page.locator("img").count() > 0:
