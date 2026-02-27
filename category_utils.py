@@ -76,6 +76,16 @@ def assign_category(title, description):
             "confidence": 0.0
         }
 
+    # FIX 3: Reject homepage/blocked page titles
+    blocked_titles = ["aliexpress", "aliexpress.com", "just a moment", "attention required"]
+    if title.strip().lower() in blocked_titles:
+        print(f"[category] WARNING: Title looks like a blocked page: '{title}'")
+        return {
+            "category_id": 0,
+            "category_name": "Uncategorized",
+            "confidence": 0.0
+        }
+
     product_embedding = get_embedding(product_text)
 
     sims = cosine_similarity(
