@@ -4,7 +4,6 @@ from pydantic import BaseModel
 import json
 import sqlite3
 import os
-
 # Import your scraper and utils
 from scraper import get_product_info
 from utils import clean_text
@@ -55,24 +54,19 @@ class ProductRequest(BaseModel):
 def generate_product(req: ProductRequest):
     try:
         print("Processing URL:", req.url)
-
         # Step 1: Scrape
         data = get_product_info(req.url)
         if not data:
             return {"success": False, "error": "Scraping failed"}
-
         # Step 2: Clean text
         original_title = clean_text(data.get("title", ""))
         original_description = clean_text(data.get("description", ""))
-
         # Step 3: Improve with OpenAI
         improved = improve_product_content(original_title, original_description)
         if not improved:
             return {"success": False, "error": "OpenAI improvement failed"}
-
         # Step 4: Assign category
         category = assign_category(improved["title"], improved["description"])
-
         # Step 5: Save in DB
         insert_product((
             req.url,
@@ -85,20 +79,14 @@ def generate_product(req: ProductRequest):
             category["category_name"],
             category["confidence"]
         ))
-
         # Step 6: Return response
         return {
             "success": True,
             "url": req.url,
             "original": {"title": original_title, "description": original_description},
-            "enhanced": {
-                "title": improved["title"],
-                "description": improved["description"],
-                "bullet_points": improved["bullet_points"]
-            },
+            "enhanced": {"title": improved["title"], "description": improved["description"], "bullet_points": improved["bullet_points"]},
             "category": category
         }
-
     except Exception as e:
         print("ERROR:", e)
         return {"error": str(e)}
