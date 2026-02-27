@@ -4,17 +4,23 @@ from pydantic import BaseModel
 import json
 import sqlite3
 import os
-# Import your scraper and utils
+from openai import OpenAI
+from dotenv import load_dotenv
+
 from scraper import get_product_info
 from utils import clean_text
 from openai_client import improve_product_content
 from category_utils import assign_category
 from db import create_table, insert_product, create_categories_table
 
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 # ==============================
 # Initialize app
 # ==============================
 app = FastAPI(title="AliExpress Product AI Enhancer")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,7 +32,7 @@ app.add_middleware(
 )
 
 # ==============================
-# Startup: Create DB tables
+# Startup
 # ==============================
 @app.on_event("startup")
 def startup():
@@ -35,7 +41,7 @@ def startup():
     print("Database ready")
 
 # ==============================
-# Root endpoint
+# Root
 # ==============================
 @app.get("/")
 def root():
@@ -48,26 +54,63 @@ class ProductRequest(BaseModel):
     url: str
 
 # ==============================
+# Enhanced category via OpenAI
+# ==============================
+def get_enhanced_category(title: str, description: str, raw_category: str) -> str:
+    try:
+        prompt = f"""Given this product:
+Title: {title}
+Description: {description[:300]}
+Current Category: {raw_category}
+
+Return a short, clean, human-readable category name (max 5 words).
+Return ONLY the category name, nothing else. No quotes, no punctuation."""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=20
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print("Enhanced category error:", e)
+        return raw_category
+
+# ==============================
 # Main API
 # ==============================
 @app.post("/generate-product")
 def generate_product(req: ProductRequest):
     try:
         print("Processing URL:", req.url)
+
         # Step 1: Scrape
         data = get_product_info(req.url)
         if not data:
             return {"success": False, "error": "Scraping failed"}
-        # Step 2: Clean text
+
+        # Step 2: Clean
         original_title = clean_text(data.get("title", ""))
         original_description = clean_text(data.get("description", ""))
+
         # Step 3: Improve with OpenAI
         improved = improve_product_content(original_title, original_description)
         if not improved:
             return {"success": False, "error": "OpenAI improvement failed"}
-        # Step 4: Assign category
+
+        # Step 4: Assign category from embeddings
         category = assign_category(improved["title"], improved["description"])
-        # Step 5: Save in DB
+
+        # Step 5: Enhanced category via OpenAI
+        enhanced_category = get_enhanced_category(
+            improved["title"],
+            improved["description"],
+            category["category_name"]
+        )
+        print("Enhanced category:", enhanced_category)
+
+        # Step 6: Save to DB
         insert_product((
             req.url,
             original_title,
@@ -77,22 +120,37 @@ def generate_product(req: ProductRequest):
             json.dumps(improved["bullet_points"]),
             category["category_id"],
             category["category_name"],
-            category["confidence"]
+            category["confidence"],
+            enhanced_category
         ))
-        # Step 6: Return response
+
+        # Step 7: Return
         return {
             "success": True,
             "url": req.url,
-            "original": {"title": original_title, "description": original_description},
-            "enhanced": {"title": improved["title"], "description": improved["description"], "bullet_points": improved["bullet_points"]},
-            "category": category
+            "original": {
+                "title": original_title,
+                "description": original_description
+            },
+            "enhanced": {
+                "title": improved["title"],
+                "description": improved["description"],
+                "bullet_points": improved["bullet_points"]
+            },
+            "category": {
+                "category_id": category["category_id"],
+                "category_name": category["category_name"],
+                "confidence": category["confidence"],
+                "enhanced_category": enhanced_category
+            }
         }
+
     except Exception as e:
         print("ERROR:", e)
         return {"error": str(e)}
 
 # ==============================
-# View saved products
+# View products
 # ==============================
 @app.get("/products")
 def view_products():
