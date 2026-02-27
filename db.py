@@ -34,18 +34,9 @@ def create_table():
 
         category_id INTEGER,
         category_name TEXT,
-        confidence REAL,
-
-        enhanced_category TEXT
+        confidence REAL
     )
     """)
-
-    # Add column to existing DB without deleting data
-    try:
-        cursor.execute("ALTER TABLE products ADD COLUMN enhanced_category TEXT")
-        print("Added enhanced_category column")
-    except Exception:
-        pass  # Already exists
 
     conn.commit()
 
@@ -74,6 +65,7 @@ def create_categories_table():
     conn.close()
 
 
+
 def insert_product(data):
 
     conn = create_connection()
@@ -94,21 +86,20 @@ def insert_product(data):
         bullet_points,
         category_id,
         category_name,
-        confidence,
-        enhanced_category
+        confidence
 
         )
 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 
         """, data)
 
         conn.commit()
 
-        print("Saved into SQLite")
+        print("✅ Saved into SQLite")
 
     except sqlite3.IntegrityError:
 
-        print("Duplicate URL skipped")
+        print("⚠ Duplicate URL skipped")
 
     conn.close()
