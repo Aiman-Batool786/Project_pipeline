@@ -3,8 +3,11 @@ import re
 
 
 def get_product_info(url):
+
     try:
+
         with sync_playwright() as p:
+
             print("[scraper] Launching browser...")
             browser = p.chromium.launch(
                 headless=True,
@@ -29,13 +32,13 @@ def get_product_info(url):
                 }
             )
 
-            # FIX 1: Force English US region via cookies (stops Dutch/Italian redirects)
+            # Force English US via cookies
             context.add_cookies([
                 {"name": "aep_usuc_f", "value": "site=glo&c_tp=USD&region=US&b_locale=en_US", "domain": ".aliexpress.com", "path": "/"},
                 {"name": "intl_locale", "value": "en_US", "domain": ".aliexpress.com", "path": "/"},
             ])
 
-            # Stealth JS tweaks (unchanged)
+            # Mask webdriver
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 window.chrome = { runtime: {} };
@@ -46,70 +49,126 @@ def get_product_info(url):
             page = context.new_page()
 
             print("[scraper] Navigating to:", url)
-            page.goto(
-                url,
-                timeout=120000,
-                wait_until="domcontentloaded"
-            )
-            page.wait_for_timeout(5000)
+            page.goto(url, timeout=90000, wait_until="domcontentloaded")
+            page.wait_for_timeout(4000)
 
-            print("[scraper] Page loaded. Current URL:", page.url)
-            print("[scraper] Page title tag:", page.title())
-
-            # FIX 2: If Tor redirected to regional site, force back to English
+            # Fix regional redirect
             current_url = page.url
             if "www.aliexpress.com" not in current_url:
                 match = re.search(r'item/(\d+)', current_url)
                 if match:
                     english_url = f"https://www.aliexpress.com/item/{match.group(1)}.html"
-                    print("[scraper] Regional redirect detected! Switching to:", english_url)
-                    page.goto(english_url, timeout=120000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(5000)
-                    print("[scraper] Now on:", page.url)
+                    print("[scraper] Redirect detected, switching to:", english_url)
+                    page.goto(english_url, timeout=90000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(4000)
 
-            # Simulate human behavior (unchanged)
-            page.wait_for_timeout(3000)
+            print("[scraper] Current URL:", page.url)
+
+            # Simulate human
             page.mouse.move(200, 300)
-            page.mouse.wheel(0, 2000)
-            page.wait_for_timeout(3000)
+            page.mouse.wheel(0, 1000)
+            page.wait_for_timeout(2000)
 
-            # DEBUG: Check body content (unchanged)
-            try:
-                body_text = page.locator("body").inner_text()
-                print("[scraper] Body preview (first 500 chars):")
-                print(body_text[:500])
-                print("[scraper] ---")
-            except Exception as body_err:
-                print("[scraper] Could not read body:", body_err)
+            # Block detection
+            body_text = page.locator("body").inner_text()
+            if "Sign in / Register" in body_text and "Browse by Category" in body_text:
+                print("[scraper] BLOCKED: homepage detected")
+                browser.close()
+                return None
 
-            # Extract title (unchanged)
+            # ── TITLE ─────────────────────────────────────────────────────
             title = ""
-            h1_count = page.locator("h1").count()
-            print(f"[scraper] h1 elements found: {h1_count}")
-            if h1_count > 0:
-                title = page.locator("h1").first.inner_text()
-                print("[scraper] Title extracted:", title[:100])
+            title_selectors = [
+                "h1.product-title-text",
+                "[class*='title--wrap'] h1",
+                "[class*='product-title']",
+                "h1",
+            ]
+            for sel in title_selectors:
+                try:
+                    el = page.locator(sel).first
+                    if el.count() > 0:
+                        text = el.inner_text(timeout=2000).strip()
+                        if text and text.lower() not in ["aliexpress", "aliexpress.com"]:
+                            title = text
+                            print("[scraper] Title:", title[:80])
+                            break
+                except Exception:
+                    continue
 
-            # Extract description (unchanged)
-            paragraphs = page.locator("p").all_text_contents()
-            description = " ".join(paragraphs[:5]) if paragraphs else ""
+            if not title:
+                print("[scraper] BLOCKED: no product title found")
+                browser.close()
+                return None
 
-            # Extract bullet points (unchanged)
-            bullets = page.locator("li").all_text_contents()
-            bullet_points = bullets[:5] if bullets else []
+            # ── DESCRIPTION (from #nav-description section) ───────────────
+            description = ""
 
-            # Extract first image (unchanged)
+            # Scroll to description section
+            try:
+                page.evaluate("document.querySelector('#nav-description')?.scrollIntoView()")
+                page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
+            desc_selectors = [
+                "#nav-description",
+                "[class*='description--wrap--']",
+                "[class*='description-content']",
+                ".detail-desc-decorate-richtext",
+                "[id*='description']",
+            ]
+            for sel in desc_selectors:
+                try:
+                    el = page.locator(sel).first
+                    if el.count() > 0:
+                        text = el.inner_text(timeout=3000).strip()
+                        # Must be real description, not nav links
+                        if len(text) > 50 and "Customer Reviews" not in text[:30]:
+                            description = text[:2000]
+                            print(f"[scraper] Description via {sel!r} ({len(description)} chars)")
+                            break
+                except Exception:
+                    continue
+
+            # Fallback: meaningful paragraphs
+            if not description:
+                try:
+                    paragraphs = page.locator("p").all_text_contents()
+                    meaningful = [p.strip() for p in paragraphs if len(p.strip()) > 40]
+                    description = " ".join(meaningful[:5])[:2000]
+                    print(f"[scraper] Description from <p> tags ({len(description)} chars)")
+                except Exception:
+                    pass
+
+            # ── BULLET POINTS ─────────────────────────────────────────────
+            bullet_points = []
+            try:
+                bullets = page.locator("li").all_text_contents()
+                bullet_points = [b.strip() for b in bullets if len(b.strip()) > 20][:5]
+            except Exception:
+                pass
+
+            # ── IMAGE ─────────────────────────────────────────────────────
             image = ""
-            if page.locator("img").count() > 0:
-                image = page.locator("img").first.get_attribute("src")
+            img_selectors = [
+                ".magnifier-image",
+                "[class*='product-image'] img",
+                "img[src*='alicdn']",
+                "img",
+            ]
+            for sel in img_selectors:
+                try:
+                    src = page.locator(sel).first.get_attribute("src", timeout=2000)
+                    if src and src.startswith("http"):
+                        image = src
+                        break
+                except Exception:
+                    continue
 
             browser.close()
 
-            # Detect block (unchanged)
-            if title == "":
-                print("[scraper] BLOCKED: title is empty - likely CAPTCHA or login wall")
-                return None
-
+            print("[scraper] Done!")
             return {
                 "title": title,
                 "description": description,
@@ -118,6 +177,5 @@ def get_product_info(url):
             }
 
     except Exception as e:
-        print(f"[scraper] EXCEPTION TYPE: {type(e).__name__}")
-        print(f"[scraper] EXCEPTION MESSAGE: {e}")
+        print(f"[scraper] EXCEPTION: {type(e).__name__}: {e}")
         return None
