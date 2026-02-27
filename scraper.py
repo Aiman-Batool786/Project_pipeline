@@ -50,18 +50,13 @@ def get_product_info(url):
             """)
 
             page = context.new_page()
+print("[scraper] Navigating to:", url)
 
-            print("[scraper] Navigating to:", url)
-
-            page.goto(
-
-                url,
-
-                timeout=60000,
-
-                wait_until="networkidle"
-
-            )
+page.goto(
+    url,
+    timeout=120000,
+    wait_until="domcontentloaded"
+)
 
             print("[scraper] Page loaded. Current URL:", page.url)
             print("[scraper] Page title tag:", page.title())
