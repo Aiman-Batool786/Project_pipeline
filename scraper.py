@@ -58,6 +58,7 @@ page.goto(
     wait_until="domcontentloaded"
 )
 
+page.wait_for_timeout(5000)  # let JS finish
             print("[scraper] Page loaded. Current URL:", page.url)
             print("[scraper] Page title tag:", page.title())
 
