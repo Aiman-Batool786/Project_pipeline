@@ -6,19 +6,14 @@ from openai_client import improve_product_content
 from category_utils import assign_category
 from db import create_table, insert_product, create_categories_table
 
-from openai import OpenAI
-from dotenv import load_dotenv
 import json
 import uvicorn
 import os
 
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 app = FastAPI(title="AliExpress Product AI Enhancer")
 
 
-# Run at startup
+#  Run at startup
 @app.on_event("startup")
 def startup():
     create_table()
@@ -26,41 +21,18 @@ def startup():
     print("Database ready")
 
 
-# Root path
+#  Root path
 @app.get("/")
 def root():
     return {"message": "FastAPI Product AI Enhancer is running!"}
 
 
-# Request model
+#  Request model
 class ProductRequest(BaseModel):
     url: str
 
 
-# CHANGE 3: Enhanced category via OpenAI
-def get_enhanced_category(title: str, description: str, raw_category: str) -> str:
-    try:
-        prompt = f"""Given this product:
-Title: {title}
-Description: {description[:300]}
-Current Category: {raw_category}
-
-Return a short, clean, human-readable category name (max 5 words).
-Return ONLY the category name, nothing else."""
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=20
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print("Enhanced category error:", e)
-        return raw_category
-
-
-# MAIN API
+#  MAIN API
 @app.post("/generate-product")
 def generate_product(req: ProductRequest):
     try:
@@ -83,14 +55,6 @@ def generate_product(req: ProductRequest):
             improved["description"]
         )
 
-        # Get enhanced category
-        enhanced_category = get_enhanced_category(
-            improved["title"],
-            improved["description"],
-            category["category_name"]
-        )
-        print("Enhanced category:", enhanced_category)
-
         insert_product(
             (
                 req.url,
@@ -101,8 +65,7 @@ def generate_product(req: ProductRequest):
                 json.dumps(improved["bullet_points"]),
                 category["category_id"],
                 category["category_name"],
-                category["confidence"],
-                enhanced_category
+                category["confidence"]
             )
         )
 
@@ -118,20 +81,14 @@ def generate_product(req: ProductRequest):
                 "description": improved["description"],
                 "bullet_points": improved["bullet_points"]
             },
-            "category": {
-                "category_id": category["category_id"],
-                "category_name": category["category_name"],
-                "confidence": category["confidence"],
-                "enhanced_category": enhanced_category
-            }
+            "category": category
         }
 
     except Exception as e:
-        print("ERROR:", e)
         return {"error": str(e)}
 
 
-# View saved products
+#  View saved products
 @app.get("/products")
 def view_products():
     import sqlite3
@@ -145,5 +102,6 @@ def view_products():
 
 
 if __name__ == "__main__":
+    # Get port from environment variable, default to 8686
     port = int(os.environ.get("PORT", 8686))
     uvicorn.run(app, host="0.0.0.0", port=port)
