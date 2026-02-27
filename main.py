@@ -50,11 +50,16 @@ def generate_product(req: ProductRequest):
         if not improved:
             return {"error": "OpenAI failed"}
 
-        category = assign_category(
+        # Category from embeddings (existing logic)
+        category_from_embeddings = assign_category(
             improved["title"],
             improved["description"]
         )
 
+        # Enhanced category (from OpenAI or default)
+        enhanced_category = improved.get("enhanced_category", "Uncategorized")
+
+        # Insert into DB including enhanced category
         insert_product(
             (
                 req.url,
@@ -63,12 +68,14 @@ def generate_product(req: ProductRequest):
                 improved["title"],
                 improved["description"],
                 json.dumps(improved["bullet_points"]),
-                category["category_id"],
-                category["category_name"],
-                category["confidence"]
+                category_from_embeddings["category_id"],
+                category_from_embeddings["category_name"],
+                category_from_embeddings["confidence"],
+                enhanced_category    # <-- Added
             )
         )
 
+        # Return both categories in response
         return {
             "saved": True,
             "url": req.url,
@@ -81,13 +88,16 @@ def generate_product(req: ProductRequest):
                 "description": improved["description"],
                 "bullet_points": improved["bullet_points"]
             },
-            "category": category
+            "category": {
+                "category_id": category_from_embeddings["category_id"],
+                "category_name": category_from_embeddings["category_name"],
+                "confidence": category_from_embeddings["confidence"],
+                "enhanced_category": enhanced_category
+            }
         }
 
     except Exception as e:
         return {"error": str(e)}
-
-
 #  View saved products
 @app.get("/products")
 def view_products():
