@@ -1,8 +1,4 @@
-this is my original code:
- 
-i just update 2 things so give me output of two things
- 
-from playwright.sync_api import sync_playwright
+ from playwright.sync_api import sync_playwright
 def get_product_info(url):
     try:
         with sync_playwright() as p:
