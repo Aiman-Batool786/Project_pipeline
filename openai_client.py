@@ -24,6 +24,8 @@ Format:
 }}
 """
 
+    content = None  # ✅ always defined
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -32,10 +34,10 @@ Format:
         )
 
         content = response.choices[0].message.content.strip()
-
         return json.loads(content)
 
     except Exception as e:
-        print("OpenAI returned invalid JSON:", e)
-        print("Response content:", content)
+        print("OpenAI error:", e)
+        if content:
+            print("Raw response:", content)
         return None
