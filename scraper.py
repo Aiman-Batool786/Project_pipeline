@@ -32,7 +32,7 @@ def get_product_info(url):
             # safer title extraction
             title = ""
             if page.locator("h1").count() > 0:
-                title = page.locator("h1").first.inner_text()
+                title = page.locator("product-title").first.inner_text()
             # description extraction
             paragraphs = page.locator("p").all_text_contents()
             description = " ".join(paragraphs[:5]) if paragraphs else ""
