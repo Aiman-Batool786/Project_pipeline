@@ -97,8 +97,8 @@ def generate_product(req: ProductRequest):
         }
 
     except Exception as e:
-        print("API ERROR:", e)
-        return {"success": False, "error": str(e)}
+    print("ERROR:", e)       
+    return {"error": str(e)}
 
 # ==============================
 # View saved products
