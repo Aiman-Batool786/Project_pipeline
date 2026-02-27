@@ -8,9 +8,7 @@ DB_NAME = "products.db"
 
 
 conn = sqlite3.connect(DB_NAME)
-
 cursor = conn.cursor()
-
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS categories (
@@ -20,32 +18,25 @@ CREATE TABLE IF NOT EXISTS categories (
 )
 """)
 
-
+# Load category names from CSV
 df = pd.read_csv("categories_with_embeddings.csv")
+print(f"Loaded {len(df)} categories from CSV")
 
-print(f"Loading {len(df)} categories...")
+# Load embeddings from pickle (full precision, not truncated)
+with open("category_embeddings.pkl", "rb") as f:
+    embeddings = pickle.load(f)
+
+print(f"Loaded {len(embeddings)} embeddings from pickle")
+
+if len(df) != len(embeddings):
+    print(f"WARNING: CSV rows ({len(df)}) != pickle embeddings ({len(embeddings)})")
 
 success = 0
 failed = 0
 
-for _, row in df.iterrows():
-
+for i, row in df.iterrows():
     try:
-        # FIX: Use numpy to parse the embedding instead of ast.literal_eval
-        # Handles truncated numpy format like [0.123 -0.456 ... 0.789]
-        embedding_array = np.fromstring(
-            row["embedding"].strip("[]"),
-            sep=" "
-        )
-
-        # If space-separated failed, try comma-separated
-        if len(embedding_array) < 10:
-            embedding_array = np.fromstring(
-                row["embedding"].strip("[]"),
-                sep=","
-            )
-
-        embedding_blob = pickle.dumps(embedding_array)
+        embedding_blob = pickle.dumps(embeddings[i])
 
         cursor.execute("""
             INSERT OR REPLACE INTO categories
@@ -60,9 +51,8 @@ for _, row in df.iterrows():
         success += 1
 
     except Exception as e:
-        print(f"  Skipping row {row['category_id']}: {e}")
+        print(f"  Skipping row {i}: {e}")
         failed += 1
-
 
 conn.commit()
 conn.close()
