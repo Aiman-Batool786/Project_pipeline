@@ -6,7 +6,6 @@ import os
 from dotenv import load_dotenv
 from sklearn.metrics.pairwise import cosine_similarity
 
-
 load_dotenv()
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -22,10 +21,8 @@ def load_categories():
     cursor = conn.cursor()
 
     cursor.execute("""
-
         SELECT category_id, category_name, embedding
         FROM categories
-
     """)
 
     rows = cursor.fetchall()
@@ -37,11 +34,8 @@ def load_categories():
     embeddings = []
 
     for row in rows:
-
         category_ids.append(row[0])
-
         category_names.append(row[1])
-
         embeddings.append(pickle.loads(row[2]))
 
     return category_ids, category_names, np.array(embeddings)
@@ -50,112 +44,49 @@ def load_categories():
 category_ids, category_names, category_embeddings = load_categories()
 
 
-
 def get_embedding(text):
 
     response = client.embeddings.create(
-
         model="text-embedding-3-small",
         input=text
-
     )
 
     return np.array(response.data[0].embedding)
 
 
-
 def assign_category(title, description):
 
-    product_text = title + " " + description
+    product_text = (title + " " + description).strip()
+
+    # FIX 1: Empty text guard
+    if not product_text:
+        print("[category] WARNING: Empty title and description, returning Uncategorized")
+        return {
+            "category_id": 0,
+            "category_name": "Uncategorized",
+            "confidence": 0.0
+        }
+
+    # FIX 2: Empty embeddings guard
+    if len(category_embeddings) == 0:
+        print("[category] WARNING: No categories loaded from DB")
+        return {
+            "category_id": 0,
+            "category_name": "Uncategorized",
+            "confidence": 0.0
+        }
 
     product_embedding = get_embedding(product_text)
 
     sims = cosine_similarity(
-
         [product_embedding],
         category_embeddings
-
     )[0]
 
     idx = sims.argmax()
 
     return {
-
         "category_id": category_ids[idx],
         "category_name": category_names[idx],
         "confidence": float(sims[idx])
-
     }
-
-
-
-# import pandas as pd
-# import numpy as np
-# import pickle
-# from openai import OpenAI
-# import os
-# from dotenv import load_dotenv
-# from sklearn.metrics.pairwise import cosine_similarity
-
-
-# load_dotenv()
-
-# client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-
-# # Load categories
-
-# df = pd.read_csv("categories_with_embeddings.csv")
-
-
-# # Load embeddings from pickle
-
-# with open("category_embeddings.pkl", "rb") as f:
-
-#     category_embeddings = pickle.load(f)
-
-
-
-# def get_embedding(text):
-
-#     response = client.embeddings.create(
-
-#         model="text-embedding-3-small",
-
-#         input=text
-
-#     )
-
-#     return np.array(response.data[0].embedding)
-
-
-
-# def assign_category(title, description):
-
-#     product_text = title + " " + description
-
-
-#     product_embedding = get_embedding(product_text)
-
-
-#     sims = cosine_similarity(
-
-#         [product_embedding],
-
-#         category_embeddings
-
-#     )[0]
-
-
-#     idx = sims.argmax()
-
-
-#     return {
-
-#         "category_id": int(df.iloc[idx]["category_id"]),
-
-#         "category_name": df.iloc[idx]["category_name"],
-
-#         "confidence": float(sims[idx])
-
-#     }
