@@ -1,61 +1,43 @@
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import json
-import sqlite3
-import os
-from openai import OpenAI
-from dotenv import load_dotenv
-
 from scraper import get_product_info
 from utils import clean_text
 from openai_client import improve_product_content
 from category_utils import assign_category
 from db import create_table, insert_product, create_categories_table
 
+from openai import OpenAI
+from dotenv import load_dotenv
+import json
+import uvicorn
+import os
+
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ==============================
-# Initialize app
-# ==============================
 app = FastAPI(title="AliExpress Product AI Enhancer")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-    max_age=600,
-)
 
-# ==============================
-# Startup
-# ==============================
+# Run at startup
 @app.on_event("startup")
 def startup():
     create_table()
     create_categories_table()
     print("Database ready")
 
-# ==============================
-# Root
-# ==============================
+
+# Root path
 @app.get("/")
 def root():
-    return {"status": "running", "message": "FastAPI Product AI Enhancer is running"}
+    return {"message": "FastAPI Product AI Enhancer is running!"}
 
-# ==============================
+
 # Request model
-# ==============================
 class ProductRequest(BaseModel):
     url: str
 
-# ==============================
-# Enhanced category via OpenAI
-# ==============================
+
+# CHANGE 3: Enhanced category via OpenAI
 def get_enhanced_category(title: str, description: str, raw_category: str) -> str:
     try:
         prompt = f"""Given this product:
@@ -64,7 +46,7 @@ Description: {description[:300]}
 Current Category: {raw_category}
 
 Return a short, clean, human-readable category name (max 5 words).
-Return ONLY the category name, nothing else. No quotes, no punctuation."""
+Return ONLY the category name, nothing else."""
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -77,32 +59,31 @@ Return ONLY the category name, nothing else. No quotes, no punctuation."""
         print("Enhanced category error:", e)
         return raw_category
 
-# ==============================
-# Main API
-# ==============================
+
+# MAIN API
 @app.post("/generate-product")
 def generate_product(req: ProductRequest):
     try:
-        print("Processing URL:", req.url)
-
-        # Step 1: Scrape
         data = get_product_info(req.url)
         if not data:
-            return {"success": False, "error": "Scraping failed"}
+            return {"error": "Scraping failed"}
 
-        # Step 2: Clean
-        original_title = clean_text(data.get("title", ""))
-        original_description = clean_text(data.get("description", ""))
+        original_title = clean_text(data["title"])
+        original_description = clean_text(data["description"])
 
-        # Step 3: Improve with OpenAI
-        improved = improve_product_content(original_title, original_description)
+        improved = improve_product_content(
+            original_title,
+            original_description
+        )
         if not improved:
-            return {"success": False, "error": "OpenAI improvement failed"}
+            return {"error": "OpenAI failed"}
 
-        # Step 4: Assign category from embeddings
-        category = assign_category(improved["title"], improved["description"])
+        category = assign_category(
+            improved["title"],
+            improved["description"]
+        )
 
-        # Step 5: Enhanced category via OpenAI
+        # Get enhanced category
         enhanced_category = get_enhanced_category(
             improved["title"],
             improved["description"],
@@ -110,23 +91,23 @@ def generate_product(req: ProductRequest):
         )
         print("Enhanced category:", enhanced_category)
 
-        # Step 6: Save to DB
-        insert_product((
-            req.url,
-            original_title,
-            original_description,
-            improved["title"],
-            improved["description"],
-            json.dumps(improved["bullet_points"]),
-            category["category_id"],
-            category["category_name"],
-            category["confidence"],
-            enhanced_category
-        ))
+        insert_product(
+            (
+                req.url,
+                original_title,
+                original_description,
+                improved["title"],
+                improved["description"],
+                json.dumps(improved["bullet_points"]),
+                category["category_id"],
+                category["category_name"],
+                category["confidence"],
+                enhanced_category
+            )
+        )
 
-        # Step 7: Return
         return {
-            "success": True,
+            "saved": True,
             "url": req.url,
             "original": {
                 "title": original_title,
@@ -149,27 +130,20 @@ def generate_product(req: ProductRequest):
         print("ERROR:", e)
         return {"error": str(e)}
 
-# ==============================
-# View products
-# ==============================
+
+# View saved products
 @app.get("/products")
 def view_products():
-    try:
-        conn = sqlite3.connect("products.db")
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM products")
-        rows = cursor.fetchall()
-        conn.close()
-        return {"success": True, "count": len(rows), "products": [dict(row) for row in rows]}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    import sqlite3
+    conn = sqlite3.connect("products.db")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM products")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
-# ==============================
-# Run server
-# ==============================
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8686))
-    os.environ["PYTHONUNBUFFERED"] = "1"
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=port)
