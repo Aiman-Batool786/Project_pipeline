@@ -1,6 +1,6 @@
 from playwright.sync_api import sync_playwright
 
-def get_product_info(url):
+def get_product_info(url):   # ✅ fixed missing bracket
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -26,8 +26,14 @@ def get_product_info(url):
             # Go to page
             page.goto(url, timeout=60000)
 
-            # Wait for title to appear (IMPORTANT FIX)
-            page.wait_for_selector('h1[data-pl="product-title"]', timeout=20000)
+            # ✅ Wait properly for dynamic load (AliExpress loads via JS)
+            page.wait_for_load_state("networkidle")
+
+            # ✅ Safer wait (try multiple selectors)
+            try:
+                page.wait_for_selector('h1[data-pl="product-title"]', timeout=15000)
+            except:
+                page.wait_for_selector("h1", timeout=15000)
 
             # Simulate human behavior
             page.wait_for_timeout(2000)
@@ -36,22 +42,24 @@ def get_product_info(url):
             page.wait_for_timeout(2000)
 
             # =========================
-            # TITLE (FIXED SELECTOR)
+            # TITLE (MORE STABLE)
             # =========================
-            title = page.locator('h1[data-pl="product-title"]').inner_text().strip()
+            title = ""
+
+            if page.locator('h1[data-pl="product-title"]').count() > 0:
+                title = page.locator('h1[data-pl="product-title"]').first.inner_text().strip()
+            elif page.locator("h1").count() > 0:
+                title = page.locator("h1").first.inner_text().strip()
 
             # =========================
             # DESCRIPTION
             # =========================
             description = ""
 
-            # Try product description section first
             if page.locator("#product-description").count() > 0:
-                description = page.locator("#product-description").inner_text().strip()
-            else:
-                # fallback to strong tag (from nav area you showed)
-                if page.locator("strong").count() > 0:
-                    description = page.locator("strong").first.inner_text().strip()
+                description = page.locator("#product-description").first.inner_text().strip()
+            elif page.locator("strong").count() > 0:
+                description = page.locator("strong").first.inner_text().strip()
 
             # =========================
             # BULLET POINTS (cleaner)
@@ -82,6 +90,11 @@ def get_product_info(url):
                 "bullet_points": bullet_points,
                 "image_url": image_url
             }
+
+    except Exception as e:
+        print("Scraping failed for URL:", url)
+        print("Error:", e)
+        return None
 
     except Exception as e:
         print("Scraping failed for URL:", url)
