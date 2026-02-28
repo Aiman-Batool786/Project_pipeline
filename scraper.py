@@ -5,7 +5,7 @@ def get_product_info(url):
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
-                headless=False,  # ⚠️ Try headful first to debug; set True in production
+               headless=True,  # ⚠️ Try headful first to debug; set True in production
                 proxy={"server": "socks5://127.0.0.1:9050"},
                 args=[
                     "--disable-blink-features=AutomationControlled",
