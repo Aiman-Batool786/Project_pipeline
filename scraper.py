@@ -5,140 +5,124 @@ def get_product_info(url):
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
-               headless=True,  # ⚠️ Try headful first to debug; set True in production
+                headless=True,
                 proxy={"server": "socks5://127.0.0.1:9050"},
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
-                    "--disable-web-security",
-                    "--disable-features=IsolateOrigins,site-per-process",
                 ]
             )
             context = browser.new_context(
-                # ✅ Updated to recent Chrome version
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1440, "height": 900},
                 locale="en-US",
                 timezone_id="Asia/Karachi",
-                # ✅ These help bypass bot detection
-                java_script_enabled=True,
                 extra_http_headers={
                     "Accept-Language": "en-US,en;q=0.9",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
                 }
             )
 
-            # ✅ Mask webdriver property
+            # ✅ Mask webdriver
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
             """)
 
             page = context.new_page()
             print("Opening URL:", url)
 
+            # ✅ Use domcontentloaded (faster), then wait for JS manually
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
 
-            # ✅ Check if we got blocked before waiting for selectors
-            page_title = page.title()
-            print("Page title:", page_title)
-            if "verify" in page_title.lower() or "captcha" in page_title.lower() or "robot" in page_title.lower():
-                print("❌ CAPTCHA or verification page detected!")
-                browser.close()
-                return None
+            # ✅ Give JS time to boot up
+            page.wait_for_timeout(3000)
 
-            # ✅ Human-like random delay
-            page.wait_for_timeout(random.randint(2000, 4000))
-            page.mouse.move(random.randint(200, 500), random.randint(300, 600))
-            page.wait_for_timeout(random.randint(500, 1500))
-            page.mouse.wheel(0, random.randint(300, 800))
-            page.wait_for_timeout(random.randint(1000, 2000))
+            # ✅ Scroll to trigger lazy loading
+            page.mouse.wheel(0, 500)
+            page.wait_for_timeout(2000)
 
-            #  Wait for title with longer timeout
+            # ✅ Wait for title with longer timeout
             try:
-                page.wait_for_selector('h1[data-pl="product-title"]', timeout=20000)
+                page.wait_for_selector(
+                    'h1[data-pl="product-title"]',
+                    timeout=30000,   # 30 seconds
+                    state="visible"
+                )
             except Exception:
-                # Dump HTML to debug what page we actually got
-                html_snippet = page.content()[:2000]
-                print("⚠️ Title selector not found. Page snippet:")
-                print(html_snippet)
+                # ✅ DEBUG: print page title and URL to understand what loaded
+                print("Page title:", page.title())
+                print("Current URL:", page.url)
+                # ✅ Check if redirected to login or captcha
+                current_url = page.url
+                if "login" in current_url or "passport" in current_url:
+                    print("❌ Redirected to login page!")
+                elif "robot" in page.title().lower() or "verify" in page.title().lower():
+                    print("❌ CAPTCHA page detected!")
+                else:
+                    print("❌ Product title not found - page may not have loaded correctly")
+                    # Save full HTML for inspection
+                    with open("/tmp/debug_page.html", "w", encoding="utf-8") as f:
+                        f.write(page.content())
+                    print("💾 Full HTML saved to /tmp/debug_page.html")
                 browser.close()
                 return None
+
+            print("✅ Page loaded successfully!")
+            print("Page title:", page.title())
 
             # =========================
-            # TITLE — correct selector
+            # TITLE
             # =========================
             title = ""
-            title_el = page.locator('h1[data-pl="product-title"]')
-            if title_el.count() > 0:
-                title = title_el.first.inner_text().strip()
+            el = page.locator('h1[data-pl="product-title"]')
+            if el.count() > 0:
+                title = el.first.inner_text().strip()
+            print("✅ Title:", title)
 
             # =========================
-            # DESCRIPTION — fixed selector
-            # The description <strong> tag lives inside the description
-            # section div, not just any <strong> on the page
+            # DESCRIPTION
             # =========================
             description = ""
-            # Try the specific description section first
             desc_selectors = [
-                '#nav-description strong',           # <strong> inside description nav section
-                '.product-description strong',        # class-based fallback
-                '[id*="description"] strong',         # any id containing "description"
-                'div[class*="description"] strong',   # any div with description in class
+                '#nav-description strong',
+                'div[class*="description"] strong',
+                '[id*="description"] strong',
+                '.product-description strong',
             ]
             for selector in desc_selectors:
                 el = page.locator(selector)
                 if el.count() > 0:
-                    description = el.first.inner_text().strip()
-                    print(f"Description found with selector: {selector}")
-                    break
-
-            # If still empty, scroll to description section and try again
-            if not description:
-                try:
-                    page.locator('a[href="#nav-description"]').click()
-                    page.wait_for_timeout(2000)
-                    for selector in desc_selectors:
-                        el = page.locator(selector)
-                        if el.count() > 0:
-                            description = el.first.inner_text().strip()
-                            break
-                except Exception:
-                    pass
+                    text = el.first.inner_text().strip()
+                    if text:
+                        description = text
+                        print(f"✅ Description found via: {selector}")
+                        break
 
             # =========================
-            # MAIN IMAGE — more specific
+            # MAIN IMAGE
             # =========================
             image_url = ""
             img_selectors = [
-                '.image-view--previewImage--tnpEVgJ img',   # AliExpress product image class
-                '.slider-item img',
-                '.product-image img',
-                'img[src*="ae01.alicdn.com"]',              # AliExpress CDN images
+                'img[src*="ae01.alicdn.com"]',
+                'img[src*="alicdn.com"]',
+                '.image-view--previewImage--tnpEVgJ img',
             ]
             for selector in img_selectors:
                 el = page.locator(selector)
                 if el.count() > 0:
-                    image_url = el.first.get_attribute("src") or ""
-                    if image_url:
+                    src = el.first.get_attribute("src") or ""
+                    if src:
+                        image_url = src
                         break
 
             browser.close()
 
-            # =========================
-            # BLOCK DETECTION
-            # =========================
             if not title:
-                print("No title found — likely blocked or wrong page")
+                print("❌ Title empty after extraction")
                 return None
-
-            print("Title:", title)
-            print("Description:", description[:100] if description else "Not found")
 
             return {
                 "title": title,
