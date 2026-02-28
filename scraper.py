@@ -1,4 +1,4 @@
- from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright
 def get_product_info(url):
     try:
         with sync_playwright() as p:
