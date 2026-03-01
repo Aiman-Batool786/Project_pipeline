@@ -9,8 +9,8 @@ def renew_tor_ip():
         with Controller.from_port(port=9051) as controller:
             controller.authenticate()
             controller.signal(Signal.NEWNYM)
-            time.sleep(5)  # wait for new circuit to establish
-            print("Got new Tor IP")
+            time.sleep(5)  # wait for new circuit
+            print("🔄 Got new Tor IP")
     except Exception as e:
         print("Could not rotate IP:", e)
 
@@ -20,7 +20,7 @@ def scrape(url):
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                proxy={"server": "socks5://127.0.0.1:9050"},  # 9050 = SOCKS proxy, keep this!
+                proxy={"server": "socks5://127.0.0.1:9050"},  # 9050 = SOCKS proxy (keep this!)
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
@@ -34,10 +34,10 @@ def scrape(url):
                 timezone_id="Asia/Karachi"
             )
 
-            # Hide automation signals
+            # Hide automation signals from AliExpress
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+                Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3] });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
                 window.chrome = { runtime: {} };
             """)
@@ -45,11 +45,7 @@ def scrape(url):
             page = context.new_page()
             print("Opening URL:", url)
 
-            page.goto(
-                url,
-                timeout=60000,
-                wait_until="networkidle"  # better than domcontentloaded for JS-heavy sites
-            )
+            page.goto(url, timeout=60000, wait_until="networkidle")
 
             # Simulate human behaviour
             page.wait_for_timeout(3000)
@@ -57,12 +53,8 @@ def scrape(url):
             page.mouse.wheel(0, 2000)
             page.wait_for_timeout(3000)
 
-            # Debug info
             print("Page title:", page.title())
             print("Current URL:", page.url)
-
-            # Screenshot for debugging (remove this line once scraper is working)
-            page.screenshot(path="/home/aimanbatool114/debug.png")
 
             # Title extraction with multiple selectors
             title = ""
@@ -72,7 +64,7 @@ def scrape(url):
                     if title:
                         break
 
-            # Description extraction
+            # Description
             paragraphs = page.locator("p").all_text_contents()
             description = " ".join(paragraphs[:5]) if paragraphs else ""
 
@@ -105,13 +97,14 @@ def scrape(url):
 
 
 def get_product_info(url, max_retries=3):
+    """Try scraping with automatic Tor IP rotation on failure"""
     for attempt in range(max_retries):
         print(f"\n--- Attempt {attempt + 1} of {max_retries} ---")
         result = scrape(url)
         if result:
             return result
         if attempt < max_retries - 1:
-            print(f"Blocked! Rotating Tor IP and retrying...")
+            print(f"Blocked! Rotating Tor IP...")
             renew_tor_ip()
     print("All attempts failed for URL:", url)
     return None
