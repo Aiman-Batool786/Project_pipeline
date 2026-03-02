@@ -45,7 +45,7 @@ def scrape(url):
             page = context.new_page()
             print("Opening URL:", url)
 
-            page.goto(url, timeout=60000, wait_until="networkidle")
+            page.goto(url, timeout=90000, wait_until="domcontentloaded")
 
             # Simulate human behaviour
             page.wait_for_timeout(3000)
