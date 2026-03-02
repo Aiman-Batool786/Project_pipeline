@@ -48,10 +48,10 @@ def scrape(url):
             page.goto(url, timeout=90000, wait_until="domcontentloaded")
 
             # Simulate human behaviour
-            page.wait_for_timeout(3000)
-            page.mouse.move(200, 300)
-            page.mouse.wheel(0, 2000)
-            page.wait_for_timeout(3000)
+           page.wait_for_timeout(6000)  # give JS time to render after DOM loads
+           page.mouse.move(200, 300)
+           page.mouse.wheel(0, 2000)
+           page.wait_for_timeout(4000)
 
             print("Page title:", page.title())
             print("Current URL:", page.url)
