@@ -133,7 +133,7 @@ def process_single_url(url: str) -> dict:
 # ─────────────────────────────────────────
 # SINGLE URL ENDPOINT (original, kept working)
 # ─────────────────────────────────────────
-@app.post("/Single_URL")
+@app.post("/Single-URL")
 def generate_product(req: ProductRequest):
     return process_single_url(req.url)
 
@@ -141,7 +141,7 @@ def generate_product(req: ProductRequest):
 # ─────────────────────────────────────────
 # MULTI URL ENDPOINT (new — uses threads)
 # ─────────────────────────────────────────
-@app.post("/MULTI URL")
+@app.post("/MULTI-URL")
 def generate_products(req: MultiProductRequest):
     if not req.urls:
         return {"error": "No URLs provided"}
@@ -189,7 +189,7 @@ def view_products():
     return [dict(row) for row in rows]
 
 
-@app.get("/Original-Content_Table")
+@app.get("/Original-Content-Table")
 def view_original_content():
     conn = sqlite3.connect("products.db")
     conn.row_factory = sqlite3.Row
@@ -200,7 +200,7 @@ def view_original_content():
     return [dict(row) for row in rows]
 
 
-@app.get("/Enhanced-Content_Table")
+@app.get("/Enhanced-Content-Table")
 def view_enhanced_content():
     conn = sqlite3.connect("products.db")
     conn.row_factory = sqlite3.Row
@@ -211,7 +211,7 @@ def view_enhanced_content():
     return [dict(row) for row in rows]
 
 
-@app.get("/Categories_Table")
+@app.get("/Categories-Table")
 def view_category_assignments():
     conn = sqlite3.connect("products.db")
     conn.row_factory = sqlite3.Row
