@@ -68,10 +68,10 @@ def process_single_url(url: str) -> dict:
             url, original_title, original_description, image_url
         )
 
-        # Step 3: OpenAI enhancement
-        improved = improve_product_content(original_title, original_description)
-        if not improved:
-            return {"url": url, "status": "failed", "reason": "OpenAI enhancement failed"}
+        # # Step 3: OpenAI enhancement
+        # improved = improve_product_content(original_title, original_description)
+        # if not improved:
+        #     return {"url": url, "status": "failed", "reason": "OpenAI enhancement failed"}
 
         # Step 4: Save enhanced content
         insert_enhanced_content(
