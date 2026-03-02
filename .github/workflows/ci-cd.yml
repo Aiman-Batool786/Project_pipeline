@@ -50,7 +50,7 @@ jobs:
             git pull origin main || { echo "Git pull failed"; exit 1; }
 
             # Activate virtual environment
-            source env/bin/activate || { echo "Failed to activate virtualenv"; exit 1; }
+            source venv/bin/activate || { echo "Failed to activate virtualenv"; exit 1; }
 
             # Update pip and install dependencies
             pip install --upgrade pip
@@ -83,7 +83,7 @@ jobs:
             # ────────────────────────────────────────────────
             # Start the FastAPI server and save new PID
             # ────────────────────────────────────────────────
-            nohup /home/aimanbatool114/Project_pipeline/env/bin/python -m uvicorn main:app \
+            nohup /home/aimanbatool114/Project_pipeline/venv/bin/python -m uvicorn main:app \
               --host 0.0.0.0 \
               --port 8686 \
               --log-level info \
