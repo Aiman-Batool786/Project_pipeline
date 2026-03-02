@@ -21,7 +21,6 @@ from typing import List
 
 app = FastAPI(title="AliExpress Product AI Enhancer")
 
-
 # ─────────────────────────────────────────
 # STARTUP
 # ─────────────────────────────────────────
