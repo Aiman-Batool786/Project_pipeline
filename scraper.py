@@ -9,7 +9,7 @@ def renew_tor_ip():
         with Controller.from_port(port=9051) as controller:
             controller.authenticate()
             controller.signal(Signal.NEWNYM)
-            time.sleep(5)  # wait for new circuit
+            time.sleep(5)
             print("🔄 Got new Tor IP")
     except Exception as e:
         print("Could not rotate IP:", e)
@@ -20,7 +20,7 @@ def scrape(url):
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                proxy={"server": "socks5://127.0.0.1:9050"},  # 9050 = SOCKS proxy (keep this!)
+                proxy={"server": "socks5://127.0.0.1:9050"},
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
@@ -34,7 +34,6 @@ def scrape(url):
                 timezone_id="Asia/Karachi"
             )
 
-            # Hide automation signals from AliExpress
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3] });
@@ -46,6 +45,7 @@ def scrape(url):
             print("Opening URL:", url)
 
             page.goto(url, timeout=90000, wait_until="domcontentloaded")
+
             # Simulate human behaviour
             page.wait_for_timeout(6000)
             page.mouse.move(200, 300)
@@ -55,7 +55,7 @@ def scrape(url):
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
-            # Title extraction with multiple selectors
+            # ── Title ──────────────────────────────────────────
             title = ""
             for selector in ["h1[data-pl='product-title']", ".product-title-text", "h1"]:
                 if page.locator(selector).count() > 0:
@@ -63,15 +63,28 @@ def scrape(url):
                     if title:
                         break
 
-            # Description
-            paragraphs = page.locator("p").all_text_contents()
-            description = " ".join(paragraphs[:5]) if paragraphs else ""
+            # ── Description ────────────────────────────────────
+            description = ""
+            desc_selectors = [
+                "h2.title--title--O6xcB1q",
+                "h2[class*='title--title']",
+                ".description--description--cnCBH",
+                "div[class*='description'] p",
+            ]
+            for selector in desc_selectors:
+                el = page.locator(selector)
+                if el.count() > 0:
+                    text = el.first.inner_text().strip()
+                    if text and text.lower() != "description":
+                        description = text
+                        print(f"✅ Description found via: {selector}")
+                        break
 
-            # Bullet points
+            # ── Bullet points ──────────────────────────────────
             bullets = page.locator("li").all_text_contents()
             bullet_points = bullets[:5] if bullets else []
 
-            # Image
+            # ── Image ──────────────────────────────────────────
             image = ""
             if page.locator("img").count() > 0:
                 image = page.locator("img").first.get_attribute("src")
