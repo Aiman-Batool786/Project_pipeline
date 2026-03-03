@@ -16,6 +16,13 @@ def renew_tor_ip():
 
 
 def scrape(url):
+    # ✅ Fix regional redirects BEFORE scraping
+    url = url.split("?")[0]
+    url = url.replace("aliexpress.us",     "www.aliexpress.com")
+    url = url.replace("de.aliexpress.com", "www.aliexpress.com")
+    url = url.replace("fr.aliexpress.com", "www.aliexpress.com")
+    url = url.replace("es.aliexpress.com", "www.aliexpress.com")
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -55,11 +62,23 @@ def scrape(url):
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
-            # ✅ Detect if redirected to homepage or blocked
+            # ✅ Fix: handle aliexpress.us redirect after load too
+            current_url = page.url
+            if "aliexpress.us" in current_url or "gatewayAdapt" in current_url:
+                fixed_url = current_url.split("?")[0]
+                fixed_url = fixed_url.replace("aliexpress.us", "www.aliexpress.com")
+                print(f"🔀 Redirected to regional site, retrying: {fixed_url}")
+                page.goto(fixed_url, timeout=90000, wait_until="domcontentloaded")
+                page.wait_for_timeout(5000)
+                print("Page title after fix:", page.title())
+                print("Current URL after fix:", page.url)
+
             current_url = page.url
             page_title = page.title().strip().lower()
+
+            # ✅ Fix: check for /item/ in url (works for all regions)
             if (
-                "aliexpress.com/item" not in current_url
+                "/item/" not in current_url
                 or page_title in ["aliexpress", "aliexpress.com", ""]
                 or "login" in current_url
                 or "passport" in current_url
@@ -71,7 +90,7 @@ def scrape(url):
             # ── Title ──────────────────────────────────────────
             title = ""
             for selector in [
-                "h1[data-pl='product-title']",   # ✅ your inspect confirmed this works
+                "h1[data-pl='product-title']",
                 ".product-title-text",
                 "h1"
             ]:
@@ -82,17 +101,15 @@ def scrape(url):
                         break
 
             # ── Description ────────────────────────────────────
-            # From your screenshot: description is inside the
-            # description section with text like "---Size Reference Table---"
             description = ""
 
-            # ✅ Scroll down to load description section first
+            # ✅ Scroll down to load description section
             page.mouse.wheel(0, 3000)
             page.wait_for_timeout(2000)
 
             desc_selectors = [
-                "div[class*='description--description']",   # ✅ main description container
-                "div[class*='detailmodule_text']",          # ✅ AliExpress text module
+                "div[class*='description--description']",
+                "div[class*='detailmodule_text']",
                 "div[class*='description-content']",
                 "div[id*='description']",
                 "div[class*='product-description']",
@@ -101,9 +118,8 @@ def scrape(url):
                 el = page.locator(selector)
                 if el.count() > 0:
                     text = el.first.inner_text().strip()
-                    # ✅ Skip if it's just the word "Description" or empty
                     if text and text.lower() not in ["description", "report"]:
-                        description = text[:500]  # limit to 500 chars
+                        description = text[:500]
                         print(f"✅ Description found via: {selector}")
                         break
 
