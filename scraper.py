@@ -16,6 +16,13 @@ def renew_tor_ip():
 
 
 def scrape(url):
+    # ✅ Fix regional redirects BEFORE scraping
+    url = url.split("?")[0]
+    url = url.replace("aliexpress.us",     "www.aliexpress.com")
+    url = url.replace("de.aliexpress.com", "www.aliexpress.com")
+    url = url.replace("fr.aliexpress.com", "www.aliexpress.com")
+    url = url.replace("es.aliexpress.com", "www.aliexpress.com")
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -55,28 +62,64 @@ def scrape(url):
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
+            # ✅ Fix: handle aliexpress.us redirect after load too
+            current_url = page.url
+            if "aliexpress.us" in current_url or "gatewayAdapt" in current_url:
+                fixed_url = current_url.split("?")[0]
+                fixed_url = fixed_url.replace("aliexpress.us", "www.aliexpress.com")
+                print(f"🔀 Redirected to regional site, retrying: {fixed_url}")
+                page.goto(fixed_url, timeout=90000, wait_until="domcontentloaded")
+                page.wait_for_timeout(5000)
+                print("Page title after fix:", page.title())
+                print("Current URL after fix:", page.url)
+
+            current_url = page.url
+            page_title = page.title().strip().lower()
+
+            # ✅ Fix: check for /item/ in url (works for all regions)
+            if (
+                "/item/" not in current_url
+                or page_title in ["aliexpress", "aliexpress.com", ""]
+                or "login" in current_url
+                or "passport" in current_url
+            ):
+                print("❌ Blocked or redirected — not a product page")
+                browser.close()
+                return None
+
             # ── Title ──────────────────────────────────────────
             title = ""
-            for selector in ["h1[data-pl='product-title']", ".product-title-text", "h1"]:
+            for selector in [
+                "h1[data-pl='product-title']",
+                ".product-title-text",
+                "h1"
+            ]:
                 if page.locator(selector).count() > 0:
                     title = page.locator(selector).first.inner_text().strip()
                     if title:
+                        print(f"✅ Title found via: {selector}")
                         break
 
             # ── Description ────────────────────────────────────
             description = ""
+
+            # ✅ Scroll down to load description section
+            page.mouse.wheel(0, 3000)
+            page.wait_for_timeout(2000)
+
             desc_selectors = [
-                "h2.title--title--O6xcB1q",
-                "h2[class*='title--title']",
-                ".description--description--cnCBH",
-                "div[class*='description'] p",
+                "div[class*='description--description']",
+                "div[class*='detailmodule_text']",
+                "div[class*='description-content']",
+                "div[id*='description']",
+                "div[class*='product-description']",
             ]
             for selector in desc_selectors:
                 el = page.locator(selector)
                 if el.count() > 0:
                     text = el.first.inner_text().strip()
-                    if text and text.lower() != "description":
-                        description = text
+                    if text and text.lower() not in ["description", "report"]:
+                        description = text[:500]
                         print(f"✅ Description found via: {selector}")
                         break
 
