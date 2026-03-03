@@ -9,18 +9,25 @@ def renew_tor_ip():
         with Controller.from_port(port=9051) as controller:
             controller.authenticate()
             controller.signal(Signal.NEWNYM)
-            time.sleep(5)  # wait for new circuit
+            time.sleep(5)
             print("🔄 Got new Tor IP")
     except Exception as e:
         print("Could not rotate IP:", e)
 
 
 def scrape(url):
+    # ✅ Fix regional redirects BEFORE scraping
+    url = url.split("?")[0]
+    url = url.replace("aliexpress.us",     "www.aliexpress.com")
+    url = url.replace("de.aliexpress.com", "www.aliexpress.com")
+    url = url.replace("fr.aliexpress.com", "www.aliexpress.com")
+    url = url.replace("es.aliexpress.com", "www.aliexpress.com")
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                proxy={"server": "socks5://127.0.0.1:9050"},  # 9050 = SOCKS proxy (keep this!)
+                proxy={"server": "socks5://127.0.0.1:9050"},
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
@@ -34,7 +41,6 @@ def scrape(url):
                 timezone_id="Asia/Karachi"
             )
 
-            # Hide automation signals from AliExpress
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3] });
@@ -46,6 +52,7 @@ def scrape(url):
             print("Opening URL:", url)
 
             page.goto(url, timeout=90000, wait_until="domcontentloaded")
+
             # Simulate human behaviour
             page.wait_for_timeout(6000)
             page.mouse.move(200, 300)
@@ -55,44 +62,72 @@ def scrape(url):
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
-            # Title extraction with multiple selectors
+            # ✅ Handle regional redirect after load
+            current_url = page.url
+            if "aliexpress.us" in current_url or "gatewayAdapt" in current_url:
+                fixed_url = current_url.split("?")[0]
+                fixed_url = fixed_url.replace("aliexpress.us", "www.aliexpress.com")
+                print(f"🔀 Redirected to regional site, retrying: {fixed_url}")
+                page.goto(fixed_url, timeout=90000, wait_until="domcontentloaded")
+                page.wait_for_timeout(5000)
+                print("Page title after fix:", page.title())
+                print("Current URL after fix:", page.url)
+
+            current_url = page.url
+            page_title = page.title().strip().lower()
+
+            # ✅ Block detection
+            if (
+                "/item/" not in current_url
+                or page_title in ["aliexpress", "aliexpress.com", ""]
+                or "login" in current_url
+                or "passport" in current_url
+            ):
+                print("❌ Blocked or redirected — not a product page")
+                browser.close()
+                return None
+
+            # ── Title ──────────────────────────────────────────
             title = ""
-            for selector in ["h1[data-pl='product-title']", ".product-title-text", "h1"]:
+            for selector in [
+                "h1[data-pl='product-title']",
+                ".product-title-text",
+                "h1"
+            ]:
                 if page.locator(selector).count() > 0:
                     title = page.locator(selector).first.inner_text().strip()
                     if title:
+                        print(f"✅ Title found via: {selector}")
                         break
 
-# Description 
-# paragraphs = page.locator("p").all_text_contents()
-# description = " ".join(paragraphs[:5]) if paragraphs else ""
+            # ── Description ────────────────────────────────────
+            description = ""
 
-# Description - NEW (correct selector from your inspect)
-           # Description - OLD (wrong, grabs random paragraphs)
-paragraphs = page.locator("p").all_text_contents()
-description = " ".join(paragraphs[:5]) if paragraphs else ""
+            # ✅ Scroll down to load description section
+            page.mouse.wheel(0, 3000)
+            page.wait_for_timeout(2000)
 
-# Description - NEW (correct selector from your inspect)
-description = ""
-desc_selectors = [
-    "h2.title--title--O6xcB1q",           # exact class from your inspect
-    "h2[class*='title--title']",           # partial class match (safer)
-    ".description--description--cnCBH",   # description container
-    "div[class*='description'] p",         # fallback
-]
-for selector in desc_selectors:
-    el = page.locator(selector)
-    if el.count() > 0:
-        text = el.first.inner_text().strip()
-        if text and text.lower() != "description":  # skip if just the word "Description"
-            description = text
-            print(f"✅ Description found via: {selector}")
-            break
-            # Bullet points
+            desc_selectors = [
+                "div[class*='description--description']",
+                "div[class*='detailmodule_text']",
+                "div[class*='description-content']",
+                "div[id*='description']",
+                "div[class*='product-description']",
+            ]
+            for selector in desc_selectors:
+                el = page.locator(selector)
+                if el.count() > 0:
+                    text = el.first.inner_text().strip()
+                    if text and text.lower() not in ["description", "report"]:
+                        description = text[:500]
+                        print(f"✅ Description found via: {selector}")
+                        break
+
+            # ── Bullet points ──────────────────────────────────
             bullets = page.locator("li").all_text_contents()
             bullet_points = bullets[:5] if bullets else []
 
-            # Image
+            # ── Image ──────────────────────────────────────────
             image = ""
             if page.locator("img").count() > 0:
                 image = page.locator("img").first.get_attribute("src")
