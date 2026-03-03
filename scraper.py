@@ -111,7 +111,8 @@ def get_product_info(url, max_retries=3):
         if result:
             return result
         if attempt < max_retries - 1:
-            print(f"Blocked! Rotating Tor IP and retrying...")
+            print("Blocked! Rotating Tor IP and retrying...")
             renew_tor_ip()
+
     print("All attempts failed for URL:", url)
-return None
+    return None
