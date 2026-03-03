@@ -45,17 +45,14 @@ def scrape(url):
             page = context.new_page()
             print("Opening URL:", url)
 
-            page.goto(
-                url,
-                timeout=60000,
-                wait_until="networkidle"  # better than domcontentloaded for JS-heavy sites
-            )
+           
+            page.goto(url, timeout=90000, wait_until="domcontentloaded")
 
             # Simulate human behaviour
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(6000)
             page.mouse.move(200, 300)
             page.mouse.wheel(0, 2000)
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(4000)
 
             # Debug info
             print("Page title:", page.title())
