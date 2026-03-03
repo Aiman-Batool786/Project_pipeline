@@ -1,165 +1,227 @@
-from playwright.sync_api import sync_playwright
-from stem import Signal
-from stem.control import Controller
-import time
+from fastapi import FastAPI
+from pydantic import BaseModel
+from scraper import get_product_info
+from utils import clean_text
+from openai_client import improve_product_content
+from category_utils import assign_category
+from db import (
+    create_all_tables,
+    insert_original_content,
+    insert_enhanced_content,
+    insert_category_assignment,
+    insert_product
+)
+
+import json
+import uvicorn
+import os
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List
+
+app = FastAPI(title="AliExpress Product AI Enhancer")
+
+# ─────────────────────────────────────────
+# STARTUP
+# ─────────────────────────────────────────
+@app.on_event("startup")
+def startup():
+    create_all_tables()
+    print("Database ready")
 
 
-def renew_tor_ip():
+# ─────────────────────────────────────────
+# ROOT
+# ─────────────────────────────────────────
+@app.get("/")
+def root():
+    return {"message": "FastAPI Product AI Enhancer is running!"}
+
+
+# ─────────────────────────────────────────
+# REQUEST MODELS
+# ─────────────────────────────────────────
+class ProductRequest(BaseModel):
+    url: str
+
+
+class MultiProductRequest(BaseModel):
+    urls: List[str]  # accepts multiple URLs
+
+
+# ─────────────────────────────────────────
+# PROCESS ONE URL (used by both endpoints)
+# ─────────────────────────────────────────
+def process_single_url(url: str) -> dict:
     try:
-        with Controller.from_port(port=9051) as controller:
-            controller.authenticate()
-            controller.signal(Signal.NEWNYM)
-            time.sleep(5)
-            print("🔄 Got new Tor IP")
-    except Exception as e:
-        print("Could not rotate IP:", e)
+        # Step 1: Scrape
+        data = get_product_info(url)
+        if not data:
+            return {"url": url, "status": "failed", "reason": "Scraping failed or blocked"}
 
+        original_title       = clean_text(data["title"])
+        original_description = clean_text(data["description"])
+        image_url            = data.get("image_url", "")
 
-def scrape(url):
-    # ✅ Fix regional redirects BEFORE scraping
-    url = url.split("?")[0]
-    url = url.replace("aliexpress.us",     "www.aliexpress.com")
-    url = url.replace("de.aliexpress.com", "www.aliexpress.com")
-    url = url.replace("fr.aliexpress.com", "www.aliexpress.com")
-    url = url.replace("es.aliexpress.com", "www.aliexpress.com")
+        # Step 2: Save original content → get product_id
+        product_id = insert_original_content(
+            url, original_title, original_description, image_url
+        )
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                proxy={"server": "socks5://127.0.0.1:9050"},
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage"
-                ]
-            )
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                viewport={"width": 1366, "height": 768},
-                locale="en-US",
-                timezone_id="Asia/Karachi"
-            )
+        # # Step 3: OpenAI enhancement
+        improved = improve_product_content(original_title, original_description)
+        if not improved:
+            return {"url": url, "status": "failed", "reason": "OpenAI enhancement failed"}
 
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                window.chrome = { runtime: {} };
-            """)
+        # Step 4: Save enhanced content
+        insert_enhanced_content(
+            product_id,
+            improved["title"],
+            improved["description"],
+            json.dumps(improved["bullet_points"]),
+            image_url
+        )
 
-            page = context.new_page()
-            print("Opening URL:", url)
+        # Step 5: Assign categories (original + enhanced)
+        original_category = assign_category(original_title, original_description)
+        enhanced_category = assign_category(improved["title"], improved["description"])
 
-            page.goto(url, timeout=90000, wait_until="domcontentloaded")
+        insert_category_assignment(
+            product_id,
+            original_category["category_id"],
+            original_category["category_name"],
+            enhanced_category["category_id"],
+            enhanced_category["category_name"],
+            enhanced_category["confidence"]
+        )
 
-            # Simulate human behaviour
-            page.wait_for_timeout(6000)
-            page.mouse.move(200, 300)
-            page.mouse.wheel(0, 2000)
-            page.wait_for_timeout(4000)
+        # Step 6: Also save to old products table (backward compatibility)
+        insert_product((
+            url,
+            original_title,
+            original_description,
+            improved["title"],
+            improved["description"],
+            json.dumps(improved["bullet_points"]),
+            enhanced_category["category_id"],
+            enhanced_category["category_name"],
+            enhanced_category["confidence"],
+            enhanced_category["category_name"]   # enhanced_category column
+        ))
 
-            print("Page title:", page.title())
-            print("Current URL:", page.url)
-
-            # ✅ Fix: handle aliexpress.us redirect after load too
-            current_url = page.url
-            if "aliexpress.us" in current_url or "gatewayAdapt" in current_url:
-                fixed_url = current_url.split("?")[0]
-                fixed_url = fixed_url.replace("aliexpress.us", "www.aliexpress.com")
-                print(f"🔀 Redirected to regional site, retrying: {fixed_url}")
-                page.goto(fixed_url, timeout=90000, wait_until="domcontentloaded")
-                page.wait_for_timeout(5000)
-                print("Page title after fix:", page.title())
-                print("Current URL after fix:", page.url)
-
-            current_url = page.url
-            page_title = page.title().strip().lower()
-
-            # ✅ Fix: check for /item/ in url (works for all regions)
-            if (
-                "/item/" not in current_url
-                or page_title in ["aliexpress", "aliexpress.com", ""]
-                or "login" in current_url
-                or "passport" in current_url
-            ):
-                print("❌ Blocked or redirected — not a product page")
-                browser.close()
-                return None
-
-            # ── Title ──────────────────────────────────────────
-            title = ""
-            for selector in [
-                "h1[data-pl='product-title']",
-                ".product-title-text",
-                "h1"
-            ]:
-                if page.locator(selector).count() > 0:
-                    title = page.locator(selector).first.inner_text().strip()
-                    if title:
-                        print(f"✅ Title found via: {selector}")
-                        break
-
-            # ── Description ────────────────────────────────────
-            description = ""
-
-            # ✅ Scroll down to load description section
-            page.mouse.wheel(0, 3000)
-            page.wait_for_timeout(2000)
-
-            desc_selectors = [
-                "div[class*='description--description']",
-                "div[class*='detailmodule_text']",
-                "div[class*='description-content']",
-                "div[id*='description']",
-                "div[class*='product-description']",
-            ]
-            for selector in desc_selectors:
-                el = page.locator(selector)
-                if el.count() > 0:
-                    text = el.first.inner_text().strip()
-                    if text and text.lower() not in ["description", "report"]:
-                        description = text[:500]
-                        print(f"✅ Description found via: {selector}")
-                        break
-
-            # ── Bullet points ──────────────────────────────────
-            bullets = page.locator("li").all_text_contents()
-            bullet_points = bullets[:5] if bullets else []
-
-            # ── Image ──────────────────────────────────────────
-            image = ""
-            if page.locator("img").count() > 0:
-                image = page.locator("img").first.get_attribute("src")
-
-            browser.close()
-
-            if not title:
-                print("Login page detected or scraping blocked")
-                return None
-
-            return {
-                "title": title,
-                "description": description,
-                "bullet_points": bullet_points,
-                "image_url": image
+        return {
+            "url": url,
+            "status": "success",
+            "product_id": product_id,
+            "original": {
+                "title": original_title,
+                "description": original_description,
+                "category": original_category["category_name"]
+            },
+            "enhanced": {
+                "title": improved["title"],
+                "description": improved["description"],
+                "bullet_points": improved["bullet_points"],
+                "category": enhanced_category["category_name"]
             }
+        }
 
     except Exception as e:
-        print("Scraping failed for URL:", url)
-        print("Error:", e)
-        return None
+        return {"url": url, "status": "failed", "reason": str(e)}
 
 
-def get_product_info(url, max_retries=3):
-    """Try scraping with automatic Tor IP rotation on failure"""
-    for attempt in range(max_retries):
-        print(f"\n--- Attempt {attempt + 1} of {max_retries} ---")
-        result = scrape(url)
-        if result:
-            return result
-        if attempt < max_retries - 1:
-            print(f"Blocked! Rotating Tor IP...")
-            renew_tor_ip()
-    print("All attempts failed for URL:", url)
-    return None
+# ─────────────────────────────────────────
+# SINGLE URL ENDPOINT (original, kept working)
+# ─────────────────────────────────────────
+@app.post("/Single-URL")
+def generate_product(req: ProductRequest):
+    return process_single_url(req.url)
+
+
+# ─────────────────────────────────────────
+# MULTI URL ENDPOINT (new — uses threads)
+# ─────────────────────────────────────────
+@app.post("/MULTI-URL")
+def generate_products(req: MultiProductRequest):
+    if not req.urls:
+        return {"error": "No URLs provided"}
+
+    if len(req.urls) > 20:
+        return {"error": "Max 20 URLs allowed per request"}
+
+    results = []
+    success_count = 0
+    failed_count = 0
+
+    # Use ThreadPoolExecutor to process multiple URLs concurrently
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_to_url = {
+            executor.submit(process_single_url, url): url
+            for url in req.urls
+        }
+        for future in as_completed(future_to_url):
+            result = future.result()
+            results.append(result)
+            if result["status"] == "success":
+                success_count += 1
+            else:
+                failed_count += 1
+
+    return {
+        "total": len(req.urls),
+        "success": success_count,
+        "failed": failed_count,
+        "results": results
+    }
+
+
+# ─────────────────────────────────────────
+# VIEW ENDPOINTS
+# ─────────────────────────────────────────
+@app.get("/products")
+def view_products():
+    conn = sqlite3.connect("products.db")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM products")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+@app.get("/Original-Content-Table")
+def view_original_content():
+    conn = sqlite3.connect("products.db")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM original_content")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+@app.get("/Enhanced-Content-Table")
+def view_enhanced_content():
+    conn = sqlite3.connect("products.db")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM enhanced_content")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+@app.get("/Categories-Table")
+def view_category_assignments():
+    conn = sqlite3.connect("products.db")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM category_assignments")
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8686))
+    uvicorn.run(app, host="0.0.0.0", port=port)
