@@ -9,7 +9,7 @@ def renew_tor_ip():
         with Controller.from_port(port=9051) as controller:
             controller.authenticate()
             controller.signal(Signal.NEWNYM)
-            time.sleep(5)  # wait for new circuit
+            time.sleep(5)
             print("🔄 Got new Tor IP")
     except Exception as e:
         print("Could not rotate IP:", e)
@@ -20,7 +20,7 @@ def scrape(url):
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                proxy={"server": "socks5://127.0.0.1:9050"},  # 9050 = SOCKS proxy (keep this!)
+                proxy={"server": "socks5://127.0.0.1:9050"},
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
@@ -34,7 +34,6 @@ def scrape(url):
                 timezone_id="Asia/Karachi"
             )
 
-            # Hide automation signals from AliExpress
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3] });
@@ -46,6 +45,7 @@ def scrape(url):
             print("Opening URL:", url)
 
             page.goto(url, timeout=90000, wait_until="domcontentloaded")
+
             # Simulate human behaviour
             page.wait_for_timeout(6000)
             page.mouse.move(200, 300)
@@ -71,7 +71,7 @@ def scrape(url):
             # ── Title ──────────────────────────────────────────
             title = ""
             for selector in [
-                "h1[data-pl='product-title']",
+                "h1[data-pl='product-title']",   # ✅ your inspect confirmed this works
                 ".product-title-text",
                 "h1"
             ]:
@@ -82,27 +82,9 @@ def scrape(url):
                         break
 
             # ── Description ────────────────────────────────────
-            description = ""
-
-            # ✅ Scroll down to load description section first
-            page.mouse.wheel(0, 3000)
-            page.wait_for_timeout(2000)
-
-            desc_selectors = [
-                "div[class*='description--description']",
-                "div[class*='detailmodule_text']",
-                "div[class*='description-content']",
-                "div[id*='description']",
-                "div[class*='product-description']",
-            ]
-            for selector in desc_selectors:
-                el = page.locator(selector)
-                if el.count() > 0:
-                    text = el.first.inner_text().strip()
-                    if text and text.lower() not in ["description", "report"]:
-                        description = text[:500]
-                        print(f"✅ Description found via: {selector}")
-                        break
+            From your screenshot: description is inside the
+            description section with text like "---Size Reference Table---"
+          
 
             # ── Bullet points ──────────────────────────────────
             bullets = page.locator("li").all_text_contents()
