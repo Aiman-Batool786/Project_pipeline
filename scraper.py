@@ -2,6 +2,7 @@ from playwright.sync_api import sync_playwright
 from stem import Signal
 from stem.control import Controller
 import time
+import re
 
 
 def renew_tor_ip():
@@ -16,12 +17,10 @@ def renew_tor_ip():
 
 
 def scrape(url):
-    # ✅ Fix regional redirects BEFORE scraping
+    # ✅ Fix ANY regional subdomain before scraping
     url = url.split("?")[0]
-    url = url.replace("aliexpress.us",     "www.aliexpress.com")
-    url = url.replace("de.aliexpress.com", "www.aliexpress.com")
-    url = url.replace("fr.aliexpress.com", "www.aliexpress.com")
-    url = url.replace("es.aliexpress.com", "www.aliexpress.com")
+    url = re.sub(r'https://[a-z]{2}\.aliexpress\.com', 'https://www.aliexpress.com', url)
+    url = url.replace("aliexpress.us", "www.aliexpress.com")
 
     try:
         with sync_playwright() as p:
@@ -62,16 +61,20 @@ def scrape(url):
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
-            # ✅ Handle regional redirect after load
+            # ✅ Fix ANY regional redirect after load
             current_url = page.url
-            if "aliexpress.us" in current_url or "gatewayAdapt" in current_url:
-                fixed_url = current_url.split("?")[0]
-                fixed_url = fixed_url.replace("aliexpress.us", "www.aliexpress.com")
-                print(f"🔀 Redirected to regional site, retrying: {fixed_url}")
-                page.goto(fixed_url, timeout=90000, wait_until="domcontentloaded")
-                page.wait_for_timeout(5000)
-                print("Page title after fix:", page.title())
-                print("Current URL after fix:", page.url)
+            if "gatewayAdapt" in current_url or (
+                "aliexpress" in current_url and
+                not current_url.startswith("https://www.aliexpress.com")
+            ):
+                match = re.search(r'/item/[\d]+\.html', current_url)
+                if match:
+                    fixed_url = f"https://www.aliexpress.com{match.group()}"
+                    print(f"🔀 Redirected to regional site, retrying: {fixed_url}")
+                    page.goto(fixed_url, timeout=90000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(5000)
+                    print("Page title after fix:", page.title())
+                    print("Current URL after fix:", page.url)
 
             current_url = page.url
             page_title = page.title().strip().lower()
@@ -102,8 +105,6 @@ def scrape(url):
 
             # ── Description ────────────────────────────────────
             description = ""
-
-            # ✅ Scroll down to load description section
             page.mouse.wheel(0, 3000)
             page.wait_for_timeout(2000)
 
