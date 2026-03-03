@@ -2,7 +2,6 @@ from playwright.sync_api import sync_playwright
 from stem import Signal
 from stem.control import Controller
 import time
-import re
 
 
 def renew_tor_ip():
@@ -10,23 +9,18 @@ def renew_tor_ip():
         with Controller.from_port(port=9051) as controller:
             controller.authenticate()
             controller.signal(Signal.NEWNYM)
-            time.sleep(5)
+            time.sleep(5)  # wait for new circuit
             print("🔄 Got new Tor IP")
     except Exception as e:
         print("Could not rotate IP:", e)
 
 
 def scrape(url):
-    # ✅ Fix ANY regional subdomain before scraping
-    url = url.split("?")[0]
-    url = re.sub(r'https://[a-z]{2}\.aliexpress\.com', 'https://www.aliexpress.com', url)
-    url = url.replace("aliexpress.us", "www.aliexpress.com")
-
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                proxy={"server": "socks5://127.0.0.1:9050"},
+                proxy={"server": "socks5://127.0.0.1:9050"},  # 9050 = SOCKS proxy (keep this!)
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
@@ -40,6 +34,7 @@ def scrape(url):
                 timezone_id="Asia/Karachi"
             )
 
+            # Hide automation signals from AliExpress
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3] });
@@ -51,7 +46,6 @@ def scrape(url):
             print("Opening URL:", url)
 
             page.goto(url, timeout=90000, wait_until="domcontentloaded")
-
             # Simulate human behaviour
             page.wait_for_timeout(6000)
             page.mouse.move(200, 300)
@@ -61,27 +55,11 @@ def scrape(url):
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
-            # ✅ Fix ANY regional redirect after load
-            current_url = page.url
-            if "gatewayAdapt" in current_url or (
-                "aliexpress" in current_url and
-                not current_url.startswith("https://www.aliexpress.com")
-            ):
-                match = re.search(r'/item/[\d]+\.html', current_url)
-                if match:
-                    fixed_url = f"https://www.aliexpress.com{match.group()}"
-                    print(f"🔀 Redirected to regional site, retrying: {fixed_url}")
-                    page.goto(fixed_url, timeout=90000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(5000)
-                    print("Page title after fix:", page.title())
-                    print("Current URL after fix:", page.url)
-
+            # ✅ Detect if redirected to homepage or blocked
             current_url = page.url
             page_title = page.title().strip().lower()
-
-            # ✅ Block detection
             if (
-                "/item/" not in current_url
+                "aliexpress.com/item" not in current_url
                 or page_title in ["aliexpress", "aliexpress.com", ""]
                 or "login" in current_url
                 or "passport" in current_url
@@ -105,6 +83,8 @@ def scrape(url):
 
             # ── Description ────────────────────────────────────
             description = ""
+
+            # ✅ Scroll down to load description section first
             page.mouse.wheel(0, 3000)
             page.wait_for_timeout(2000)
 
