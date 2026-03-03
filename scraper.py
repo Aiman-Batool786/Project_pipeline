@@ -27,6 +27,7 @@ def scrape(url):
                     "--disable-dev-shm-usage"
                 ]
             )
+
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
@@ -36,7 +37,7 @@ def scrape(url):
 
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
                 window.chrome = { runtime: {} };
             """)
@@ -55,9 +56,10 @@ def scrape(url):
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
-            # ✅ Detect if redirected to homepage or blocked
+            # ❌ Detect block / redirect
             current_url = page.url
             page_title = page.title().strip().lower()
+
             if (
                 "aliexpress.com/item" not in current_url
                 or page_title in ["aliexpress", "aliexpress.com", ""]
@@ -68,10 +70,10 @@ def scrape(url):
                 browser.close()
                 return None
 
-            # ── Title ──────────────────────────────────────────
+            # ── Title ───────────────────────────────
             title = ""
             for selector in [
-                "h1[data-pl='product-title']",   # ✅ your inspect confirmed this works
+                "h1[data-pl='product-title']",
                 ".product-title-text",
                 "h1"
             ]:
@@ -81,24 +83,40 @@ def scrape(url):
                         print(f"✅ Title found via: {selector}")
                         break
 
-            # ── Description ────────────────────────────────────
-            From your screenshot: description is inside the
-            description section with text like "---Size Reference Table---"
-          
+            # ── Description ─────────────────────────
+            description = ""
+            for selector in [
+                "#product-description",
+                ".product-description",
+                "div.product-description",
+                "div[class*='description']"
+            ]:
+                if page.locator(selector).count() > 0:
+                    description = page.locator(selector).first.inner_text().strip()
+                    if description:
+                        print(f"✅ Description found via: {selector}")
+                        break
 
-            # ── Bullet points ──────────────────────────────────
-            bullets = page.locator("li").all_text_contents()
-            bullet_points = bullets[:5] if bullets else []
+            # ── Bullet Points ───────────────────────
+            bullet_points = []
+            try:
+                bullets = page.locator("li").all_text_contents()
+                bullet_points = [b.strip() for b in bullets if b.strip()][:5]
+            except:
+                pass
 
-            # ── Image ──────────────────────────────────────────
+            # ── Image ───────────────────────────────
             image = ""
-            if page.locator("img").count() > 0:
-                image = page.locator("img").first.get_attribute("src")
+            try:
+                if page.locator("img").count() > 0:
+                    image = page.locator("img").first.get_attribute("src")
+            except:
+                pass
 
             browser.close()
 
             if not title:
-                print("Login page detected or scraping blocked")
+                print("❌ Scraping blocked or login page detected")
                 return None
 
             return {
@@ -121,8 +139,10 @@ def get_product_info(url, max_retries=3):
         result = scrape(url)
         if result:
             return result
+
         if attempt < max_retries - 1:
-            print(f"Blocked! Rotating Tor IP...")
+            print("⚠ Blocked! Rotating Tor IP...")
             renew_tor_ip()
-    print("All attempts failed for URL:", url)
+
+    print("❌ All attempts failed for URL:", url)
     return None
