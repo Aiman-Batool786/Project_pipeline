@@ -24,6 +24,7 @@ def renew_tor_ip():
 def scrape(url):
     try:
         with sync_playwright() as p:
+
             # ── Browser & Context Setup ───────────────────────────────
             browser = p.chromium.launch(
                 headless=True,
@@ -55,7 +56,6 @@ def scrape(url):
             print("Opening URL:", url)
             page.goto(url, timeout=90000, wait_until="domcontentloaded")
 
-            # Simulate human behaviour
             page.wait_for_timeout(6000)
             page.mouse.move(200, 300)
             page.mouse.wheel(0, 2000)
@@ -64,16 +64,28 @@ def scrape(url):
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
-            # ── TITLE EXTRACTION ───────────────────────────────────────
-        title = ""
+            # ── Block Detection ────────────────────────────────────────
+            current_url = page.url
+            page_title = page.title().strip().lower()
+            if (
+                "/item/" not in current_url
+                or page_title in ["aliexpress", "aliexpress.com", ""]
+                or "login" in current_url
+                or "passport" in current_url
+            ):
+                print("❌ Blocked or redirected — not a product page")
+                browser.close()
+                return None
 
-        try:
-           page.wait_for_selector("h1[data-pl='product-title']", timeout=60000)
-           title = page.locator("h1[data-pl='product-title']").first.inner_text().strip()
-        except:
-       title = ""
+            # ── Title ──────────────────────────────────────────────────
+            title = ""
+            try:
+                page.wait_for_selector("h1[data-pl='product-title']", timeout=60000)
+                title = page.locator("h1[data-pl='product-title']").first.inner_text().strip()
+            except Exception:
+                print("Title not found")
 
-            # ── DESCRIPTION EXTRACTION ─────────────────────────────────
+            # ── Description ────────────────────────────────────────────
             description = ""
             page.mouse.wheel(0, 3000)
             page.wait_for_timeout(2000)
@@ -95,11 +107,11 @@ def scrape(url):
                         print(f"✅ Description found via: {selector}")
                         break
 
-            # ── BULLET POINTS ──────────────────────────────────────────
+            # ── Bullet Points ──────────────────────────────────────────
             bullets = page.locator("li").all_text_contents()
             bullet_points = bullets[:5] if bullets else []
 
-            # ── IMAGE ──────────────────────────────────────────────────
+            # ── Image ──────────────────────────────────────────────────
             image = ""
             if page.locator("img").count() > 0:
                 image = page.locator("img").first.get_attribute("src")
