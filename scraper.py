@@ -1,9 +1,12 @@
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from stem import Signal
 from stem.control import Controller
 import time
 
 
+# ────────────────────────────────────────────────
+# TOR IP ROTATION
+# ────────────────────────────────────────────────
 def renew_tor_ip():
     try:
         with Controller.from_port(port=9051) as controller:
@@ -15,9 +18,13 @@ def renew_tor_ip():
         print("Could not rotate IP:", e)
 
 
+# ────────────────────────────────────────────────
+# MAIN SCRAPE FUNCTION
+# ────────────────────────────────────────────────
 def scrape(url):
     try:
         with sync_playwright() as p:
+            # ── Browser & Context Setup ───────────────────────────────
             browser = p.chromium.launch(
                 headless=True,
                 proxy={"server": "socks5://127.0.0.1:9050"},
@@ -27,6 +34,7 @@ def scrape(url):
                     "--disable-dev-shm-usage"
                 ]
             )
+
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
@@ -42,8 +50,9 @@ def scrape(url):
             """)
 
             page = context.new_page()
-            print("Opening URL:", url)
 
+            # ── Navigation & Human Simulation ──────────────────────────
+            print("Opening URL:", url)
             page.goto(url, timeout=90000, wait_until="domcontentloaded")
 
             # Simulate human behaviour
@@ -55,32 +64,52 @@ def scrape(url):
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
-            # ── Title ──────────────────────────────────────────
+            # ── TITLE EXTRACTION ───────────────────────────────────────
             title = ""
 
             try:
-                page.wait_for_selector("h1[data-pl='product-title']", timeout=15000)
-                title = page.locator("h1[data-pl='product-title']").first.inner_text().strip()
-            except:
-                pass
+                page.wait_for_selector('h1[data-pl="product-title"]',
+                                       state="visible",
+                                       timeout=30000)
+                title_elem = page.locator('h1[data-pl="product-title"]').first
+                title = title_elem.inner_text().strip()
+                print("Found via data-pl →", title)
+            except PlaywrightTimeoutError:
+                print("Timeout waiting for h1[data-pl='product-title'] – page likely blocked or not loaded")
 
-            if not title:
-                for selector in [
-                    "h1[data-pl*='product-title']",
-                    "[data-pl='product-title']",
-                    "h1[class*='product'], h1[class*='title']",
-                    "h1"                                        # ✅ fixed: no colon
-                ]:
-                    elements = page.locator(selector)
-                    if elements.count() > 0:
-                        candidates = [el.inner_text().strip() for el in elements.all() if el.inner_text().strip()]
-                        if candidates:
-                            title = max(candidates, key=len)
-                            break
+            if not title or len(title) < 20:
+                print("Primary selector failed → trying fallbacks")
 
-            print("Title:", title)
+                fallback_selectors = [
+                    'h1[data-pl="product-title"]',
+                    'h1[class*="title"], h1[class*="name"]',
+                    '[data-pl*="title"], [data-pl*="product"]',
+                    'div[class*="product-title"], span[class*="title"]',
+                    'h1'
+                ]
 
-            # ── Description ────────────────────────────────────
+                candidates = []
+                for sel in fallback_selectors:
+                    elements = page.locator(sel)
+                    for el in elements.all():
+                        txt = el.inner_text().strip()
+                        if txt and len(txt) > 30 and "aliexpress" not in txt.lower() and "http" not in txt:
+                            candidates.append(txt)
+
+                if candidates:
+                    title = max(candidates, key=len)
+                    print("Fallback picked →", title)
+                else:
+                    all_h1 = [el.inner_text().strip() for el in page.locator("h1").all() if el.inner_text().strip()]
+                    print("All visible <h1> texts:", all_h1)
+
+            if title and ("aliexpress" in title.lower() or len(title) < 30 or "content saved" in title.lower()):
+                title = ""
+                print("Detected possible block/junk title – discarding")
+
+            print("Final Title:", title or "NOT FOUND – check if blocked")
+
+            # ── DESCRIPTION EXTRACTION ─────────────────────────────────
             description = ""
             page.mouse.wheel(0, 3000)
             page.wait_for_timeout(2000)
@@ -92,6 +121,7 @@ def scrape(url):
                 "div[id*='description']",
                 "div[class*='product-description']",
             ]
+
             for selector in desc_selectors:
                 el = page.locator(selector)
                 if el.count() > 0:
@@ -101,11 +131,11 @@ def scrape(url):
                         print(f"✅ Description found via: {selector}")
                         break
 
-            # ── Bullet points ──────────────────────────────────
+            # ── BULLET POINTS ──────────────────────────────────────────
             bullets = page.locator("li").all_text_contents()
             bullet_points = bullets[:5] if bullets else []
 
-            # ── Image ──────────────────────────────────────────
+            # ── IMAGE ──────────────────────────────────────────────────
             image = ""
             if page.locator("img").count() > 0:
                 image = page.locator("img").first.get_attribute("src")
@@ -129,6 +159,9 @@ def scrape(url):
         return None
 
 
+# ────────────────────────────────────────────────
+# RETRY WRAPPER WITH TOR ROTATION
+# ────────────────────────────────────────────────
 def get_product_info(url, max_retries=3):
     for attempt in range(max_retries):
         print(f"\n--- Attempt {attempt + 1} of {max_retries} ---")
