@@ -78,31 +78,33 @@ def scrape(url):
                 return None
 
             # ── Title ──────────────────────────────────────────────────
-            title = ""
+           title = ""
             for selector in ["h1[data-pl='product-title']", ".product-title-text", "h1"]:
                 if page.locator(selector).count() > 0:
                     title = page.locator(selector).first.inner_text().strip()
                     if title:
                         break
 
-            # ── Description ────────────────────────────────────────────
-            description = ""
-            page.mouse.wheel(0, 5000)
-            page.wait_for_timeout(3000)
+   description = ""
+            page.mouse.wheel(0, 3000)
+            page.wait_for_timeout(2000)
 
-            try:
-                page.wait_for_selector("p.detail-desc-decorate-content", timeout=60000)
-                paragraphs = page.locator("p.detail-desc-decorate-content")
-                all_text = []
-                for i in range(paragraphs.count()):
-                    text = paragraphs.nth(i).inner_text().strip()
-                    if text:
-                        all_text.append(text)
-                description = "\n".join(all_text)
-                if description:
-                    print("✅ Description extracted successfully")
-            except Exception as e:
-                print("❌ Description not found:", e)
+            desc_selectors = [
+                "div[class*='description--description']",
+                "div[class*='detailmodule_text']",
+                "div[class*='description-content']",
+                "div[id*='description']",
+                "div[class*='product-description']",
+            ]
+
+            for selector in desc_selectors:
+                el = page.locator(selector)
+                if el.count() > 0:
+                    text = el.first.inner_text().strip()
+                    if text and text.lower() not in ["description", "report"]:
+                        description = text[:500]
+                        print(f"✅ Description found via: {selector}")
+                        break
 
             # ── Bullet Points ──────────────────────────────────────────
             bullets = page.locator("li").all_text_contents()
