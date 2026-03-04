@@ -65,12 +65,13 @@ def scrape(url):
             print("Current URL:", page.url)
 
             # ── TITLE EXTRACTION ───────────────────────────────────────
-          title = ""
-            for selector in ["h1[data-pl='product-title']", ".product-title-text", "h1"]:
-                if page.locator(selector).count() > 0:
-                    title = page.locator(selector).first.inner_text().strip()
-                    if title:
-                        break
+        title = ""
+
+        try:
+           page.wait_for_selector("h1[data-pl='product-title']", timeout=60000)
+           title = page.locator("h1[data-pl='product-title']").first.inner_text().strip()
+        except:
+       title = ""
 
             # ── DESCRIPTION EXTRACTION ─────────────────────────────────
             description = ""
