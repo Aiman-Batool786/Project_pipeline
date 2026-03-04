@@ -3,9 +3,6 @@ from stem import Signal
 from stem.control import Controller
 import time
 
-# ─────────────────────────────────────────────
-# 🔁 Rotate Tor IP
-# ─────────────────────────────────────────────
 def renew_tor_ip():
     try:
         with Controller.from_port(port=9051) as controller:
@@ -16,94 +13,78 @@ def renew_tor_ip():
     except Exception as e:
         print("❌ Could not rotate IP:", e)
 
-# ─────────────────────────────────────────────
-# 🔎 Scraper Function
-# ─────────────────────────────────────────────
 def scrape(url):
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
                 proxy={"server": "socks5://127.0.0.1:9050"},
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox"
-                ]
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
             )
-
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1920, "height": 1080}
             )
-
-            # Prevent region-based redirects that trigger blocks
-            context.add_cookies([{
-                'name': 'aep_usuc_f',
-                'value': 'region=US&site=glo&b_locale=en_US&curr=USD',
-                'domain': '.aliexpress.com',
-                'path': '/'
-            }])
-
+            
+            # Anti-detection
+            context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            
             page = context.new_page()
-            
-            # Anti-bot stealth script
-            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
             print("🌐 Opening URL:", url)
-            response = page.goto(url, timeout=90000, wait_until="domcontentloaded")
             
-            # Wait for main content to render
+            # Use 'networkidle' to ensure data-heavy elements load
+            page.goto(url, timeout=90000, wait_until="networkidle")
             page.wait_for_timeout(5000)
 
-            # 🚨 BLOCK DETECTION
-            if "punish" in page.url or "login" in page.url.lower():
-                print("🚨 Blocked by Captcha/Punish Page.")
-                browser.close()
-                return None
-
-            # ─────────────────────────────
-            # 🏷️ TITLE (FIXED SELECTOR)
-            # ─────────────────────────────
+            # --- 🏷️ TITLE CORRECTION ---
             title = ""
-            # Priority selectors that target the product container specifically
+            # AliExpress often uses very specific class names that start with 'title--'
             title_selectors = [
-                "h1[data-pl='product-title']",
-                "div.product-title h1",
-                "h1.title--titleText--v7_m0_b",
-                ".product-title-text"
+                "h1[data-pl='product-title']", 
+                "h1.title--titleText--v7_m0_b", 
+                ".product-title-text",
+                "div#j-product-detail-name h1"
             ]
-
+            
             for selector in title_selectors:
-                try:
-                    locator = page.locator(selector).first
-                    if locator.is_visible():
-                        text = locator.inner_text().strip()
-                        # CRITICAL: Ignore the logo if it's accidentally caught
-                        if text and "AliExpress" not in text:
-                            title = text
-                            print(f"✅ Title found via: {selector}")
-                            break
-                except:
-                    continue
+                locator = page.locator(selector).first
+                if locator.count() > 0:
+                    raw_title = locator.inner_text().strip()
+                    # Verify we didn't just grab the "AliExpress" logo text
+                    if raw_title and "AliExpress" not in raw_title:
+                        title = raw_title
+                        break
 
-            # ─────────────────────────────
-            # 📝 DESCRIPTION (FIXED SELECTOR)
-            # ─────────────────────────────
+            # --- 📝 DESCRIPTION CORRECTION ---
             description = ""
-            # AliExpress requires scrolling to load the description data
-            page.mouse.wheel(0, 2000)
+            # 1. Scroll down to trigger lazy-loading of the description area
+            page.mouse.wheel(0, 3000)
             page.wait_for_timeout(3000)
 
-            desc_selectors = [
-                "#product-description",
-                ".product-description",
-                "div.description--content--A6ay_S3",
-                "#j-product-desc",
-                ".detailmodule_text"
-            ]
-
-            for selector in desc_selectors:
+            # 2. Check for Iframe (Most common for Ali descriptions)
+            # Ali often puts descriptions in an iframe with 'desc' in the URL
+            desc_iframe = None
+            for frame in page.frames:
+                if "desc" in frame.url or "description" in frame.url:
+                    desc_iframe = frame
+                    break
+            
+            if desc_iframe:
                 try:
+                    description = desc_iframe.locator("body").inner_text().strip()
+                    print("✅ Description found via Iframe")
+                except:
+                    pass
+
+            # 3. Fallback: Check standard div selectors if no iframe found
+            if not description:
+                desc_selectors = [
+                    "div.description--content--A6ay_S3",
+                    "div#product-description",
+                    "div.detailmodule_text",
+                    "div.product-description"
+                ]
+                for selector in desc_selectors:
                     el = page.locator(selector).first
                     if el.count() > 0:
                         text = el.inner_text().strip()
@@ -111,61 +92,34 @@ def scrape(url):
                             description = text
                             print(f"✅ Description found via: {selector}")
                             break
-                except:
-                    continue
 
-            # Fallback: Check if description is hidden in an iframe
-            if not description:
-                for frame in page.frames:
-                    if "desc" in frame.url.lower():
-                        try:
-                            description = frame.locator("body").inner_text().strip()
-                            print("✅ Description found inside iframe")
-                            break
-                        except:
-                            continue
-
-            # ─────────────────────────────
-            # 🖼️ IMAGE & DATA VALIDATION
-            # ─────────────────────────────
+            # --- 🖼️ IMAGE ---
             image = ""
-            try:
-                img_locator = page.locator(".magnifier--image--He47f9B, .pdp-main-image img").first
-                image = img_locator.get_attribute("src")
-            except:
-                pass
+            img_el = page.locator(".magnifier--image--He47f9B, .pdp-main-image img").first
+            if img_el.count() > 0:
+                image = img_el.get_attribute("src")
 
             browser.close()
 
             if not title:
-                print("❌ Failed to find product title.")
+                print("⚠️ No title found. Check if the page is rendering correctly.")
                 return None
 
             return {
                 "title": title,
-                "description": description[:1000] if description else "Description missing",
+                "description": description[:1000] if description else "N/A",
                 "image_url": image
             }
 
     except Exception as e:
-        print(f"❌ Scraping error: {e}")
+        print("❌ Error:", e)
         return None
 
-# ─────────────────────────────────────────────
-# 🔁 Main Execution Logic
-# ─────────────────────────────────────────────
 def get_product_info(url, max_retries=3):
     for attempt in range(max_retries):
-        print(f"\n--- Attempt {attempt + 1} of {max_retries} ---")
+        print(f"\n--- Attempt {attempt + 1} ---")
         result = scrape(url)
-        
         if result:
-            print("\n🎉 SUCCESS:")
-            print(f"Title: {result['title'][:70]}...")
             return result
-        
-        if attempt < max_retries - 1:
-            print("🔁 Rotating IP and retrying...")
-            renew_tor_ip()
-            
+        renew_tor_ip()
     return None
