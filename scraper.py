@@ -9,7 +9,7 @@ def renew_tor_ip():
         with Controller.from_port(port=9051) as controller:
             controller.authenticate()
             controller.signal(Signal.NEWNYM)
-            time.sleep(5)  # wait for new circuit to establish
+            time.sleep(5)
             print("Got new Tor IP")
     except Exception as e:
         print("Could not rotate IP:", e)
@@ -20,7 +20,7 @@ def scrape(url):
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                proxy={"server": "socks5://127.0.0.1:9050"},  # 9050 = SOCKS proxy, keep this!
+                proxy={"server": "socks5://127.0.0.1:9050"},
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
@@ -34,7 +34,6 @@ def scrape(url):
                 timezone_id="Asia/Karachi"
             )
 
-            # Hide automation signals
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
@@ -45,7 +44,6 @@ def scrape(url):
             page = context.new_page()
             print("Opening URL:", url)
 
-           
             page.goto(url, timeout=90000, wait_until="domcontentloaded")
 
             # Simulate human behaviour
@@ -54,30 +52,60 @@ def scrape(url):
             page.mouse.wheel(0, 2000)
             page.wait_for_timeout(4000)
 
-            # Debug info
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
-            # Screenshot for debugging (remove this line once scraper is working)
-            page.screenshot(path="/home/aimanbatool114/debug.png")
-
-            # Title extraction with multiple selectors
+            # ── Title ──────────────────────────────────────────
             title = ""
-            for selector in ["h1[data-pl='product-title']", ".product-title-text", "h1"]:
-                if page.locator(selector).count() > 0:
-                    title = page.locator(selector).first.inner_text().strip()
-                    if title:
+
+            try:
+                page.wait_for_selector("h1[data-pl='product-title']", timeout=15000)
+                title = page.locator("h1[data-pl='product-title']").first.inner_text().strip()
+            except:
+                pass
+
+            if not title:
+                for selector in [
+                    "h1[data-pl*='product-title']",
+                    "[data-pl='product-title']",
+                    "h1[class*='product'], h1[class*='title']",
+                    "h1"                                        # ✅ fixed: no colon
+                ]:
+                    elements = page.locator(selector)
+                    if elements.count() > 0:
+                        candidates = [el.inner_text().strip() for el in elements.all() if el.inner_text().strip()]
+                        if candidates:
+                            title = max(candidates, key=len)
+                            break
+
+            print("Title:", title)
+
+            # ── Description ────────────────────────────────────
+            description = ""
+            page.mouse.wheel(0, 3000)
+            page.wait_for_timeout(2000)
+
+            desc_selectors = [
+                "div[class*='description--description']",
+                "div[class*='detailmodule_text']",
+                "div[class*='description-content']",
+                "div[id*='description']",
+                "div[class*='product-description']",
+            ]
+            for selector in desc_selectors:
+                el = page.locator(selector)
+                if el.count() > 0:
+                    text = el.first.inner_text().strip()
+                    if text and text.lower() not in ["description", "report"]:
+                        description = text[:500]
+                        print(f"✅ Description found via: {selector}")
                         break
 
-            # Description extraction
-            paragraphs = page.locator("p").all_text_contents()
-            description = " ".join(paragraphs[:5]) if paragraphs else ""
-
-            # Bullet points
+            # ── Bullet points ──────────────────────────────────
             bullets = page.locator("li").all_text_contents()
             bullet_points = bullets[:5] if bullets else []
 
-            # Image
+            # ── Image ──────────────────────────────────────────
             image = ""
             if page.locator("img").count() > 0:
                 image = page.locator("img").first.get_attribute("src")
@@ -110,6 +138,5 @@ def get_product_info(url, max_retries=3):
         if attempt < max_retries - 1:
             print("Blocked! Rotating Tor IP and retrying...")
             renew_tor_ip()
-
     print("All attempts failed for URL:", url)
     return None
