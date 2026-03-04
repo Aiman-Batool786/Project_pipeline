@@ -78,14 +78,15 @@ def scrape(url):
                 return None
 
             # ── Title ──────────────────────────────────────────────────
-           title = ""
+            title = ""                                          # ✅ fixed
             for selector in ["h1[data-pl='product-title']", ".product-title-text", "h1"]:
                 if page.locator(selector).count() > 0:
                     title = page.locator(selector).first.inner_text().strip()
                     if title:
                         break
 
-   description = ""
+            # ── Description ────────────────────────────────────────────
+            description = ""                                    # ✅ fixed
             page.mouse.wheel(0, 3000)
             page.wait_for_timeout(2000)
 
