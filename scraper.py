@@ -40,16 +40,19 @@ def is_blocked_page(page):
             print(f"🚫 Blocked page detected in URL: {current_url}")
             return True
         
-        # === UPDATED: Catch fake "Aliexpress" title (this was your exact problem) ===
-        if page_title and page_title.strip().lower() in ["aliexpress", "ali express", "ali-express"]:
-            print(f"🚫 Blocked/generic page detected: page title is '{page_title}'")
-            return True
+        # === FIXED: Catch the exact problem in your log (empty title or "Aliexpress") ===
+        page_title_clean = (page_title or "").strip().lower()
+        if page_title_clean in ["", "aliexpress", "ali express", "ali-express"]:
+            # Extra safety: check if we're on aliexpress domain
+            if "aliexpress" in current_url.lower():
+                print(f"🚫 BLOCKED / Challenge page detected! Page title = '{page_title}' (only shows 'Aliexpress')")
+                return True
        
         # Check page content
         try:
             body_text = page.locator("body").inner_text().lower()
             if "verify" in body_text or "challenge" in body_text or "security" in body_text:
-                if page_title and page_title.strip() == "":
+                if page_title_clean == "":
                     print(f"🚫 Blocked page detected: empty title with security keywords")
                     return True
         except:
@@ -85,12 +88,12 @@ def get_product_title(page):
             count = page.locator(selector).count()
             if count > 0:
                 title = page.locator(selector).first.inner_text().strip()
-                # === UPDATED: stricter length to prevent "Aliexpress" ===
-                if title and len(title) > 20: 
+                # === FIXED: stricter length to prevent "Aliexpress" ===
+                if title and len(title) > 25: 
                     print(f"✅ Title found via '{selector}': {title[:80]}...")
                     return title
                 else:
-                    print(f"⚠️ Selector '{selector}' found but text too short: '{title}'")
+                    print(f"⚠️ Selector '{selector}' found but text too short/generic: '{title}'")
         except Exception as e:
             print(f"⚠️ Error with selector '{selector}': {e}")
             continue
@@ -109,10 +112,11 @@ def get_product_description(page):
     except:
         pass
    
-    # === UPDATED: exact selector from the HTML you pasted ===
     desc_selectors = [
-        "div[style*='font-family:arial, helvetica, sans-serif'][style*='font-size:13px']",  # ← YOUR EXACT CONTAINER
-        "div[style*='font-family:arial'][style*='font-size:13px']",
+        # Your specific pattern - divs containing feature text
+        "div[style*='font-family:arial'][style*='font-size:13px'] > div > span > span",
+        # More general patterns
+        "div[style*='font-family:arial'] div span span",
         "div[class*='description--description']",
         "div[class*='detailmodule_text']",
         "div[class*='description-content']",
@@ -131,10 +135,11 @@ def get_product_description(page):
            
             for element in elements:
                 try:
-                    text = element.inner_text().strip()          # ← full block, not tiny span
-                    if text and len(text) > 30: 
+                    text = element.inner_text().strip()
+                    if text and len(text) > 10: # Minimum text length
+                        # Skip headers and short labels
                         if text.lower() not in ["features:", "description", "report", "details", "specifications"]:
-                            if text not in collected_text:
+                            if text not in collected_text: # Avoid duplicates
                                 collected_text.append(text)
                 except:
                     continue
@@ -143,8 +148,9 @@ def get_product_description(page):
             continue
    
     if collected_text:
+        # Join all collected text
         full_desc = "\n".join(collected_text)
-        desc = full_desc[:1000]
+        desc = full_desc[:1000] # Limit to 1000 chars
         print(f"✅ Description found: {len(collected_text)} text blocks, {len(desc)} chars")
         return desc
    
@@ -154,26 +160,21 @@ def get_product_description(page):
 def get_bullet_points(page):
     """Extract bullet points"""
     try:
+        # Try to get from list items
         bullets = []
        
         # Strategy 1: Get from <li> elements
         li_elements = page.locator("li").all()
-        for li in li_elements[:10]:
-            # === UPDATED: skip the bad Q&A elements you showed ===
-            class_attr = (li.get_attribute("class") or "").lower()
-            if "ask-item" in class_attr or "answer-box" in class_attr:
-                continue
-                
+        for li in li_elements[:10]: # Get up to 10
             text = li.inner_text().strip()
             if text and len(text) > 5:
-                if text not in bullets:
-                    bullets.append(text)
+                bullets.append(text)
        
         if bullets:
             print(f"✅ Found {len(bullets)} bullet points")
             return bullets[:5]
        
-        # Strategy 2: fallback (unchanged)
+        # Strategy 2: Try to get key features from description area
         features = page.locator("div[class*='feature']").all()
         if features:
             for feature in features[:5]:
@@ -201,9 +202,10 @@ def get_product_image(page):
         for selector in image_selectors:
             if page.locator(selector).count() > 0:
                 img = page.locator(selector).first
+                # Try different attributes
                 src = img.get_attribute("src") or img.get_attribute("data-src") or img.get_attribute("data-original")
                 if src and ("http" in src or src.startswith("/")):
-                    if not src.startswith("data:"):
+                    if not src.startswith("data:"): # Skip data URIs
                         print(f"✅ Image found: {src[:100]}...")
                         return src
        
@@ -213,10 +215,16 @@ def get_product_image(page):
         print(f"⚠️ Error extracting image: {e}")
         return ""
 
-# ====================== scrape() and get_product_info() UNCHANGED ======================
 def scrape(url, attempt_num=1):
     """
     Scrape product information from AliExpress URL
+   
+    Args:
+        url: Product URL to scrape
+        attempt_num: Current attempt number (for logging)
+   
+    Returns:
+        dict with product data or None if failed
     """
     browser = None
     try:
@@ -224,6 +232,7 @@ def scrape(url, attempt_num=1):
         print(f"🔍 Scraping: {url}")
         print(f"{'='*60}")
        
+        # Launch browser with Tor proxy
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
@@ -237,6 +246,7 @@ def scrape(url, attempt_num=1):
                 ]
             )
            
+            # Create context with anti-detection measures
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
@@ -244,6 +254,7 @@ def scrape(url, attempt_num=1):
                 timezone_id="Asia/Karachi"
             )
            
+            # Add stealth scripts
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
@@ -258,14 +269,16 @@ def scrape(url, attempt_num=1):
            
             page = context.new_page()
            
+            # Add request interception for faster loading
             def handle_route(route):
                 if route.request.resource_type in ["image", "stylesheet", "font"]:
                     route.abort()
                 else:
                     route.continue_()
            
-            # page.route("**/*", handle_route)
+            # page.route("**/*", handle_route) # Uncomment to block images for faster loading
            
+            # Navigate to URL with longer timeout
             print(f"🌐 Navigating to URL...")
             try:
                 page.goto(url, timeout=120000, wait_until="domcontentloaded")
@@ -273,6 +286,7 @@ def scrape(url, attempt_num=1):
             except PlaywrightTimeoutError:
                 print(f"⚠️ Page load timeout, continuing anyway...")
            
+            # Wait for critical elements
             print(f"⏳ Waiting for product elements to load...")
             try:
                 page.wait_for_selector("h1[data-pl='product-title']", timeout=15000)
@@ -280,8 +294,10 @@ def scrape(url, attempt_num=1):
             except:
                 print(f"⚠️ Title element timeout")
            
+            # Extra wait for JS to render
             page.wait_for_timeout(5000)
            
+            # Simulate human behavior
             print(f"👤 Simulating human behavior...")
             page.mouse.move(
                 random.randint(100, 800),
@@ -291,16 +307,19 @@ def scrape(url, attempt_num=1):
             page.mouse.wheel(0, random.randint(1500, 3000))
             page.wait_for_timeout(random.randint(2000, 4000))
            
+            # Get final URL and page info
             final_url = page.url
             page_title = page.title()
            
             print(f"📄 Final URL: {final_url}")
             print(f"📋 Page Title: {page_title if page_title else '(empty)'}")
            
+            # Check if we hit a block page
             if is_blocked_page(page):
                 browser.close()
                 return None
            
+            # Extract product information
             print(f"\n📦 Extracting product data...")
             print(f"{'='*60}")
            
@@ -351,6 +370,13 @@ def scrape(url, attempt_num=1):
 def get_product_info(url, max_retries=4):
     """
     Get product info with retry logic and IP rotation
+   
+    Args:
+        url: Product URL
+        max_retries: Maximum number of retry attempts
+   
+    Returns:
+        dict with product data or None if all attempts fail
     """
     print(f"\n{'='*60}")
     print(f"🚀 Starting scrape process for: {url}")
@@ -365,6 +391,7 @@ def get_product_info(url, max_retries=4):
             print(f"\n🎉 SUCCESS on attempt {attempt + 1}!")
             return result
        
+        # If not last attempt, rotate IP and retry
         if attempt < max_retries - 1:
             print(f"\n🔄 Failed, rotating Tor IP and retrying...")
             if renew_tor_ip():
