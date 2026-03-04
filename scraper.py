@@ -4,17 +4,23 @@ from stem.control import Controller
 import time
 
 
+# ─────────────────────────────────────────────
+# 🔁 Rotate Tor IP
+# ─────────────────────────────────────────────
 def renew_tor_ip():
     try:
         with Controller.from_port(port=9051) as controller:
             controller.authenticate()
             controller.signal(Signal.NEWNYM)
             time.sleep(5)
-            print("Got new Tor IP")
+            print("✅ Got new Tor IP")
     except Exception as e:
-        print("Could not rotate IP:", e)
+        print("❌ Could not rotate IP:", e)
 
 
+# ─────────────────────────────────────────────
+# 🔎 Scraper Function
+# ─────────────────────────────────────────────
 def scrape(url):
     try:
         with sync_playwright() as p:
@@ -32,9 +38,13 @@ def scrape(url):
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
-                timezone_id="Asia/Karachi"
+                timezone_id="Asia/Karachi",
+                extra_http_headers={
+                    "accept-language": "en-US,en;q=0.9",
+                }
             )
 
+            # Anti-detection tweaks
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
@@ -44,71 +54,95 @@ def scrape(url):
 
             page = context.new_page()
 
-            print("Opening URL:", url)
-            page.goto(url, timeout=90000, wait_until="domcontentloaded")
+            print("🌐 Opening URL:", url)
+            page.goto(url, timeout=90000, wait_until="networkidle")
 
-            # Simulate human behaviour
-            page.wait_for_timeout(6000)
-            page.mouse.move(200, 300)
-            page.mouse.wheel(0, 2000)
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(5000)
 
-            print("Page title:", page.title())
-            print("Current URL:", page.url)
+            print("📌 Current URL:", page.url)
+            print("📌 Page Title:", page.title())
 
-            # ── Title ─────────────────────────────
+            # Save screenshot for debugging
+            page.screenshot(path="debug.png", full_page=True)
+
+            # 🚨 Detect login / captcha
+            if "login" in page.url.lower() or "captcha" in page.content().lower():
+                print("🚨 Login/Captcha page detected!")
+                browser.close()
+                return None
+
+            # ─────────────────────────────
+            # 🏷️ TITLE
+            # ─────────────────────────────
             title = ""
-            selectors = [
-                "h1[data-pl='product-title']",
-                ".product-title",
-                "div[id='item_title'] h1"
-            ]
+            try:
+                title = page.locator("h1").first.inner_text(timeout=10000).strip()
+            except:
+                pass
 
-            for selector in selectors:
-                locator = page.locator(selector).first
-                try:
-                    locator.wait_for(state="visible", timeout=5000)
-                    title = locator.inner_text().strip()
-                    if title:
-                        break
-                except:
-                    continue
-
-            # ── Description ───────────────────────
+            # ─────────────────────────────
+            # 📝 DESCRIPTION
+            # ─────────────────────────────
             description = ""
-            page.mouse.wheel(0, 3000)
-            page.wait_for_timeout(2000)
 
+            # Scroll to trigger lazy load
+            page.mouse.wheel(0, 4000)
+            page.wait_for_timeout(3000)
+
+            # Try normal page first
             desc_selectors = [
-                "div[class*='description--description']",
-                "div[class*='detailmodule_text']",
-                "div[class*='description-content']",
+                "div[class*='description']",
+                "div[class*='detailmodule']",
                 "div[id*='description']",
-                "div[class*='product-description']",
             ]
 
             for selector in desc_selectors:
-                el = page.locator(selector)
-                if el.count() > 0:
-                    text = el.first.inner_text().strip()
-                    if text and text.lower() not in ["description", "report"]:
-                        description = text[:500]
-                        print(f"✅ Description found via: {selector}")
-                        break
+                try:
+                    el = page.locator(selector)
+                    if el.count() > 0:
+                        text = el.first.inner_text().strip()
+                        if text and len(text) > 20:
+                            description = text[:800]
+                            print(f"✅ Description found via {selector}")
+                            break
+                except:
+                    continue
 
-            # ── Bullet points ─────────────────────
-            bullets = page.locator("li").all_text_contents()
-            bullet_points = bullets[:5] if bullets else []
+            # If not found → check iframes
+            if not description:
+                for frame in page.frames:
+                    if "description" in frame.url:
+                        try:
+                            description = frame.locator("body").inner_text()[:800]
+                            print("✅ Description found inside iframe")
+                            break
+                        except:
+                            continue
 
-            # ── Image ─────────────────────────────
+            # ─────────────────────────────
+            # 📌 BULLET POINTS
+            # ─────────────────────────────
+            bullet_points = []
+            try:
+                bullets = page.locator("ul li").all_text_contents()
+                bullet_points = [b.strip() for b in bullets if len(b.strip()) > 10][:5]
+            except:
+                pass
+
+            # ─────────────────────────────
+            # 🖼️ IMAGE
+            # ─────────────────────────────
             image = ""
-            if page.locator("img").count() > 0:
-                image = page.locator("img").first.get_attribute("src")
+            try:
+                img = page.locator("img").first
+                image = img.get_attribute("src")
+            except:
+                pass
 
             browser.close()
 
             if not title:
-                print("Login page detected or scraping blocked")
+                print("❌ No title found. Likely blocked.")
                 return None
 
             return {
@@ -119,22 +153,26 @@ def scrape(url):
             }
 
     except Exception as e:
-        print("Scraping failed for URL:", url)
+        print("❌ Scraping failed for URL:", url)
         print("Error:", e)
         return None
 
 
+# ─────────────────────────────────────────────
+# 🔁 Retry Logic
+# ─────────────────────────────────────────────
 def get_product_info(url, max_retries=3):
     for attempt in range(max_retries):
         print(f"\n--- Attempt {attempt + 1} of {max_retries} ---")
+
         result = scrape(url)
 
         if result:
             return result
 
         if attempt < max_retries - 1:
-            print("Blocked! Rotating Tor IP and retrying...")
+            print("🔁 Blocked! Rotating Tor IP and retrying...")
             renew_tor_ip()
 
-    print("All attempts failed for URL:", url)
+    print("❌ All attempts failed for URL:", url)
     return None
