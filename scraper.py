@@ -18,91 +18,82 @@ def renew_tor_ip():
 def scrape(url):
     try:
         with sync_playwright() as p:
-
-            # 🔥 REMOVE TOR FOR TESTING
             browser = p.chromium.launch(
-                headless=False,  # Important for testing
+                headless=True,
+                proxy={"server": "socks5://127.0.0.1:9050"},
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage"
                 ]
             )
-
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/124.0.0.0 Safari/537.36",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
                 timezone_id="Asia/Karachi"
             )
-
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
                 window.chrome = { runtime: {} };
             """)
-
             page = context.new_page()
-
-            # Step 1: Open homepage first
-            print("Opening homepage...")
-            page.goto("https://www.aliexpress.com", wait_until="domcontentloaded")
-            page.wait_for_timeout(5000)
-
-            # Step 2: Open product page
-            print("Opening product URL:", url)
+            print("Opening URL:", url)
             page.goto(url, timeout=90000, wait_until="domcontentloaded")
+            # Simulate human behaviour
             page.wait_for_timeout(6000)
-
             page.mouse.move(200, 300)
             page.mouse.wheel(0, 2000)
             page.wait_for_timeout(4000)
-
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
-            # ── TITLE ─────────────────────────────
+            # ... inside your page handling ...
             title = ""
-            try:
-                page.wait_for_selector("h1[data-pl='product-title']", timeout=30000)
-                title = page.locator("h1[data-pl='product-title']").inner_text().strip()
-                print("✅ Title found")
-            except Exception as e:
-                print("❌ Error fetching title:", e)
+            for selector in ["h1[data-pl='product-title']", ".product-title-text", "h1"]:
+                if page.locator(selector).count() > 0:
+                    title = page.locator(selector).first.inner_text().strip()
+                    if title:
+                        break
 
-            # ── DESCRIPTION ───────────────────────
+            # ── Description ────────────────────────────────────
             description = ""
-            try:
-                page.wait_for_selector("p.detail-desc-decorate-content", timeout=30000)
-
-                paragraphs = page.locator("p.detail-desc-decorate-content")
-                texts = []
-
-                for i in range(paragraphs.count()):
-                    txt = paragraphs.nth(i).inner_text().strip()
-                    if txt:
-                        texts.append(txt)
-
-                description = "\n".join(texts)
-                print("✅ Description found")
-
-            except Exception as e:
-                print("❌ Error fetching description:", e)
-
+            page.mouse.wheel(0, 3000)
+            page.wait_for_timeout(2000)
+            desc_selectors = [
+                "div[class*='description--description']",
+                "div[class*='detailmodule_text']",
+                "div[class*='description-content']",
+                "div[id*='description']",
+                "div[class*='product-description']",
+            ]
+            for selector in desc_selectors:
+                el = page.locator(selector)
+                if el.count() > 0:
+                    text = el.first.inner_text().strip()
+                    if text and text.lower() not in ["description", "report"]:
+                        description = text[:500]
+                        print(f"✅ Description found via: {selector}")
+                        break
+            # ── Bullet points ──────────────────────────────────
+            bullets = page.locator("li").all_text_contents()
+            bullet_points = bullets[:5] if bullets else []
+            # ── Image ──────────────────────────────────────────
+            image = ""
+            if page.locator("img").count() > 0:
+                image = page.locator("img").first.get_attribute("src")
             browser.close()
-
             if not title:
-                print("⚠️ Possibly blocked or login page")
+                print("Login page detected or scraping blocked")
                 return None
-
             return {
                 "title": title,
-                "description": description
+                "description": description,
+                "bullet_points": bullet_points,
+                "image_url": image
             }
-
     except Exception as e:
         print("Scraping failed for URL:", url)
         print("Error:", e)
@@ -113,13 +104,10 @@ def get_product_info(url, max_retries=3):
     for attempt in range(max_retries):
         print(f"\n--- Attempt {attempt + 1} of {max_retries} ---")
         result = scrape(url)
-
         if result:
             return result
-
         if attempt < max_retries - 1:
             print("Blocked! Rotating Tor IP and retrying...")
             renew_tor_ip()
-
     print("All attempts failed for URL:", url)
-    return None
+    return None	
