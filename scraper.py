@@ -18,9 +18,10 @@ def renew_tor_ip():
 def scrape(url):
     try:
         with sync_playwright() as p:
+
+            # 🔥 REMOVE TOR FOR TESTING
             browser = p.chromium.launch(
-                headless=True,
-                proxy={"server": "socks5://127.0.0.1:9050"},
+                headless=False,  # Important for testing
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
@@ -29,7 +30,9 @@ def scrape(url):
             )
 
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
                 timezone_id="Asia/Karachi"
@@ -44,10 +47,16 @@ def scrape(url):
 
             page = context.new_page()
 
-            print("Opening URL:", url)
-            page.goto(url, timeout=90000, wait_until="domcontentloaded")
+            # Step 1: Open homepage first
+            print("Opening homepage...")
+            page.goto("https://www.aliexpress.com", wait_until="domcontentloaded")
+            page.wait_for_timeout(5000)
 
+            # Step 2: Open product page
+            print("Opening product URL:", url)
+            page.goto(url, timeout=90000, wait_until="domcontentloaded")
             page.wait_for_timeout(6000)
+
             page.mouse.move(200, 300)
             page.mouse.wheel(0, 2000)
             page.wait_for_timeout(4000)
@@ -55,28 +64,38 @@ def scrape(url):
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
-            # ── Title ─────────────────────────────
+            # ── TITLE ─────────────────────────────
             title = ""
             try:
+                page.wait_for_selector("h1[data-pl='product-title']", timeout=30000)
                 title = page.locator("h1[data-pl='product-title']").inner_text().strip()
-                if title:
-                    print("✅ Title found")
+                print("✅ Title found")
             except Exception as e:
-                print("Error fetching title:", e)
+                print("❌ Error fetching title:", e)
 
-            # ── Description ───────────────────────
+            # ── DESCRIPTION ───────────────────────
             description = ""
             try:
-                description = page.locator("p.detail-desc-decorate-content").first.inner_text().strip()
-                if description:
-                    print("✅ Description found")
+                page.wait_for_selector("p.detail-desc-decorate-content", timeout=30000)
+
+                paragraphs = page.locator("p.detail-desc-decorate-content")
+                texts = []
+
+                for i in range(paragraphs.count()):
+                    txt = paragraphs.nth(i).inner_text().strip()
+                    if txt:
+                        texts.append(txt)
+
+                description = "\n".join(texts)
+                print("✅ Description found")
+
             except Exception as e:
-                print("Error fetching description:", e)
+                print("❌ Error fetching description:", e)
 
             browser.close()
 
-            if not title or not description:
-                print("Login page detected or scraping blocked")
+            if not title:
+                print("⚠️ Possibly blocked or login page")
                 return None
 
             return {
