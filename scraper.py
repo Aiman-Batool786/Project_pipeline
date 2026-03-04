@@ -43,12 +43,16 @@ def is_blocked_page(page):
             return True
         
         # Check page content
-        body_text = page.locator("body").inner_text().lower()
-        if "verify" in body_text or "challenge" in body_text or "security" in body_text:
-            if page_title and page_title.strip() == "":
-                print(f"🚫 Blocked page detected: empty title with security keywords")
-                return True
+        try:
+            body_text = page.locator("body").inner_text().lower()
+            if "verify" in body_text or "challenge" in body_text or "security" in body_text:
+                if page_title and page_title.strip() == "":
+                    print(f"🚫 Blocked page detected: empty title with security keywords")
+                    return True
+        except:
+            pass
         
+        print(f"✅ Page appears to be normal (not blocked)")
         return False
     except Exception as e:
         print(f"⚠️ Error checking if page is blocked: {e}")
@@ -57,8 +61,16 @@ def is_blocked_page(page):
 
 def get_product_title(page):
     """Extract product title with multiple selector strategies"""
+    # Wait for title to be visible first
+    try:
+        page.locator("h1[data-pl='product-title']").wait_for(timeout=10000)
+        print(f"✅ Title element detected on page")
+    except Exception as e:
+        print(f"⚠️ Title wait failed: {e}")
+    
     title_selectors = [
         "h1[data-pl='product-title']",
+        "h1[data-spm-anchor-id]",
         "h1.product-title-text",
         ".product-title-text",
         "h1.title",
@@ -68,25 +80,38 @@ def get_product_title(page):
     
     for selector in title_selectors:
         try:
-            if page.locator(selector).count() > 0:
+            count = page.locator(selector).count()
+            if count > 0:
                 title = page.locator(selector).first.inner_text().strip()
                 if title and len(title) > 5:  # Minimum title length
-                    print(f"✅ Title found: {title[:80]}...")
+                    print(f"✅ Title found via '{selector}': {title[:80]}...")
                     return title
+                else:
+                    print(f"⚠️ Selector '{selector}' found but text too short: '{title}'")
         except Exception as e:
+            print(f"⚠️ Error with selector '{selector}': {e}")
             continue
     
-    print("❌ Could not extract title")
+    print("❌ Could not extract title from any selector")
     return ""
 
 
 def get_product_description(page):
     """Extract product description with multiple selector strategies"""
+    print(f"📄 Extracting description...")
+    
     # Scroll to load description
-    page.mouse.wheel(0, 3000)
-    page.wait_for_timeout(2000)
+    try:
+        page.mouse.wheel(0, 3000)
+        page.wait_for_timeout(2000)
+    except:
+        pass
     
     desc_selectors = [
+        # Your specific pattern - divs containing feature text
+        "div[style*='font-family:arial'][style*='font-size:13px'] > div > span > span",
+        # More general patterns
+        "div[style*='font-family:arial'] div span span",
         "div[class*='description--description']",
         "div[class*='detailmodule_text']",
         "div[class*='description-content']",
@@ -96,18 +121,33 @@ def get_product_description(page):
         "section[class*='description']"
     ]
     
+    collected_text = []
+    
     for selector in desc_selectors:
         try:
             elements = page.locator(selector).all()
+            print(f"  Trying selector '{selector}': found {len(elements)} elements")
+            
             for element in elements:
-                text = element.inner_text().strip()
-                if text and len(text) > 20:  # Minimum description length
-                    if text.lower() not in ["description", "report", "details"]:
-                        desc = text[:1000]  # Increased from 500 to 1000
-                        print(f"✅ Description found via {selector}")
-                        return desc
+                try:
+                    text = element.inner_text().strip()
+                    if text and len(text) > 10:  # Minimum text length
+                        # Skip headers and short labels
+                        if text.lower() not in ["features:", "description", "report", "details", "specifications"]:
+                            if text not in collected_text:  # Avoid duplicates
+                                collected_text.append(text)
+                except:
+                    continue
         except Exception as e:
+            print(f"  ⚠️ Error with selector '{selector}': {e}")
             continue
+    
+    if collected_text:
+        # Join all collected text
+        full_desc = "\n".join(collected_text)
+        desc = full_desc[:1000]  # Limit to 1000 chars
+        print(f"✅ Description found: {len(collected_text)} text blocks, {len(desc)} chars")
+        return desc
     
     print("⚠️ No description found")
     return ""
@@ -240,13 +280,23 @@ def scrape(url, attempt_num=1):
             print(f"🌐 Navigating to URL...")
             try:
                 page.goto(url, timeout=120000, wait_until="domcontentloaded")
+                print(f"✅ Page loaded (domcontentloaded)")
             except PlaywrightTimeoutError:
                 print(f"⚠️ Page load timeout, continuing anyway...")
             
-            print(f"⏳ Waiting for page to stabilize...")
-            page.wait_for_timeout(8000)
+            # Wait for critical elements
+            print(f"⏳ Waiting for product elements to load...")
+            try:
+                page.wait_for_selector("h1[data-pl='product-title']", timeout=15000)
+                print(f"✅ Title element loaded")
+            except:
+                print(f"⚠️ Title element timeout")
+            
+            # Extra wait for JS to render
+            page.wait_for_timeout(5000)
             
             # Simulate human behavior
+            print(f"👤 Simulating human behavior...")
             page.mouse.move(
                 random.randint(100, 800),
                 random.randint(100, 600)
@@ -269,6 +319,7 @@ def scrape(url, attempt_num=1):
             
             # Extract product information
             print(f"\n📦 Extracting product data...")
+            print(f"{'='*60}")
             
             title = get_product_title(page)
             if not title:
@@ -276,17 +327,31 @@ def scrape(url, attempt_num=1):
                 browser.close()
                 return None
             
+            print(f"\n✅ Got title, now extracting description...")
             description = get_product_description(page)
+            
+            print(f"\n✅ Got description, now extracting bullet points...")
             bullet_points = get_bullet_points(page)
+            
+            print(f"\n✅ Got bullet points, now extracting image...")
             image_url = get_product_image(page)
             
             browser.close()
             
-            print(f"\n✅ Scraping successful!")
-            print(f"   - Title: {title[:60]}...")
-            print(f"   - Description: {len(description)} chars")
-            print(f"   - Bullet points: {len(bullet_points)} items")
-            print(f"   - Image: {image_url[:50] if image_url else 'None'}...")
+            print(f"\n{'='*60}")
+            print(f"✅ SCRAPING SUCCESSFUL!")
+            print(f"{'='*60}")
+            print(f"   ✓ Title: {title[:60]}...")
+            print(f"   ✓ Description: {len(description)} chars")
+            print(f"   ✓ Bullet points: {len(bullet_points)} items")
+            print(f"   ✓ Image: {image_url[:50] if image_url else 'None'}...")
+            
+            return {
+                "title": title,
+                "description": description,
+                "bullet_points": bullet_points,
+                "image_url": image_url
+            }
             
             return {
                 "title": title,
