@@ -29,7 +29,7 @@ def scrape(url):
             )
 
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
                 timezone_id="Asia/Karachi"
@@ -55,46 +55,33 @@ def scrape(url):
             print("Page title:", page.title())
             print("Current URL:", page.url)
 
-            # ── Title ──────────────────────────────────────────
+            # ── Title ─────────────────────────────
             title = ""
             try:
                 title = page.locator("h1[data-pl='product-title']").inner_text().strip()
                 if title:
-                    print(f"✅ Title found: {title}")
+                    print("✅ Title found")
             except Exception as e:
                 print("Error fetching title:", e)
 
-            # ── Description ───────────────────────────────────
+            # ── Description ───────────────────────
             description = ""
             try:
-                desc_selector = "p.detail-desc-decorate-content"
-                el = page.locator(desc_selector)
-                if el.count() > 0:
-                    description = el.first.inner_text().strip()
-                    print(f"✅ Description found via: {desc_selector}")
+                description = page.locator("p.detail-desc-decorate-content").first.inner_text().strip()
+                if description:
+                    print("✅ Description found")
             except Exception as e:
                 print("Error fetching description:", e)
 
-            # ── Bullet points ──────────────────────────────────
-            bullets = page.locator("li").all_text_contents()
-            bullet_points = bullets[:5] if bullets else []
-
-            # ── Image ──────────────────────────────────────────
-            image = ""
-            if page.locator("img").count() > 0:
-                image = page.locator("img").first.get_attribute("src")
-
             browser.close()
 
-            if not title:
+            if not title or not description:
                 print("Login page detected or scraping blocked")
                 return None
 
             return {
                 "title": title,
-                "description": description,
-                "bullet_points": bullet_points,
-                "image_url": image
+                "description": description
             }
 
     except Exception as e:
