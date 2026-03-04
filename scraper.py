@@ -1,203 +1,113 @@
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
+from stem import Signal
+from stem.control import Controller
 import time
-import random
-import os
 
 
-PROFILE_PATH = "/home/aimanbatool114/aliexpress_profile"
-
-
-# ─────────────────────────────────────────
-# TITLE EXTRACTION
-# ─────────────────────────────────────────
-def get_product_title(page):
+def renew_tor_ip():
     try:
-        page.wait_for_selector("h1", timeout=60000)
-
-        h1_tags = page.locator("h1").all()
-        for h1 in h1_tags:
-            text = h1.inner_text().strip()
-            if text and len(text) > 20:
-                print("✅ Product title found")
-                return text
-
-        return ""
-
+        with Controller.from_port(port=9051) as controller:
+            controller.authenticate()
+            controller.signal(Signal.NEWNYM)
+            time.sleep(5)
+            print("Got new Tor IP")
     except Exception as e:
-        print(f"❌ Title extraction error: {e}")
-        return ""
+        print("Could not rotate IP:", e)
 
 
-# ─────────────────────────────────────────
-# DESCRIPTION EXTRACTION
-# ─────────────────────────────────────────
-def get_product_description(page):
-    print("📄 Extracting description...")
-
-    # scroll to trigger lazy load
-    for _ in range(3):
-        page.mouse.wheel(0, 1500)
-        page.wait_for_timeout(2000)
-
-    selectors = [
-        "div[class*='description']",
-        "div[class*='detail-desc']",
-        "section[class*='description']",
-        "div[id*='description']"
-    ]
-
-    for selector in selectors:
-        try:
-            elements = page.locator(selector).all()
-            for el in elements:
-                text = el.inner_text().strip()
-                if text and len(text) > 100:
-                    print("✅ Description found")
-                    return text[:1500]
-        except:
-            continue
-
-    # try iframe
-    for frame in page.frames:
-        try:
-            body = frame.locator("body")
-            if body.count() > 0:
-                text = body.inner_text()
-                if text and len(text) > 200:
-                    print("✅ Description found in iframe")
-                    return text[:1500]
-        except:
-            continue
-
-    print("⚠️ Description not found")
-    return ""
-
-
-# ─────────────────────────────────────────
-# BULLET POINTS
-# ─────────────────────────────────────────
-def get_bullet_points(page):
-    bullets = []
-    try:
-        li_elements = page.locator("li").all()
-        for li in li_elements:
-            text = li.inner_text().strip()
-            if text and 10 < len(text) < 200:
-                if text not in bullets:
-                    bullets.append(text)
-        return bullets[:5]
-    except:
-        return []
-
-
-# ─────────────────────────────────────────
-# IMAGE EXTRACTION
-# ─────────────────────────────────────────
-def get_product_image(page):
-    try:
-        images = page.locator("img").all()
-        for img in images:
-            src = img.get_attribute("src")
-            if src and "http" in src and not src.startswith("data:"):
-                if "ae01" in src or "alidfs" in src:
-                    return src
-        return ""
-    except:
-        return ""
-
-
-# ─────────────────────────────────────────
-# MAIN SCRAPER
-# ─────────────────────────────────────────
-def scrape(url, attempt=1):
-
-    print("\n" + "=" * 60)
-    print(f"🔍 Attempt {attempt}: {url}")
-    print("=" * 60)
-
+def scrape(url):
     try:
         with sync_playwright() as p:
-
-            # create profile folder if not exists
-            os.makedirs(PROFILE_PATH, exist_ok=True)
-
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=PROFILE_PATH,
-                headless=False,  # IMPORTANT
+            browser = p.chromium.launch(
+                headless=True,
+                proxy={"server": "socks5://127.0.0.1:9050"},
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage"
                 ]
             )
-
-            page = context.pages[0] if context.pages else context.new_page()
-
-            # stealth patch
-            page.add_init_script("""
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                viewport={"width": 1366, "height": 768},
+                locale="en-US",
+                timezone_id="Asia/Karachi"
+            )
+            context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
                 window.chrome = { runtime: {} };
             """)
+            page = context.new_page()
+            print("Opening URL:", url)
+            page.goto(url, timeout=90000, wait_until="domcontentloaded")
+            # Simulate human behaviour
+            page.wait_for_timeout(6000)
+            page.mouse.move(200, 300)
+            page.mouse.wheel(0, 2000)
+            page.wait_for_timeout(4000)
+            print("Page title:", page.title())
+            print("Current URL:", page.url)
 
-            # 🔥 IMPORTANT: warm up homepage first
-            page.goto("https://www.aliexpress.com", wait_until="domcontentloaded")
-            page.wait_for_timeout(10000)
+            # ... inside your page handling ...
+            title = ""
+            for selector in ["h1[data-pl='product-title']", ".product-title-text", "h1"]:
+                if page.locator(selector).count() > 0:
+                    title = page.locator(selector).first.inner_text().strip()
+                    if title:
+                        break
 
-            # open product
-            page.goto(url, timeout=120000, wait_until="domcontentloaded")
-            page.wait_for_timeout(8000)
-
-            print("📄 Page title:", page.title())
-
-            # if first time and captcha appears, allow manual solve
-            if "captcha" in page.title().lower():
-                input("⚠️ Solve CAPTCHA manually, then press ENTER...")
-
-            title = get_product_title(page)
-
+            # ── Description ────────────────────────────────────
+            description = ""
+            page.mouse.wheel(0, 3000)
+            page.wait_for_timeout(2000)
+            desc_selectors = [
+                "div[class*='description--description']",
+                "div[class*='detailmodule_text']",
+                "div[class*='description-content']",
+                "div[id*='description']",
+                "div[class*='product-description']",
+            ]
+            for selector in desc_selectors:
+                el = page.locator(selector)
+                if el.count() > 0:
+                    text = el.first.inner_text().strip()
+                    if text and text.lower() not in ["description", "report"]:
+                        description = text[:500]
+                        print(f"✅ Description found via: {selector}")
+                        break
+            # ── Bullet points ──────────────────────────────────
+            bullets = page.locator("li").all_text_contents()
+            bullet_points = bullets[:5] if bullets else []
+            # ── Image ──────────────────────────────────────────
+            image = ""
+            if page.locator("img").count() > 0:
+                image = page.locator("img").first.get_attribute("src")
+            browser.close()
             if not title:
-                print("❌ No title found. Possibly blocked.")
-                context.close()
+                print("Login page detected or scraping blocked")
                 return None
-
-            description = get_product_description(page)
-            bullet_points = get_bullet_points(page)
-            image_url = get_product_image(page)
-
-            context.close()
-
-            print("✅ SCRAPE SUCCESS")
-
             return {
                 "title": title,
                 "description": description,
                 "bullet_points": bullet_points,
-                "image_url": image_url
+                "image_url": image
             }
-
-    except PlaywrightTimeoutError:
-        print("⏱️ Timeout occurred")
-        return None
-
     except Exception as e:
-        print(f"❌ Scrape error: {e}")
+        print("Scraping failed for URL:", url)
+        print("Error:", e)
         return None
 
 
-# ─────────────────────────────────────────
-# RETRY WRAPPER
-# ─────────────────────────────────────────
 def get_product_info(url, max_retries=3):
-
     for attempt in range(max_retries):
-        result = scrape(url, attempt + 1)
+        print(f"\n--- Attempt {attempt + 1} of {max_retries} ---")
+        result = scrape(url)
         if result:
             return result
-
-        print("⏳ Waiting before retry...")
-        time.sleep(random.randint(15, 30))
-
-    print("❌ All attempts failed")
-    return None
+        if attempt < max_retries - 1:
+            print("Blocked! Rotating Tor IP and retrying...")
+            renew_tor_ip()
+    print("All attempts failed for URL:", url)
+    return None	
