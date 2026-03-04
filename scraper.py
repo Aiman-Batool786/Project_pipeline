@@ -65,49 +65,12 @@ def scrape(url):
             print("Current URL:", page.url)
 
             # ── TITLE EXTRACTION ───────────────────────────────────────
-            title = ""
-
-            try:
-                page.wait_for_selector('h1[data-pl="product-title"]',
-                                       state="visible",
-                                       timeout=30000)
-                title_elem = page.locator('h1[data-pl="product-title"]').first
-                title = title_elem.inner_text().strip()
-                print("Found via data-pl →", title)
-            except PlaywrightTimeoutError:
-                print("Timeout waiting for h1[data-pl='product-title'] – page likely blocked or not loaded")
-
-            if not title or len(title) < 20:
-                print("Primary selector failed → trying fallbacks")
-
-                fallback_selectors = [
-                    'h1[data-pl="product-title"]',
-                    'h1[class*="title"], h1[class*="name"]',
-                    '[data-pl*="title"], [data-pl*="product"]',
-                    'div[class*="product-title"], span[class*="title"]',
-                    'h1'
-                ]
-
-                candidates = []
-                for sel in fallback_selectors:
-                    elements = page.locator(sel)
-                    for el in elements.all():
-                        txt = el.inner_text().strip()
-                        if txt and len(txt) > 30 and "aliexpress" not in txt.lower() and "http" not in txt:
-                            candidates.append(txt)
-
-                if candidates:
-                    title = max(candidates, key=len)
-                    print("Fallback picked →", title)
-                else:
-                    all_h1 = [el.inner_text().strip() for el in page.locator("h1").all() if el.inner_text().strip()]
-                    print("All visible <h1> texts:", all_h1)
-
-            if title and ("aliexpress" in title.lower() or len(title) < 30 or "content saved" in title.lower()):
-                title = ""
-                print("Detected possible block/junk title – discarding")
-
-            print("Final Title:", title or "NOT FOUND – check if blocked")
+          title = ""
+            for selector in ["h1[data-pl='product-title']", ".product-title-text", "h1"]:
+                if page.locator(selector).count() > 0:
+                    title = page.locator(selector).first.inner_text().strip()
+                    if title:
+                        break
 
             # ── DESCRIPTION EXTRACTION ─────────────────────────────────
             description = ""
