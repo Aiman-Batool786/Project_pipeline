@@ -34,6 +34,9 @@ def scrape(url):
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
                 timezone_id="Asia/Karachi"
+                extra_http_headers={
+                 "accept-language": "en-US,en;q=0.9",
+                 "upgrade-insecure-requests": "1"
             )
 
             # Stealth script
