@@ -33,10 +33,11 @@ def scrape(url):
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
-                timezone_id="Asia/Karachi"
+                timezone_id="Asia/Karachi",
                 extra_http_headers={
-                 "accept-language": "en-US,en;q=0.9",
-                 "upgrade-insecure-requests": "1"
+                    "accept-language": "en-US,en;q=0.9",
+                    "upgrade-insecure-requests": "1"
+                }
             )
 
             # Stealth script
