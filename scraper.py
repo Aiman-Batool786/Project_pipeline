@@ -20,7 +20,7 @@ def scrape(url):
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                proxy={"server": "socks5://127.0.0.1:9050"},  # ← TOR PROXY ADDED BACK
+                proxy={"server": "socks5://127.0.0.1:9050"},
                 args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
             )
             context = browser.new_context(
@@ -46,7 +46,16 @@ def scrape(url):
             page.goto(url, timeout=90000, wait_until="domcontentloaded")
             page.wait_for_timeout(3000)
             
-            # Check if redirected to security page (not domain change)
+            # Wait for product title to appear (not homepage title)
+            try:
+                page.wait_for_selector("h1[data-pl='product-title']", timeout=20000)
+                print("✓ Product title element found")
+            except:
+                print("⚠ Product title not found, returning homepage content")
+                browser.close()
+                return None
+            
+            # Check if redirected to punishment/security page
             current_url = page.url
             if "punish" in current_url or "/_____tmd_____/" in current_url or "/x5secdata=" in current_url:
                 print(f"❌ BLOCKED - Security page detected")
@@ -56,7 +65,7 @@ def scrape(url):
             page.wait_for_timeout(6000)
             page.mouse.move(200, 300)
             page.mouse.wheel(0, 2000)
-            page.wait_for_timeout(6000)  # Increased from 4000 to 6000
+            page.wait_for_timeout(6000)
 
             # TITLE - FIXED SELECTOR
             title = ""
@@ -112,6 +121,6 @@ def get_product_info(url, max_retries=3):
             return result
         if attempt < max_retries - 1:
             print("Blocked! Rotating Tor IP...")
-            renew_tor_ip()  # ← TOR IP ROTATION ADDED BACK
+            renew_tor_ip()
             time.sleep(3)
     return None
