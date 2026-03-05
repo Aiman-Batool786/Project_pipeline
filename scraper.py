@@ -12,7 +12,7 @@ def scrape(url):
             # Persistent browser (saves cookies)
             browser = p.chromium.launch_persistent_context(
                 user_data_dir="browser_profile",
-                headless=False,
+                headless=True,
                 args=[
                     "--start-maximized",
                     "--disable-blink-features=AutomationControlled"
