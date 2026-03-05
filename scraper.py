@@ -94,7 +94,6 @@ def scrape(url):
             # -------------------------------------------------
             # BULLET POINTS
             # -------------------------------------------------
-
             bullet_points = []
 
             bullets = page.locator("#product-description li").all_text_contents()
