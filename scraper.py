@@ -20,7 +20,7 @@ def scrape(url):
         with sync_playwright() as p:
 
             browser = p.chromium.launch(
-                headless=True,
+                headless=False,
                 proxy={"server": "socks5://127.0.0.1:9050"},
                 args=[
                     "--disable-blink-features=AutomationControlled",
