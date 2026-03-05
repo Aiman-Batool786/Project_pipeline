@@ -9,7 +9,7 @@ def renew_tor_ip():
         with Controller.from_port(port=9051) as controller:
             controller.authenticate()
             controller.signal(Signal.NEWNYM)
-            time.sleep(5)
+            time.sleep(6)
             print("Got new Tor IP")
     except Exception as e:
         print("Could not rotate IP:", e)
@@ -18,76 +18,98 @@ def renew_tor_ip():
 def scrape(url):
     try:
         with sync_playwright() as p:
+
             browser = p.chromium.launch(
                 headless=True,
                 proxy={"server": "socks5://127.0.0.1:9050"},
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage"
+                ]
             )
+
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
-                timezone_id="Asia/Karachi",
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                }
+                timezone_id="Asia/Karachi"
             )
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                Object.defineProperty(navigator, 'permissions', { get: () => ({ query: () => ({state: 'granted'}) }) });
-                window.chrome = { runtime: {} };
-                Object.defineProperty(document, 'webdriver', { get: () => undefined });
-            """)
-            page = context.new_page()
-            print("Opening URL:", url)
-            page.goto(url, timeout=90000, wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
-            
-            # Wait for product title to appear (not homepage title)
-            try:
-                page.wait_for_selector("h1[data-pl='product-title']", timeout=20000)
-                print("✓ Product title element found")
-            except:
-                print("⚠ Product title not found, returning homepage content")
-                browser.close()
-                return None
-            
-            # Check if redirected to punishment/security page
-            current_url = page.url
-            if "punish" in current_url or "/_____tmd_____/" in current_url or "/x5secdata=" in current_url:
-                print(f"❌ BLOCKED - Security page detected")
-                browser.close()
-                return None
-            
-            page.wait_for_timeout(6000)
-            page.mouse.move(200, 300)
-            page.mouse.wheel(0, 2000)
-            page.wait_for_timeout(6000)
 
-            # TITLE - FIXED SELECTOR
+            # Stealth script
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined})
+                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]})
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']})
+                window.chrome = {runtime:{}}
+            """)
+
+            page = context.new_page()
+
+            print("Opening URL:", url)
+
+            page.goto(url, timeout=90000)
+
+            # wait for full network idle
+            page.wait_for_load_state("networkidle")
+
+            page.wait_for_timeout(5000)
+
+            print("Current URL:", page.url)
+
+            # Detect redirect
+            if "aliexpress.com/item" not in page.url:
+                print("Redirect detected!")
+                browser.close()
+                return None
+
+            # simulate human behaviour
+            page.mouse.move(300, 400)
+            page.mouse.wheel(0, 2000)
+            page.wait_for_timeout(3000)
+
+            # Wait for product title
+            try:
+                page.wait_for_selector("h1", timeout=20000)
+            except:
+                print("Title not found")
+                browser.close()
+                return None
+
+            # TITLE
             title = ""
-            for selector in ["h1[data-pl='product-title']", "h1[class*='product-title']", "h1"]:
+            for selector in [
+                "h1[data-pl='product-title']",
+                "h1[class*='product-title']",
+                "h1"
+            ]:
                 if page.locator(selector).count() > 0:
                     title = page.locator(selector).first.inner_text().strip()
                     if title:
                         break
 
-            # DESCRIPTION - FIXED SELECTOR
+            # DESCRIPTION
             description = ""
-            page.mouse.wheel(0, 3000)
-            page.wait_for_timeout(2000)
-            for selector in ["div#product-description", "div[class*='description--product-description']", "div[class*='detailmodule_text']", "div[id*='description']"]:
+            page.mouse.wheel(0, 4000)
+            page.wait_for_timeout(3000)
+
+            for selector in [
+                "div#product-description",
+                "div[class*='description--product-description']",
+                "div[class*='detailmodule_text']",
+                "div[id*='description']"
+            ]:
                 if page.locator(selector).count() > 0:
                     text = page.locator(selector).first.inner_text().strip()
                     if text and text.lower() not in ["description", "report"]:
-                        description = text[:1000]
+                        description = text[:1200]
                         break
 
             # BULLET POINTS
-            bullets = page.locator("li").all_text_contents()
+            bullets = []
+            if page.locator("li").count() > 0:
+                bullets = page.locator("li").all_text_contents()
+
             bullet_points = [b.strip() for b in bullets[:8] if b.strip()]
 
             # IMAGE
@@ -98,29 +120,35 @@ def scrape(url):
                     image = src
 
             browser.close()
-            
+
             if not title:
                 return None
-            
+
             return {
                 "title": title,
                 "description": description,
                 "bullet_points": bullet_points,
                 "image_url": image
             }
+
     except Exception as e:
         print("Scraping failed:", e)
         return None
 
 
 def get_product_info(url, max_retries=3):
+
     for attempt in range(max_retries):
-        print(f"\n--- Attempt {attempt + 1} of {max_retries} ---")
+
+        print(f"\n--- Attempt {attempt+1} of {max_retries} ---")
+
         result = scrape(url)
+
         if result:
             return result
+
         if attempt < max_retries - 1:
-            print("Blocked! Rotating Tor IP...")
+            print("Blocked! Rotating IP...")
             renew_tor_ip()
-            time.sleep(3)
+
     return None
