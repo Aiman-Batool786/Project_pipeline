@@ -2,7 +2,6 @@ from playwright.sync_api import sync_playwright
 from stem import Signal
 from stem.control import Controller
 import time
-import re
 
 
 def renew_tor_ip():
@@ -21,223 +20,77 @@ def scrape(url):
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                proxy={"server": "socks5://127.0.0.1:9050"},
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage"
-                ]
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"]
             )
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
-                timezone_id="Asia/Karachi"
+                timezone_id="Asia/Karachi",
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                }
             )
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                Object.defineProperty(navigator, 'permissions', { get: () => ({ query: () => ({state: 'granted'}) }) });
                 window.chrome = { runtime: {} };
+                Object.defineProperty(document, 'webdriver', { get: () => undefined });
             """)
             page = context.new_page()
             print("Opening URL:", url)
             page.goto(url, timeout=90000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
             
-            # ⚠️ CRITICAL: Wait for actual product page, not homepage
-            # The h1 "AliExpress" is a clickable logo that redirects!
-            print("Waiting for product page to fully load...")
-            
-            # Wait for product title element to appear
-            try:
-                page.wait_for_selector("h1[data-pl='product-title']", timeout=15000)
-                print("✅ Product page loaded (product-title found)")
-            except:
-                # Fallback: wait for description section
-                try:
-                    page.wait_for_selector("div[id*='description']", timeout=15000)
-                    print("✅ Product page loaded (description section found)")
-                except:
-                    print("⚠️ Warning: Product page may not have loaded properly")
-            
-            # Check if we're on homepage (redirect happened)
+            # Check if redirected
             current_url = page.url
-            if "?spm=" not in current_url or "/detail/" not in current_url:
-                print(f"❌ REDIRECTED TO HOMEPAGE! URL: {current_url}")
+            if current_url != url and ("redirect" in current_url or "punish" in current_url or current_url.split('/')[2] != url.split('/')[2]):
+                print(f"❌ BLOCKED - Redirected to: {current_url[:100]}")
                 browser.close()
                 return None
             
-            # Simulate human behaviour
             page.wait_for_timeout(6000)
             page.mouse.move(200, 300)
             page.mouse.wheel(0, 2000)
             page.wait_for_timeout(4000)
-            print("Page title:", page.title())
-            print("Current URL:", page.url)
 
-            # ────────────────────────────────────
-            # TITLE EXTRACTION (FIXED SELECTORS)
-            # ────────────────────────────────────
+            # TITLE - FIXED SELECTOR
             title = ""
-            
-            # ⚠️ IMPORTANT: 
-            # h1[data-pl='product-title'] = The ACTUAL product title
-            # h1 = Could be "AliExpress" logo link (WRONG!)
-            # So we MUST use data-pl='product-title' first
-            
-            title_selectors = [
-                "h1[data-pl='product-title']",  # ✅ Product title ONLY - has data-pl attribute
-                "h1[data-tticheck='true']",     # ✅ Another specific selector for title
-                "div[data-pl='product-title']", # Sometimes it's a div not h1
-                "span[data-pl='product-title']", # Sometimes it's a span
-                # DO NOT USE GENERIC h1 - it will match the logo!
-            ]
-            
-            for selector in title_selectors:
-                try:
-                    elements = page.locator(selector)
-                    if elements.count() > 0:
-                        title = elements.first.inner_text().strip()
-                        # Remove common prefixes
-                        title = re.sub(r'^(Buy|Shop|Get|Order)\s+', '', title)
-                        if title and len(title) > 5 and "aliexpress" not in title.lower():
-                            print(f"✅ Title found via: {selector}")
-                            print(f"   Text: {title[:80]}...")
-                            break
-                except:
-                    pass
-            
-            # Validation: Make sure it's NOT the homepage
-            if not title or "aliexpress" in title.lower():
-                print("❌ ERROR: Got generic title or homepage logo - still on wrong page!")
-                browser.close()
-                return None
+            for selector in ["h1[data-pl='product-title']", "h1[class*='product-title']", "h1"]:
+                if page.locator(selector).count() > 0:
+                    title = page.locator(selector).first.inner_text().strip()
+                    if title:
+                        break
 
-            # ────────────────────────────────────
-            # DESCRIPTION EXTRACTION (FIXED)
-            # ────────────────────────────────────
+            # DESCRIPTION - FIXED SELECTOR
             description = ""
             page.mouse.wheel(0, 3000)
             page.wait_for_timeout(2000)
-            
-            # Try shadow DOM first (common on AliExpress)
-            desc_selectors = [
-                "div[data-pl='product-description']",
-                "div#product-description",
-                "div[class*='description--product-description']",
-                "div.detailmodule_text",
-                "div[class*='description-content']",
-                "div[id*='description']",
-                "div[class*='product-description']",
-                "div[class*='description']",
-            ]
-            
-            for selector in desc_selectors:
-                try:
-                    el = page.locator(selector)
-                    if el.count() > 0:
-                        text = el.first.inner_text().strip()
-                        # Filter out non-descriptive content
-                        if text and len(text) > 20 and text.lower() not in ["description", "report"]:
-                            description = text[:1000]  # Increased to 1000 chars
-                            print(f"✅ Description found via: {selector}")
-                            break
-                except:
-                    pass
-            
-            # Fallback: Try to get description from product specs or details
-            if not description:
-                try:
-                    # Look for specification sections
-                    spec_text = ""
-                    specs = page.locator("div[class*='specification']").all_text_contents()
-                    if specs:
-                        spec_text = " ".join(specs[:3])[:500]
-                    
-                    if spec_text and len(spec_text) > 20:
-                        description = spec_text
-                        print("✅ Description extracted from specifications")
-                except:
-                    pass
+            for selector in ["div#product-description", "div[class*='description--product-description']", "div[class*='detailmodule_text']", "div[id*='description']"]:
+                if page.locator(selector).count() > 0:
+                    text = page.locator(selector).first.inner_text().strip()
+                    if text and text.lower() not in ["description", "report"]:
+                        description = text[:1000]
+                        break
 
-            # ────────────────────────────────────
-            # BULLET POINTS EXTRACTION (IMPROVED)
-            # ────────────────────────────────────
-            bullet_points = []
-            try:
-                # Method 1: Direct <li> elements
-                li_elements = page.locator("li").all_text_contents()
-                if li_elements:
-                    bullet_points = [
-                        point.strip() 
-                        for point in li_elements[:8] 
-                        if point.strip() and len(point.strip()) > 5
-                    ]
-                    print(f"✅ Found {len(bullet_points)} bullet points from <li>")
-                
-                # Method 2: Div-based bullet points (common on AliExpress)
-                if len(bullet_points) < 3:
-                    divs = page.locator("div[class*='bullet']").all_text_contents()
-                    if divs:
-                        bullet_points = [
-                            point.strip() 
-                            for point in divs[:8] 
-                            if point.strip() and len(point.strip()) > 5
-                        ]
-                        print(f"✅ Found {len(bullet_points)} bullet points from div")
-                
-                # Method 3: Generate from description if bullets are missing
-                if len(bullet_points) < 3 and description:
-                    sentences = [s.strip() for s in description.split('.') if len(s.strip()) > 10]
-                    bullet_points = sentences[:5]
-                    print(f"✅ Generated {len(bullet_points)} bullet points from description")
-            
-            except Exception as e:
-                print(f"⚠️ Error extracting bullet points: {e}")
+            # BULLET POINTS
+            bullets = page.locator("li").all_text_contents()
+            bullet_points = [b.strip() for b in bullets[:8] if b.strip()]
 
-            # ────────────────────────────────────
-            # IMAGE EXTRACTION (IMPROVED)
-            # ────────────────────────────────────
+            # IMAGE
             image = ""
-            try:
-                # Try main product image
-                img_selectors = [
-                    "img[alt*='product']",
-                    "img[class*='product-image']",
-                    "img[data-pl='image']",
-                    "img.slide-image",
-                    "img",
-                ]
-                
-                for selector in img_selectors:
-                    img_elements = page.locator(selector)
-                    if img_elements.count() > 0:
-                        for i in range(min(3, img_elements.count())):  # Check first 3 images
-                            src = img_elements.nth(i).get_attribute("src")
-                            # Skip small/placeholder images
-                            if src and len(src) > 20 and "placeholder" not in src.lower():
-                                image = src
-                                print(f"✅ Image found: {image[:80]}...")
-                                break
-                        if image:
-                            break
-            except Exception as e:
-                print(f"⚠️ Error extracting image: {e}")
+            if page.locator("img").count() > 0:
+                src = page.locator("img").first.get_attribute("src")
+                if src:
+                    image = src
 
             browser.close()
             
-            # ────────────────────────────────────
-            # VALIDATION & RETURN
-            # ────────────────────────────────────
-            if not title or len(title) < 5:
-                print("❌ Login page detected or scraping blocked - No valid title found")
+            if not title:
                 return None
-            
-            print(f"\n✅ SCRAPE SUCCESSFUL:")
-            print(f"   Title: {title[:60]}...")
-            print(f"   Description: {description[:60]}..." if description else "   Description: NOT FOUND")
-            print(f"   Bullet Points: {len(bullet_points)}")
-            print(f"   Image: {'FOUND' if image else 'NOT FOUND'}")
             
             return {
                 "title": title,
@@ -245,37 +98,18 @@ def scrape(url):
                 "bullet_points": bullet_points,
                 "image_url": image
             }
-    
     except Exception as e:
-        print("❌ Scraping failed for URL:", url)
-        print("Error:", e)
+        print("Scraping failed:", e)
         return None
 
 
 def get_product_info(url, max_retries=3):
-    """
-    Get product info with retry logic
-    
-    Args:
-        url: Product URL to scrape
-        max_retries: Number of retry attempts (default: 3)
-    
-    Returns:
-        Dictionary with product data or None if failed
-    """
     for attempt in range(max_retries):
-        print(f"\n{'='*60}")
-        print(f"--- Attempt {attempt + 1} of {max_retries} ---")
-        print(f"{'='*60}")
+        print(f"\n--- Attempt {attempt + 1} of {max_retries} ---")
         result = scrape(url)
-        
         if result:
             return result
-        
         if attempt < max_retries - 1:
-            print("⚠️ Blocked! Rotating Tor IP and retrying...")
-            renew_tor_ip()
-            time.sleep(3)
-    
-    print(f"❌ All {max_retries} attempts failed for URL: {url}")
+            print("Blocked! Retrying...")
+            time.sleep(5)
     return None
