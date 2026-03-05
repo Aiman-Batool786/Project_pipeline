@@ -44,6 +44,29 @@ def scrape(url):
             print("Opening URL:", url)
             page.goto(url, timeout=90000, wait_until="domcontentloaded")
             
+            # ⚠️ CRITICAL: Wait for actual product page, not homepage
+            # The h1 "AliExpress" is a clickable logo that redirects!
+            print("Waiting for product page to fully load...")
+            
+            # Wait for product title element to appear
+            try:
+                page.wait_for_selector("h1[data-pl='product-title']", timeout=15000)
+                print("✅ Product page loaded (product-title found)")
+            except:
+                # Fallback: wait for description section
+                try:
+                    page.wait_for_selector("div[id*='description']", timeout=15000)
+                    print("✅ Product page loaded (description section found)")
+                except:
+                    print("⚠️ Warning: Product page may not have loaded properly")
+            
+            # Check if we're on homepage (redirect happened)
+            current_url = page.url
+            if "?spm=" not in current_url or "/detail/" not in current_url:
+                print(f"❌ REDIRECTED TO HOMEPAGE! URL: {current_url}")
+                browser.close()
+                return None
+            
             # Simulate human behaviour
             page.wait_for_timeout(6000)
             page.mouse.move(200, 300)
@@ -56,12 +79,18 @@ def scrape(url):
             # TITLE EXTRACTION (FIXED SELECTORS)
             # ────────────────────────────────────
             title = ""
+            
+            # ⚠️ IMPORTANT: 
+            # h1[data-pl='product-title'] = The ACTUAL product title
+            # h1 = Could be "AliExpress" logo link (WRONG!)
+            # So we MUST use data-pl='product-title' first
+            
             title_selectors = [
-                "h1[data-pl='product-title']",  # Primary selector for AliExpress
-                "h1[class*='product-title']",
-                "h1[class*='title']",
-                ".product-name",
-                "h1",
+                "h1[data-pl='product-title']",  # ✅ Product title ONLY - has data-pl attribute
+                "h1[data-tticheck='true']",     # ✅ Another specific selector for title
+                "div[data-pl='product-title']", # Sometimes it's a div not h1
+                "span[data-pl='product-title']", # Sometimes it's a span
+                # DO NOT USE GENERIC h1 - it will match the logo!
             ]
             
             for selector in title_selectors:
@@ -71,11 +100,18 @@ def scrape(url):
                         title = elements.first.inner_text().strip()
                         # Remove common prefixes
                         title = re.sub(r'^(Buy|Shop|Get|Order)\s+', '', title)
-                        if title and len(title) > 5:
+                        if title and len(title) > 5 and "aliexpress" not in title.lower():
                             print(f"✅ Title found via: {selector}")
+                            print(f"   Text: {title[:80]}...")
                             break
                 except:
                     pass
+            
+            # Validation: Make sure it's NOT the homepage
+            if not title or "aliexpress" in title.lower():
+                print("❌ ERROR: Got generic title or homepage logo - still on wrong page!")
+                browser.close()
+                return None
 
             # ────────────────────────────────────
             # DESCRIPTION EXTRACTION (FIXED)
