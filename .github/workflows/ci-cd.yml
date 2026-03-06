@@ -2,91 +2,97 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   pull_request:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
-  # -----------------------------
-  # Step 1: Build and Test
-  # -----------------------------
   build-and-test:
     runs-on: ubuntu-latest
-
     steps:
-      # Checkout your code
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4   # Updated to latest
 
-      # Set up Python 3.11
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # Install dependencies
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Run tests (optional)
       - name: Run tests
         run: |
-          echo "No tests yet"
+          echo "No tests yet"   # ← Add real tests later (pytest, etc.)
 
-
-  # -----------------------------
-  # Step 2: Deploy to VM
-  # -----------------------------
   deploy:
     runs-on: ubuntu-latest
-    needs: build-and-test
+    needs: build-and-test   # Only deploy if build succeeds
+    if: github.ref == 'refs/heads/main'   # Only deploy on push to main (not PR)
 
     steps:
-      # Checkout code
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      # Set up Python 3.11
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      # Install dependencies
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      # Deploy via SSH to your VM
       - name: Deploy to VM via SSH
-        uses: appleboy/ssh-action@v0.1.6
+        uses: appleboy/ssh-action@v1.0.3   # Safe & stable version (or try v1.2.5 if you want newest)
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_KEY }}
           port: 22
           script: |
+            set -e  # Exit on any error
+
             # Navigate to project directory
-            cd /home/aimanbatool114/Project_pipeline
+            cd /home/aimanbatool114/Project_pipeline || { echo "Project directory not found!"; exit 1; }
 
             # Pull latest code
-            git pull origin main
+            git pull origin main || { echo "Git pull failed"; exit 1; }
 
             # Activate virtual environment
-            source env/bin/activate
+            source venv/bin/activate || { echo "Failed to activate virtualenv"; exit 1; }
 
-            # Install/update dependencies
+            # Update pip and install dependencies
             pip install --upgrade pip
-            pip install -r requirements.txt
+            pip install -r requirements.txt || { echo "Failed to install dependencies"; exit 1; }
 
-            # Set OpenAI API key safely
-            export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            # Set secrets as environment variables
+            export OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}"
+            echo "${{ secrets.GCP_SA_KEY }}" > gcp-service-account.json
+            export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/gcp-service-account.json"
 
-            # Stop any running FastAPI process
-            pkill -f "uvicorn main:app" || true
+            # ────────────────────────────────────────────────
+            # Stop old process using PID file (reliable method)
+            # ────────────────────────────────────────────────
+            PID_FILE="/home/aimanbatool114/Project_pipeline/uvicorn.pid"
 
-            # Start FastAPI app in background
-            nohup uvicorn main:app --host 0.0.0.0 --port 8686 &
+            if [ -f "$PID_FILE" ]; then
+              OLD_PID=$(cat "$PID_FILE")
+              if kill -0 "$OLD_PID" 2>/dev/null; then
+                echo "Gracefully stopping old uvicorn (PID $OLD_PID)..."
+                kill "$OLD_PID" || echo "Could not kill old PID (already gone?)"
+                sleep 4  # Give more time for clean shutdown
+              else
+                echo "Old PID $OLD_PID not running anymore"
+              fi
+              rm -f "$PID_FILE"
+            else
+              echo "No PID file found — assuming first deploy or already stopped"
+            fi
+
+            # ────────────────────────────────────────────────
+            # Start the FastAPI server and save new PID
+            # ────────────────────────────────────────────────
+            nohup /home/aimanbatool114/Project_pipeline/venv/bin/python -m uvicorn main:app \
+              --host 0.0.0.0 \
+              --port 8686 \
+              --log-level info \
+              --access-log \
+              > uvicorn.log 2>&1 &
+
+            NEW_PID=$!
+            echo "$NEW_PID" > "$PID_FILE"
+            disown
+
+            echo "Deployment complete. New uvicorn started with PID $NEW_PID"
+            echo "Check all logs (requests + info + errors): tail -f uvicorn.log"
