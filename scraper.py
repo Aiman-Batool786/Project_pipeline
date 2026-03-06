@@ -1,31 +1,268 @@
 from playwright.sync_api import sync_playwright
-from stem import Signal
-from stem.control import Controller
-import time
-import logging
-import traceback
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import re
+import json
 
 
-def renew_tor_ip():
-    """Rotate to new Tor circuit"""
+def extract_from_meta_tags(page):
+    """Extract data from meta tags (most reliable)"""
+    data = {}
+    
+    # Title from og:title
     try:
-        with Controller.from_port(port=9051) as controller:
-            controller.authenticate()
-            controller.signal(Signal.NEWNYM)
-            time.sleep(5)
-            logger.info("✓ Got new Tor IP")
+        title_meta = page.locator('meta[property="og:title"]').get_attribute('content')
+        data['title'] = title_meta or ""
+    except:
+        data['title'] = ""
+    
+    # Main image from og:image
+    try:
+        image_meta = page.locator('meta[property="og:image"]').get_attribute('content')
+        data['image_1'] = image_meta or ""
+    except:
+        data['image_1'] = ""
+    
+    # Description from og:description
+    try:
+        desc_meta = page.locator('meta[property="og:description"]').get_attribute('content')
+        data['description'] = desc_meta or ""
+    except:
+        data['description'] = ""
+    
+    return data
+
+
+def extract_from_javascript(page):
+    """Extract data from embedded JavaScript"""
+    data = {}
+    
+    try:
+        # Get all script content
+        scripts = page.locator('script').all()
+        
+        for script in scripts:
+            try:
+                script_text = script.text_content()
+                
+                # Look for imagePathList
+                image_match = re.search(r'"imagePathList":\s*\[(.*?)\]', script_text)
+                if image_match:
+                    images_str = image_match.group(1)
+                    images = re.findall(r'"(https://[^"]+\.jpg[^"]*)"', images_str)
+                    
+                    for i, img in enumerate(images[:6], 1):
+                        key = f'image_{i}'
+                        data[key] = img.split('_')[0] + '.jpg' if '_' in img else img
+                
+                # Look for product price
+                price_match = re.search(r'"price":\s*"([^"]+)"', script_text)
+                if price_match:
+                    data['price'] = price_match.group(1)
+                
+                # Look for trade quantity
+                trade_match = re.search(r'"tradeCount":\s*"([^"]+)"', script_text)
+                if trade_match:
+                    data['sales_count'] = trade_match.group(1)
+                
+                # Look for shipping info
+                ship_match = re.search(r'"shipmentWay":\s*"([^"]+)"', script_text)
+                if ship_match:
+                    data['shipping'] = ship_match.group(1)
+                
+            except:
+                pass
+    
     except Exception as e:
-        logger.error(f"✗ Could not rotate IP: {e}")
+        print(f"[scraper] Warning extracting JS data: {e}")
+    
+    return data
 
 
-def scrape(url):
-    """Scrape AliExpress product"""
+def extract_from_dom(page):
+    """Extract data from DOM elements"""
+    data = {}
+    
+    # ========================
+    # TITLE
+    # ========================
+    title_selectors = [
+        '[data-pl="product-title"]',
+        '.title--line-one',
+        'h1',
+        '.product-title'
+    ]
+    
+    for selector in title_selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                title = page.locator(selector).first.inner_text().strip()
+                if title and len(title) > 5:
+                    data['title'] = title
+                    break
+        except:
+            pass
+    
+    # ========================
+    # DESCRIPTION
+    # ========================
+    desc_selectors = [
+        '[data-pl="product-detail-description"]',
+        '.product-description',
+        'div[class*="description"]',
+        '.detail-desc-text'
+    ]
+    
+    page.mouse.wheel(0, 3000)
+    page.wait_for_timeout(1000)
+    
+    for selector in desc_selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                desc = page.locator(selector).first.inner_text().strip()
+                if desc and len(desc) > 10:
+                    data['description'] = desc[:2000]
+                    break
+        except:
+            pass
+    
+    # ========================
+    # PRICE
+    # ========================
+    price_selectors = [
+        '[data-pl="product-price"]',
+        '.price-main',
+        '.product-price',
+        '[class*="price"]'
+    ]
+    
+    for selector in price_selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                price = page.locator(selector).first.inner_text().strip()
+                if price and ('$' in price or any(c.isdigit() for c in price)):
+                    data['price'] = price
+                    break
+        except:
+            pass
+    
+    # ========================
+    # BRAND
+    # ========================
+    brand_selectors = [
+        '[data-pl="product-brand"]',
+        '.shop-name',
+        'a[class*="store"]',
+        '.brand-name'
+    ]
+    
+    for selector in brand_selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                brand = page.locator(selector).first.inner_text().strip()
+                if brand and len(brand) < 100:
+                    data['brand'] = brand
+                    break
+        except:
+            pass
+    
+    # ========================
+    # SPECIFICATIONS
+    # ========================
+    spec_data = {}
+    
+    # Try to find specification tables
+    try:
+        spec_rows = page.locator('[class*="spec"]').all()
+        for row in spec_rows[:20]:
+            try:
+                text = row.inner_text().strip()
+                if ':' in text:
+                    key, value = text.split(':', 1)
+                    spec_data[key.lower().strip()] = value.strip()
+            except:
+                pass
+    except:
+        pass
+    
+    # Map specifications to attributes
+    if 'color' in spec_data or 'colour' in spec_data:
+        data['color'] = spec_data.get('color') or spec_data.get('colour')
+    
+    if 'size' in spec_data or 'dimensions' in spec_data:
+        data['dimensions'] = spec_data.get('size') or spec_data.get('dimensions')
+    
+    if 'weight' in spec_data:
+        data['weight'] = spec_data.get('weight')
+    
+    if 'material' in spec_data:
+        data['material'] = spec_data.get('material')
+    
+    # ========================
+    # BULLET POINTS / FEATURES
+    # ========================
+    bullets = []
+    
+    try:
+        # Try common selectors for bullet points
+        bullet_selectors = [
+            'ul li',
+            '[class*="feature"] li',
+            '[class*="highlight"] li'
+        ]
+        
+        for selector in bullet_selectors:
+            if page.locator(selector).count() > 0:
+                items = page.locator(selector).all_text_contents()
+                bullets = [b.strip() for b in items[:8] if b.strip() and len(b.strip()) > 5]
+                if bullets:
+                    break
+    except:
+        pass
+    
+    data['bullet_points'] = bullets
+    
+    # ========================
+    # RATINGS & REVIEWS
+    # ========================
+    try:
+        rating = page.locator('[class*="rating"]').first.inner_text().strip()
+        if rating:
+            data['rating'] = rating
+    except:
+        pass
+    
+    try:
+        reviews = page.locator('[class*="review"]').first.inner_text().strip()
+        if reviews:
+            data['reviews'] = reviews
+    except:
+        pass
+    
+    # ========================
+    # SHIPPING INFO
+    # ========================
+    try:
+        shipping = page.locator('[class*="ship"]').first.inner_text().strip()
+        if shipping:
+            data['shipping'] = shipping
+    except:
+        pass
+    
+    return data
+
+
+def get_product_info(url):
+    """
+    Main scraper function - optimized for AliExpress
+    
+    Priority:
+    1. Meta tags (most reliable)
+    2. JavaScript embedded data
+    3. DOM elements
+    """
+    
     try:
         with sync_playwright() as p:
-            # Launch browser (NO proxy here!)
+            
             browser = p.chromium.launch(
                 headless=True,
                 args=[
@@ -35,153 +272,85 @@ def scrape(url):
                 ]
             )
             
-            # Add proxy in context (CORRECT location!)
             context = browser.new_context(
-                proxy={"server": "socks5://127.0.0.1:9050"},  # ← PROXY HERE
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
                 timezone_id="Asia/Karachi"
             )
             
-            # Anti-detection
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                window.chrome = { runtime: {} };
-            """)
-            
             page = context.new_page()
-            logger.info(f"Opening URL: {url}")
             
-            # Navigate
-            page.goto(url, timeout=90000, wait_until="domcontentloaded")
-            time.sleep(3)
+            print(f"[scraper] Opening: {url}")
+            page.goto(url, timeout=60000, wait_until="domcontentloaded")
             
             # Simulate human behavior
+            page.wait_for_timeout(3000)
             page.mouse.move(200, 300)
-            time.sleep(1)
             page.mouse.wheel(0, 2000)
-            time.sleep(2)
+            page.wait_for_timeout(2000)
             
-            # ===== TITLE =====
-            title = ""
-            for selector in [
-                "h1[data-pl='product-title']",
-                "h1[class*='product-title']",
-                ".pc-main h1",
-                "h1"
-            ]:
-                if page.locator(selector).count() > 0:
-                    text = page.locator(selector).first.inner_text().strip()
-                    if text and len(text) > 5:
-                        title = text
-                        break
+            # =====================================================
+            # EXTRACT DATA - Priority Order
+            # =====================================================
             
-            logger.info(f"Title: {title[:50] if title else 'NOT FOUND'}...")
+            print("[scraper] Extracting from meta tags...")
+            data = extract_from_meta_tags(page)
             
-            # ===== DESCRIPTION =====
-            description = ""
-            page.mouse.wheel(0, 3000)
-            time.sleep(2)
+            print("[scraper] Extracting from JavaScript...")
+            js_data = extract_from_javascript(page)
+            data.update({k: v for k, v in js_data.items() if v and k not in data})
             
-            for selector in [
-                "div[class*='description']",
-                "div[id*='description']",
-                "div[class*='detail']",
-                "p"
-            ]:
-                elements = page.locator(selector).all()
-                for elem in elements[:5]:
-                    text = elem.inner_text().strip()
-                    if text and len(text) > 20 and "description" not in text.lower():
-                        description = text[:500]
-                        break
-                if description:
-                    break
-            
-            logger.info(f"Description: {len(description)} chars")
-            
-            # ===== BULLET POINTS =====
-            try:
-                bullets = page.locator("li").all_text_contents()
-                bullet_points = [b.strip() for b in bullets[:8] if b.strip() and len(b.strip()) > 5]
-            except:
-                bullet_points = []
-            
-            logger.info(f"Bullets: {len(bullet_points)} found")
-            
-            # ===== IMAGE =====
-            image = ""
-            selectors = [
-                "img[src*='oss']",
-                "img[class*='product']",
-                "img[class*='main']",
-                "img[data-src*='oss']"
-            ]
-            
-            for selector in selectors:
-                if page.locator(selector).count() > 0:
-                    img = page.locator(selector).first
-                    src = img.get_attribute("src") or img.get_attribute("data-src")
-                    if src and ("http" in src or "data:" in src):
-                        image = src
-                        break
-            
-            logger.info(f"Image: {'FOUND' if image else 'NOT FOUND'}")
+            print("[scraper] Extracting from DOM...")
+            dom_data = extract_from_dom(page)
+            data.update({k: v for k, v in dom_data.items() if v and k not in data})
             
             browser.close()
             
-            # Validate
-            if not title:
-                logger.warning("⚠ No title extracted!")
+            # =====================================================
+            # VALIDATION
+            # =====================================================
+            
+            if not data.get('title'):
+                print("[scraper] ERROR: No title extracted")
                 return None
             
-            logger.info("✓ Scraping successful!")
+            print(f"[scraper] ✅ Successfully extracted {len(data)} attributes")
             
-            return {
-                "title": title,
-                "description": description,
-                "bullet_points": bullet_points,
-                "image_url": image
-            }
+            # Add defaults for missing fields
+            for key in ['description', 'brand', 'color', 'dimensions', 'weight', 
+                       'material', 'shipping', 'price', 'rating', 'reviews']:
+                if key not in data or not data[key]:
+                    data[key] = ""
             
+            # Ensure images list
+            for i in range(1, 7):
+                if f'image_{i}' not in data:
+                    data[f'image_{i}'] = ""
+            
+            return data
+    
     except Exception as e:
-        logger.error(f"✗ Scraping failed: {e}")
-        logger.error(traceback.format_exc())
+        print(f"[scraper] ERROR: {e}")
         return None
 
 
-def get_product_info(url, max_retries=3):
-    """Get product info with retries"""
-    for attempt in range(max_retries):
-        logger.info(f"\n--- Attempt {attempt + 1}/{max_retries} ---")
-        result = scrape(url)
-        
-        if result:
-            logger.info("✓ SUCCESS!")
-            return result
-        
-        if attempt < max_retries - 1:
-            logger.warning("Blocked! Rotating IP...")
-            renew_tor_ip()
-    
-    logger.error("✗ All attempts failed!")
-    return None
-
-
+# ============================================================
 # TEST
+# ============================================================
+
 if __name__ == "__main__":
-    url = "https://www.aliexpress.com/item/1005006246885476.html"
-    result = get_product_info(url)
+    # Test URL
+    test_url = "https://www.aliexpress.com/item/1005010738806664.html"
+    
+    result = get_product_info(test_url)
     
     if result:
-        print("\n" + "="*50)
-        print(f"Title: {result['title']}")
-        print(f"Price: {result.get('price', 'N/A')}")
-        print(f"Description: {result['description'][:100]}...")
-        print(f"Image: {result['image_url'][:50]}...")
-        print("="*50)
+        print("\n=== SCRAPED DATA ===")
+        for key, value in result.items():
+            if isinstance(value, list):
+                print(f"{key}: {len(value)} items")
+            else:
+                print(f"{key}: {str(value)[:80]}")
     else:
         print("Failed to scrape")
