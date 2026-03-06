@@ -19,7 +19,8 @@ def get_embedding(text: str):
     return np.array(response.data[0].embedding)
 
 print("Generating embeddings (one-time process)...")
-df["embedding"] = df["category_name"].apply(get_embedding)
+df["embedding"] = df["category_text"].apply(get_embedding)
+# df["embedding"] = df["category_name"].apply(get_embedding)
 
 # Save CSV (human readable backup)
 df.to_csv("categories_with_embeddings.csv", index=False)
