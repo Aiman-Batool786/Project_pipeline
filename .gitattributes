@@ -1,2 +1,4 @@
 categories_with_embeddings.csv filter=lfs diff=lfs merge=lfs -text
 category_embeddings.pkl filter=lfs diff=lfs merge=lfs -text
+*.csv filter=lfs diff=lfs merge=lfs -text
+*.pkl filter=lfs diff=lfs merge=lfs -text
