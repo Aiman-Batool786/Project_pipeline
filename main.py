@@ -1,14 +1,14 @@
 """
-FastAPI Server - ULTRA FAST VERSION
-Skips heavy operations, returns instantly, processes in background
+FastAPI Server - COMPLETE INFO IN RESPONSE
+Returns all product details immediately (processing happens, returns full data)
 """
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
 import sqlite3
 import logging
-from typing import List
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 # ─────────────────────────────────────────
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # FASTAPI APP INITIALIZATION
 # ─────────────────────────────────────────
 app = FastAPI(
-    title="Octopia Template Pipeline - Ultra Fast",
+    title="Octopia Template Pipeline - Complete Response",
     version="2.0.0"
 )
 
@@ -65,22 +65,29 @@ class BulkProductRequest(BaseModel):
 
 
 # ─────────────────────────────────────────
-# ROOT & HEALTH ENDPOINTS (INSTANT)
+# ROOT & HEALTH ENDPOINTS
 # ─────────────────────────────────────────
 
 @app.get("/", tags=["Info"])
 def root():
-    """API info - INSTANT"""
+    """API info"""
     return {
         "status": "running",
         "service": "Octopia Template Pipeline",
-        "version": "2.0.0"
+        "version": "2.0.0",
+        "features": [
+            "Advanced scraping (25+ attributes, 6 images)",
+            "Content enhancement (OpenAI)",
+            "Octopia categorization (5,806 categories)",
+            "Template mapping (71 columns)",
+            "Excel XLSM generation"
+        ]
     }
 
 
 @app.get("/health", tags=["Info"])
 def health_check():
-    """Health check - INSTANT"""
+    """Health check"""
     try:
         conn = sqlite3.connect(DB_NAME)
         conn.close()
@@ -90,22 +97,27 @@ def health_check():
 
 
 # ─────────────────────────────────────────
-# BACKGROUND PROCESSING FUNCTION
+# MAIN PROCESSING FUNCTION
 # ─────────────────────────────────────────
 
-def process_product_background(url: str, product_id: int):
+def process_product_complete(url: str) -> Dict[str, Any]:
     """
-    Process product in background (fast endpoint returns immediately)
+    Process product and return COMPLETE INFO
     """
+    
+    product_id = None
+    
     try:
-        logger.info(f"🚀 Background: Processing {url}")
+        logger.info(f"\n🚀 Processing: {url}")
         
+        # ================= IMPORTS =================
         from scraper import get_product_info
         from category_utils import assign_category
         from data_mapper import map_scraped_data_to_template, validate_mapped_data
         from template_filler import fill_template_for_product
         from openai_client import improve_product_content
         from db import (
+            create_all_tables,
             insert_scraped_product,
             insert_category_assignment,
             insert_mapped_product,
@@ -113,33 +125,56 @@ def process_product_background(url: str, product_id: int):
             log_processing
         )
         
+        # ================= INITIALIZATION =================
+        create_all_tables()
+        
         TEMPLATE_PATH = "pdt_template_fr-FR_20260305_090255.xlsm"
         FILLED_TEMPLATES_DIR = "./filled_templates"
         
         if not os.path.exists(FILLED_TEMPLATES_DIR):
             os.makedirs(FILLED_TEMPLATES_DIR)
         
-        # ============ STEP 1: SCRAPE ============
+        # ================= STEP 1: SCRAPE =================
         logger.info("📥 Scraping...")
         scraped_data = get_product_info(url)
         
         if not scraped_data:
-            log_processing(product_id, url, "scraping", "error", "Scraping failed")
-            return
+            return {
+                "success": False,
+                "url": url,
+                "error": "Scraping failed",
+                "timestamp": datetime.now().isoformat()
+            }
         
         title = scraped_data.get("title", "")
         description = scraped_data.get("description", "")
         
         if not title:
-            log_processing(product_id, url, "scraping", "error", "No title")
-            return
+            return {
+                "success": False,
+                "url": url,
+                "error": "No title extracted",
+                "timestamp": datetime.now().isoformat()
+            }
         
-        # Update scraped product
+        logger.info(f"✅ Extracted {len(scraped_data)} attributes")
+        
+        # ================= STEP 2: STORE SCRAPED DATA =================
+        logger.info("💾 Storing scraped data...")
         product_id = insert_scraped_product(url, scraped_data)
+        
+        if not product_id:
+            return {
+                "success": False,
+                "url": url,
+                "error": "Failed to store data",
+                "timestamp": datetime.now().isoformat()
+            }
+        
         log_processing(product_id, url, "scraping", "success")
         
-        # ============ STEP 2: ENHANCE ============
-        logger.info("🤖 Enhancing...")
+        # ================= STEP 3: ENHANCE CONTENT =================
+        logger.info("🤖 Enhancing content...")
         try:
             enhanced = improve_product_content(title, description)
             if not enhanced:
@@ -148,26 +183,32 @@ def process_product_background(url: str, product_id: int):
                     "description": description,
                     "bullet_points": scraped_data.get("bullet_points", [])
                 }
-        except:
+        except Exception as e:
+            logger.warning(f"Enhancement skipped: {e}")
             enhanced = {
                 "title": title,
                 "description": description,
                 "bullet_points": scraped_data.get("bullet_points", [])
             }
         
-        # ============ STEP 3: CATEGORIZE ============
+        logger.info("✅ Content enhanced")
+        
+        # ================= STEP 4: CATEGORIZE =================
         logger.info("🏷️ Categorizing...")
         try:
             category = assign_category(
                 enhanced.get("title", title),
                 enhanced.get("description", description)
             )
-        except:
+        except Exception as e:
+            logger.warning(f"Categorization skipped: {e}")
             category = {
                 "category_id": "0",
                 "category_name": "Unknown",
                 "confidence": 0.0
             }
+        
+        logger.info(f"✅ Category: {category['category_name']}")
         
         # Store category
         insert_category_assignment(
@@ -180,8 +221,11 @@ def process_product_background(url: str, product_id: int):
         )
         log_processing(product_id, url, "categorization", "success")
         
-        # ============ STEP 4: MAP ============
-        logger.info("🗺️ Mapping...")
+        # ================= STEP 5: MAP =================
+        logger.info("🗺️ Mapping to template...")
+        mapped_data = {}
+        is_valid = False
+        
         try:
             enriched_data = scraped_data.copy()
             enriched_data['title'] = enhanced.get('title', title)
@@ -189,18 +233,24 @@ def process_product_background(url: str, product_id: int):
             enriched_data['bullet_points'] = enhanced.get('bullet_points', [])
             
             mapped_data = map_scraped_data_to_template(enriched_data)
+            is_valid, missing = validate_mapped_data(mapped_data)
+            
             insert_mapped_product(product_id, category.get("category_id", "0"), mapped_data)
-            log_processing(product_id, url, "mapping", "success")
+            log_processing(product_id, url, "mapping", "success" if is_valid else "warning")
+            logger.info("✅ Data mapped")
         except Exception as e:
+            logger.warning(f"Mapping error: {e}")
             log_processing(product_id, url, "mapping", "error", str(e))
         
-        # ============ STEP 5: TEMPLATE ============
+        # ================= STEP 6: GENERATE TEMPLATE =================
         logger.info("📋 Generating template...")
+        template_file = None
+        
         if os.path.exists(TEMPLATE_PATH):
             try:
                 template_file = fill_template_for_product(
                     TEMPLATE_PATH,
-                    mapped_data if 'mapped_data' in locals() else {},
+                    mapped_data,
                     product_id,
                     FILLED_TEMPLATES_DIR
                 )
@@ -214,73 +264,95 @@ def process_product_background(url: str, product_id: int):
                         os.path.basename(template_file)
                     )
                     log_processing(product_id, url, "template_fill", "success")
+                    logger.info(f"✅ Template: {os.path.basename(template_file)}")
             except Exception as e:
+                logger.warning(f"Template generation failed: {e}")
                 log_processing(product_id, url, "template_fill", "error", str(e))
         
-        logger.info(f"✅ Completed: {url}")
-    
-    except Exception as e:
-        logger.error(f"❌ Error: {e}")
-
-
-# ─────────────────────────────────────────
-# SINGLE PRODUCT ENDPOINT (INSTANT)
-# ─────────────────────────────────────────
-
-@app.post("/generate-product", tags=["Product Processing"])
-def generate_product(req: ProductURLRequest, background_tasks: BackgroundTasks):
-    """
-    ✅ SINGLE PRODUCT - Returns INSTANTLY
-    
-    Processing happens in background!
-    - Returns immediately with product_id
-    - Scraping/enhancement/mapping happens in background
-    - Check status with /scraped-products endpoint
-    """
-    
-    if not req.url:
-        raise HTTPException(status_code=400, detail="URL cannot be empty")
-    
-    try:
-        from db import insert_scraped_product
+        # ================= RETURN COMPLETE INFO =================
+        logger.info("✅ Processing complete\n")
         
-        # Create placeholder in database
-        product_id = insert_scraped_product(req.url, {"title": "Processing...", "description": ""})
-        
-        # Add background task
-        background_tasks.add_task(process_product_background, req.url, product_id)
-        
-        # ✅ RETURN IMMEDIATELY
         return {
             "success": True,
             "product_id": product_id,
-            "url": req.url,
-            "status": "processing",
-            "message": "Product added to queue. Check status with /scraped-products",
+            "url": url,
+            "original": {
+                "title": title,
+                "description": description[:200] + "..." if len(description) > 200 else description,
+                "brand": scraped_data.get("brand", ""),
+                "images": sum(1 for i in range(1, 7) if scraped_data.get(f"image_{i}"))
+            },
+            "enhanced": {
+                "title": enhanced.get("title", ""),
+                "description": enhanced.get("description", "")[:200] + "..." if enhanced.get("description") else "",
+                "bullet_points": enhanced.get("bullet_points", [])[:3]  # First 3 bullet points
+            },
+            "category": {
+                "id": category.get("category_id", ""),
+                "name": category.get("category_name", ""),
+                "confidence": round(category.get("confidence", 0.0), 2)
+            },
+            "template": {
+                "file": os.path.basename(template_file) if template_file else None,
+                "columns_mapped": len(mapped_data),
+                "fields_valid": is_valid
+            },
+            "extracted": {
+                "attributes": len(scraped_data),
+                "images": sum(1 for i in range(1, 7) if scraped_data.get(f"image_{i}"))
+            },
             "timestamp": datetime.now().isoformat()
         }
     
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"❌ Error: {e}", exc_info=True)
         return {
             "success": False,
-            "url": req.url,
+            "url": url,
+            "product_id": product_id,
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
 
 
 # ─────────────────────────────────────────
-# BULK PRODUCTS ENDPOINT (INSTANT)
+# SINGLE PRODUCT ENDPOINT
+# ─────────────────────────────────────────
+
+@app.post("/generate-product", tags=["Product Processing"])
+def generate_product(req: ProductURLRequest):
+    """
+    ✅ SINGLE PRODUCT - Complete Response
+    
+    Returns ALL product information:
+    - Original scraped data
+    - Enhanced content
+    - Category assignment
+    - Template file path
+    - All extracted attributes
+    
+    **Time:** 30-60 seconds (processing + response)
+    """
+    
+    if not req.url:
+        raise HTTPException(status_code=400, detail="URL cannot be empty")
+    
+    logger.info(f"📨 Single product request: {req.url}")
+    return process_product_complete(req.url)
+
+
+# ─────────────────────────────────────────
+# BULK PRODUCTS ENDPOINT
 # ─────────────────────────────────────────
 
 @app.post("/generate-products", tags=["Product Processing"])
-def generate_products(req: BulkProductRequest, background_tasks: BackgroundTasks):
+def generate_products(req: BulkProductRequest):
     """
-    ✅ BULK PRODUCTS - Returns INSTANTLY
+    ✅ BULK PRODUCTS - Complete Response for Each
     
-    - Queues all products for background processing
-    - Returns immediately with product IDs
+    - Up to 20 URLs per request
+    - Returns complete info for each product
+    - Sequential processing
     """
     
     if not req.urls:
@@ -289,41 +361,32 @@ def generate_products(req: BulkProductRequest, background_tasks: BackgroundTasks
     if len(req.urls) > 20:
         raise HTTPException(status_code=400, detail="Maximum 20 URLs")
     
-    try:
-        from db import insert_scraped_product
-        
-        results = []
-        
-        for url in req.urls:
-            product_id = insert_scraped_product(url, {"title": "Processing...", "description": ""})
-            background_tasks.add_task(process_product_background, url, product_id)
-            
-            results.append({
-                "product_id": product_id,
-                "url": url,
-                "status": "processing"
-            })
-        
-        # ✅ RETURN IMMEDIATELY
-        return {
-            "total": len(req.urls),
-            "queued": len(results),
-            "results": results,
-            "message": "Products queued for processing",
-            "timestamp": datetime.now().isoformat()
-        }
+    logger.info(f"📨 Bulk request: {len(req.urls)} products")
     
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
+    results = []
+    successful = 0
+    failed = 0
+    
+    for url in req.urls:
+        result = process_product_complete(url)
+        results.append(result)
+        
+        if result.get("success"):
+            successful += 1
+        else:
+            failed += 1
+    
+    return {
+        "total": len(req.urls),
+        "successful": successful,
+        "failed": failed,
+        "results": results,
+        "timestamp": datetime.now().isoformat()
+    }
 
 
 # ─────────────────────────────────────────
-# DATABASE VIEW ENDPOINTS (INSTANT)
+# DATABASE VIEW ENDPOINTS
 # ─────────────────────────────────────────
 
 def get_db_connection():
@@ -334,74 +397,82 @@ def get_db_connection():
 
 
 @app.get("/scraped-products", tags=["Database"])
-def view_scraped_products(limit: int = 50):
-    """View scraped products - INSTANT"""
+def view_scraped_products(limit: int = 100):
+    """View scraped products"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(f"SELECT product_id, url, title, scraped_at FROM scraped_products ORDER BY scraped_at DESC LIMIT {min(limit, 1000)}")
+        cursor.execute(f"SELECT * FROM scraped_products ORDER BY scraped_at DESC LIMIT {min(limit, 1000)}")
         rows = cursor.fetchall()
         conn.close()
         
-        return [dict(row) for row in rows] if rows else []
+        return [dict(row) for row in rows] if rows else {"message": "No records"}
     except Exception as e:
         return {"error": str(e)}
 
 
 @app.get("/mapped-products", tags=["Database"])
-def view_mapped_products(limit: int = 50):
-    """View mapped products - INSTANT"""
+def view_mapped_products(limit: int = 100):
+    """View mapped products"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(f"SELECT product_id, titre, mapped_at FROM mapped_products ORDER BY mapped_at DESC LIMIT {min(limit, 1000)}")
+        cursor.execute(f"SELECT * FROM mapped_products ORDER BY mapped_at DESC LIMIT {min(limit, 1000)}")
         rows = cursor.fetchall()
         conn.close()
         
-        return [dict(row) for row in rows] if rows else []
+        return [dict(row) for row in rows] if rows else {"message": "No records"}
     except Exception as e:
         return {"error": str(e)}
 
 
 @app.get("/template-outputs", tags=["Database"])
-def view_template_outputs(limit: int = 50):
-    """View templates - INSTANT"""
+def view_template_outputs(limit: int = 100):
+    """View generated templates"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(f"SELECT product_id, file_name, status, created_at FROM template_outputs ORDER BY created_at DESC LIMIT {min(limit, 1000)}")
+        cursor.execute(f"SELECT * FROM template_outputs ORDER BY created_at DESC LIMIT {min(limit, 1000)}")
         rows = cursor.fetchall()
         conn.close()
         
-        return [dict(row) for row in rows] if rows else []
+        return [dict(row) for row in rows] if rows else {"message": "No records"}
     except Exception as e:
         return {"error": str(e)}
 
 
 @app.get("/processing-logs", tags=["Database"])
-def view_processing_logs(limit: int = 100):
-    """View logs - INSTANT"""
+def view_processing_logs(limit: int = 500):
+    """View processing logs"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(f"SELECT product_id, step, status, log_time FROM processing_logs ORDER BY log_time DESC LIMIT {min(limit, 1000)}")
+        cursor.execute(f"SELECT * FROM processing_logs ORDER BY log_time DESC LIMIT {min(limit, 1000)}")
         rows = cursor.fetchall()
         conn.close()
         
-        return [dict(row) for row in rows] if rows else []
+        return [dict(row) for row in rows] if rows else {"message": "No records"}
     except Exception as e:
         return {"error": str(e)}
 
 
 @app.get("/stats", tags=["Database"])
 def get_stats():
-    """Get stats - INSTANT"""
+    """Get database statistics"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
         stats = {}
-        for table in ["scraped_products", "mapped_products", "template_outputs", "processing_logs"]:
+        tables = [
+            "scraped_products",
+            "mapped_products",
+            "template_outputs",
+            "processing_logs",
+            "category_assignments"
+        ]
+        
+        for table in tables:
             try:
                 cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
                 count = cursor.fetchone()["count"]
@@ -425,7 +496,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8686))
     
     logger.info("\n" + "="*70)
-    logger.info("🚀 Octopia Template Pipeline - Ultra Fast (Background Processing)")
+    logger.info("🚀 Octopia Template Pipeline - Complete Response")
     logger.info("="*70 + "\n")
     
     uvicorn.run(
