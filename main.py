@@ -1,3 +1,8 @@
+"""
+FastAPI Server - OPTIMIZED FOR SPEED
+Faster response times with proper timeout handling
+"""
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
