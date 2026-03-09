@@ -1,109 +1,99 @@
 import sqlite3
 import json
-from datetime import datetime
 
 DB_NAME = "products.db"
 
 
 def create_connection():
-    """Create database connection"""
     conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     return conn
 
 
+# ─────────────────────────────────────────
+# CREATE ALL TABLES
+# ─────────────────────────────────────────
+
 def create_all_tables():
-    """Create ALL tables for Task 1 and Task 2"""
-    
     conn = create_connection()
     cursor = conn.cursor()
-    
-    print("\n📊 Creating database tables...\n")
-    
-    # ============================================================
-    # TASK 1 TABLES (Original functionality)
-    # ============================================================
-    
-    # 1. Categories table (shared with Task 1)
-    print("  [TASK 1] Creating categories table...")
+
+    # ✅ RENAME OLD categories TABLE IF IT EXISTS
     try:
         cursor.execute("ALTER TABLE categories RENAME TO categories_old")
-        print("  [TASK 1] ✅ Renamed old categories table")
-    except:
-        pass
-    
+        print("✅ Old categories table renamed to categories_old")
+    except sqlite3.OperationalError:
+        print("ℹ No old categories table found")
+
+    # 1. Categories table (from category_with_embeddings)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS categories (
-        category_id TEXT PRIMARY KEY,
+        category_id   INTEGER PRIMARY KEY,
         category_name TEXT,
-        embedding BLOB
+        embedding     BLOB
     )
     """)
-    
-    # 2. Original content table (Task 1)
-    print("  [TASK 1] Creating original_content table...")
+
+    # 2. Original content table (raw scraped data)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS original_content (
-        product_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        url TEXT UNIQUE,
-        title TEXT,
+        product_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+        url         TEXT UNIQUE,
+        title       TEXT,
         description TEXT,
-        image_url TEXT
+        image_url   TEXT
     )
     """)
-    
-    # 3. Enhanced content table (Task 1)
-    print("  [TASK 1] Creating enhanced_content table...")
+
+    # 3. Enhanced content table (LLM/OpenAI refined)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS enhanced_content (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id INTEGER UNIQUE,
-        title TEXT,
-        description TEXT,
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id   INTEGER UNIQUE,
+        title        TEXT,
+        description  TEXT,
         bullet_points TEXT,
-        image_url TEXT,
+        image_url    TEXT,
         FOREIGN KEY (product_id) REFERENCES original_content(product_id)
     )
     """)
-    
-    # 4. Category assignments table (Task 1)
-    print("  [TASK 1] Creating category_assignments table...")
+
+    # 4. Category assignments table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS category_assignments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id INTEGER UNIQUE,
-        original_category_id TEXT,
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id          INTEGER UNIQUE,
+        original_category_id   INTEGER,
         original_category_name TEXT,
-        enhanced_category_id TEXT,
+        enhanced_category_id   INTEGER,
         enhanced_category_name TEXT,
-        confidence REAL,
+        confidence          REAL,
         FOREIGN KEY (product_id) REFERENCES original_content(product_id)
     )
     """)
-    
-    # 5. Legacy products table (Task 1)
-    print("  [TASK 1] Creating products table...")
+
+    # 5. Products table — keeps all info in one place (as before)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS products (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        url TEXT UNIQUE,
-        title TEXT,
-        description TEXT,
-        improved_title TEXT,
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        url                  TEXT UNIQUE,
+        title                TEXT,
+        description          TEXT,
+        improved_title       TEXT,
         improved_description TEXT,
-        bullet_points TEXT,
-        category_id TEXT,
-        category_name TEXT,
-        confidence REAL,
-        enhanced_category TEXT
+        bullet_points        TEXT,
+        category_id          INTEGER,
+        category_name        TEXT,
+        confidence           REAL,
+        enhanced_category    TEXT
     )
     """)
-    
+
     # ============================================================
-    # TASK 2 TABLES (New functionality)
+    # TASK 2 TABLES (NEW)
     # ============================================================
-    
+
     # 6. Scraped products table (Task 2)
-    print("  [TASK 2] Creating scraped_products table...")
+    print("Creating Task 2 tables...")
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS scraped_products (
         product_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,9 +125,8 @@ def create_all_tables():
         scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
-    
+
     # 7. Mapped products table (Task 2)
-    print("  [TASK 2] Creating mapped_products table...")
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS mapped_products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,7 +137,6 @@ def create_all_tables():
         description TEXT,
         url_image_1 TEXT,
         marque TEXT,
-        description_marketing TEXT,
         couleur_principale TEXT,
         dimensions TEXT,
         poids TEXT,
@@ -157,33 +145,16 @@ def create_all_tables():
         age_to TEXT,
         certifications TEXT,
         pays_origine TEXT,
-        accessoires TEXT,
-        technologie TEXT,
-        fonction_video TEXT,
-        type_transmission TEXT,
-        type_ecran TEXT,
-        type_alimentation TEXT,
-        modeles TEXT,
-        objet_connecte TEXT,
-        avertissements_securite TEXT,
         fabricant_nom TEXT,
-        fabricant_adresse TEXT,
-        fabricant_email TEXT,
         garantie TEXT,
-        informations_complementaires TEXT,
-        compatibilite TEXT,
-        autonomie TEXT,
-        gamme TEXT,
-        label TEXT,
         notes TEXT,
         additional_fields TEXT,
         mapped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )
     """)
-    
+
     # 8. Template outputs table (Task 2)
-    print("  [TASK 2] Creating template_outputs table...")
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS template_outputs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,9 +169,8 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )
     """)
-    
+
     # 9. Processing logs table (Task 2)
-    print("  [TASK 2] Creating processing_logs table...")
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS processing_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -213,19 +183,17 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )
     """)
-    
+
     conn.commit()
     conn.close()
-    
-    print("\n✅ All tables created successfully (Task 1 + Task 2)\n")
+    print("✅ All tables created")
 
 
-# ============================================================
-# TASK 1 INSERT FUNCTIONS (Original)
-# ============================================================
+# ─────────────────────────────────────────
+# INSERT FUNCTIONS (ORIGINAL - UNCHANGED)
+# ─────────────────────────────────────────
 
 def insert_original_content(url, title, description, image_url):
-    """Task 1: Save original scraped content"""
     conn = create_connection()
     cursor = conn.cursor()
     try:
@@ -247,7 +215,6 @@ def insert_original_content(url, title, description, image_url):
 
 
 def insert_enhanced_content(product_id, title, description, bullet_points, image_url):
-    """Task 1: Save enhanced content"""
     conn = create_connection()
     cursor = conn.cursor()
     try:
@@ -264,7 +231,6 @@ def insert_enhanced_content(product_id, title, description, bullet_points, image
 
 
 def insert_category_assignment(product_id, orig_cat_id, orig_cat_name, enh_cat_id, enh_cat_name, confidence):
-    """Task 1: Save category assignments"""
     conn = create_connection()
     cursor = conn.cursor()
     try:
@@ -283,7 +249,7 @@ def insert_category_assignment(product_id, orig_cat_id, orig_cat_name, enh_cat_i
 
 
 def insert_product(data):
-    """Task 1: Save to legacy products table"""
+    """Keep original products table working as before"""
     conn = create_connection()
     cursor = conn.cursor()
     try:
@@ -305,12 +271,12 @@ def insert_product(data):
         conn.close()
 
 
-# ============================================================
-# TASK 2 INSERT FUNCTIONS (New)
-# ============================================================
+# ─────────────────────────────────────────
+# TASK 2 INSERT FUNCTIONS (NEW)
+# ─────────────────────────────────────────
 
 def insert_scraped_product(url, attributes):
-    """Task 2: Store raw scraped product data"""
+    """Store raw scraped product data (Task 2)"""
     conn = create_connection()
     cursor = conn.cursor()
     
@@ -370,21 +336,20 @@ def insert_scraped_product(url, attributes):
 
 
 def insert_mapped_product(product_id, category_id, mapped_data):
-    """Task 2: Store mapped product data"""
+    """Store mapped product data (Task 2)"""
     conn = create_connection()
     cursor = conn.cursor()
     
     try:
         cursor.execute("""
             INSERT INTO mapped_products (
-                product_id, category_id, titre, description, marque,
+                product_id, titre, description, marque,
                 url_image_1, couleur_principale, dimensions, poids, matiere,
                 age_from, age_to, certifications, pays_origine,
                 fabricant_nom, garantie, notes, additional_fields
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             product_id,
-            category_id,
             mapped_data.get("Titre*", ""),
             mapped_data.get("Description*", ""),
             mapped_data.get("Marque", ""),
@@ -415,7 +380,7 @@ def insert_mapped_product(product_id, category_id, mapped_data):
 
 
 def insert_template_output(product_id, category_id, output_type, file_path, file_name, status="success"):
-    """Task 2: Store template output info"""
+    """Store template output file information (Task 2)"""
     conn = create_connection()
     cursor = conn.cursor()
     
@@ -437,7 +402,7 @@ def insert_template_output(product_id, category_id, output_type, file_path, file
 
 
 def log_processing(product_id, url, step, status, message=""):
-    """Task 2: Log processing steps"""
+    """Log processing steps (Task 2)"""
     conn = create_connection()
     cursor = conn.cursor()
     
@@ -455,12 +420,8 @@ def log_processing(product_id, url, step, status, message=""):
         conn.close()
 
 
-# ============================================================
-# QUERY FUNCTIONS
-# ============================================================
-
 def get_product_by_id(product_id):
-    """Get product information"""
+    """Get product information (Task 2)"""
     conn = create_connection()
     cursor = conn.cursor()
     
@@ -477,14 +438,9 @@ def get_product_by_id(product_id):
     return result
 
 
-# ============================================================
-# BACKWARD COMPATIBILITY
-# ============================================================
-
+# Keep old function names working (backward compatibility)
 def create_table():
-    """Backward compatibility"""
     create_all_tables()
 
 def create_categories_table():
-    """Backward compatibility"""
-    pass
+    pass  # already handled in create_all_tables
