@@ -1,8 +1,3 @@
-"""
-FastAPI Server - OPTIMIZED FOR SPEED
-Faster response times with proper timeout handling
-"""
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
@@ -226,16 +221,20 @@ def generate_product(req: ProductURLRequest):
         except Exception as e:
             logger.warning(f"Categorization skipped: {e}")
             category = {
-                "category_id": "unknown",
-                "category_name": "Unknown",
+                "category_id": "0",
+                "category_name": "Uncategorized",
                 "confidence": 0.0
             }
         
+        # ✅ FIXED: Call with correct 6 parameters
+        # Old signature: (product_id, orig_cat_id, orig_cat_name, enh_cat_id, enh_cat_name, confidence)
         insert_category_assignment(
             product_id,
-            category["category_id"],
-            category["category_name"],
-            category.get("confidence", 0.0)
+            category.get("category_id", "0"),        # orig_cat_id
+            category.get("category_name", "Unknown"),      # orig_cat_name
+            category.get("category_id", "0"),        # enh_cat_id (same as original)
+            category.get("category_name", "Unknown"),      # enh_cat_name (same as original)
+            category.get("confidence", 0.0)          # confidence
         )
         
         log_processing(product_id, req.url, "categorization", "success")
@@ -251,7 +250,7 @@ def generate_product(req: ProductURLRequest):
             mapped_data = map_scraped_data_to_template(enriched_data)
             is_valid, missing = validate_mapped_data(mapped_data)
             
-            insert_mapped_product(product_id, category["category_id"], mapped_data)
+            insert_mapped_product(product_id, category.get("category_id", "0"), mapped_data)
             log_processing(product_id, req.url, "mapping", "success" if is_valid else "warning")
         except Exception as e:
             logger.warning(f"Mapping error: {e}")
@@ -273,7 +272,7 @@ def generate_product(req: ProductURLRequest):
                 if template_file:
                     insert_template_output(
                         product_id,
-                        category["category_id"],
+                        category.get("category_id", "0"),
                         "xlsm",
                         template_file,
                         os.path.basename(template_file)
@@ -291,7 +290,7 @@ def generate_product(req: ProductURLRequest):
             "product_id": product_id,
             "url": req.url,
             "title": title,
-            "category_name": category["category_name"],
+            "category_name": category.get("category_name", "Unknown"),
             "template_file": template_file,
             "attributes_extracted": len(scraped_data),
             "timestamp": datetime.now().isoformat()
