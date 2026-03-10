@@ -21,7 +21,7 @@ def extract_from_meta_tags(page):
     except:
         data['image_1'] = ""
     
-    # Description from og:description (FALLBACK ONLY)
+    # Description from og:description
     try:
         desc_meta = page.locator('meta[property="og:description"]').get_attribute('content')
         data['description'] = desc_meta or ""
@@ -102,90 +102,27 @@ def extract_from_dom(page):
             pass
     
     # ========================
-    # DESCRIPTION (FIXED - From detailmodule_text)
+    # DESCRIPTION
     # ========================
+    desc_selectors = [
+        '[data-pl="product-detail-description"]',
+        '.product-description',
+        'div[class*="description"]',
+        '.detail-desc-text'
+    ]
     
     page.mouse.wheel(0, 3000)
     page.wait_for_timeout(1000)
     
-    description = ""
-    
-    # PRIMARY: Extract from detailmodule_text section (most comprehensive)
-    try:
-        detail_modules = page.locator('div.detailmodule_text').all()
-        if detail_modules:
-            detail_texts = []
-            
-            for module in detail_modules:
-                try:
-                    # Try to get span.detail-desc-decorate-content inside this module
-                    spans = module.locator('span.detail-desc-decorate-content').all()
-                    if spans:
-                        for span in spans:
-                            text = span.inner_text().strip()
-                            if text and len(text) > 5:
-                                detail_texts.append(text)
-                    
-                    # Also try direct text from module
-                    if not spans:
-                        module_text = module.inner_text().strip()
-                        if module_text and len(module_text) > 20:
-                            detail_texts.append(module_text)
-                except:
-                    pass
-            
-            if detail_texts:
-                # Join all descriptions with pipe separator
-                description = " | ".join(detail_texts)
-    except:
-        pass
-    
-    # SECONDARY: Extract from any span with detail-desc-decorate-content (orphaned spans)
-    if not description or len(description) < 50:
+    for selector in desc_selectors:
         try:
-            desc_spans = page.locator('span.detail-desc-decorate-content').all()
-            if desc_spans:
-                span_texts = []
-                
-                for span in desc_spans:
-                    text = span.inner_text().strip()
-                    if text and len(text) > 5:
-                        span_texts.append(text)
-                
-                if span_texts:
-                    description = " | ".join(span_texts)
+            if page.locator(selector).count() > 0:
+                desc = page.locator(selector).first.inner_text().strip()
+                if desc and len(desc) > 10:
+                    data['description'] = desc[:2000]
+                    break
         except:
             pass
-    
-    # TERTIARY: Generic description selectors (fallback)
-    if not description or len(description) < 50:
-        desc_selectors = [
-            '[data-pl="product-detail-description"]',
-            '.product-description',
-            'div[class*="description"]',
-            '.detail-desc-text'
-        ]
-        
-        for selector in desc_selectors:
-            try:
-                if page.locator(selector).count() > 0:
-                    desc = page.locator(selector).first.inner_text().strip()
-                    if desc and len(desc) > 10:
-                        description = desc
-                        break
-            except:
-                pass
-    
-    # Clean and normalize description
-    if description:
-        # Replace multiple newlines with pipe separator
-        description = re.sub(r'\n+', ' | ', description)
-        # Remove excessive whitespace
-        description = re.sub(r'\s+', ' ', description).strip()
-        # Limit to 2000 characters
-        description = description[:2000]
-    
-    data['description'] = description
     
     # ========================
     # PRICE
