@@ -1,94 +1,119 @@
 from playwright.sync_api import sync_playwright
 import re
 import json
-import time
 
 
-def extract_specifications(page):
-    """
-    Extract all product specifications from the specification section
-    Handles the new AliExpress layout with specification--wrap--lxVQ2tj
-    """
-    specs = {}
+def extract_from_meta_tags(page):
+    """Extract data from meta tags (most reliable)"""
+    data = {}
+    
+    # Title from og:title
+    try:
+        title_meta = page.locator('meta[property="og:title"]').get_attribute('content')
+        data['title'] = title_meta or ""
+    except:
+        data['title'] = ""
+    
+    # Main image from og:image
+    try:
+        image_meta = page.locator('meta[property="og:image"]').get_attribute('content')
+        data['image_1'] = image_meta or ""
+    except:
+        data['image_1'] = ""
+    
+    # Description from og:description (FALLBACK ONLY)
+    try:
+        desc_meta = page.locator('meta[property="og:description"]').get_attribute('content')
+        data['description'] = desc_meta or ""
+    except:
+        data['description'] = ""
+    
+    return data
+
+
+def extract_from_javascript(page):
+    """Extract data from embedded JavaScript"""
+    data = {}
     
     try:
-        # Find all specification items
-        spec_items = page.locator('div.specification--prop--Jh28bKu').all()
+        # Get all script content
+        scripts = page.locator('script').all()
         
-        for item in spec_items:
+        for script in scripts:
             try:
-                # Get title
-                title_elem = item.locator('div.specification--title--SfH3sA8 span').first
-                title = title_elem.inner_text().strip() if title_elem.count() > 0 else ""
+                script_text = script.text_content()
                 
-                # Get description
-                desc_elem = item.locator('div.specification--desc--Dxx6W0W span').first
-                desc = desc_elem.inner_text().strip() if desc_elem.count() > 0 else ""
+                # Look for imagePathList
+                image_match = re.search(r'"imagePathList":\s*\[(.*?)\]', script_text)
+                if image_match:
+                    images_str = image_match.group(1)
+                    images = re.findall(r'"(https://[^"]+\.jpg[^"]*)"', images_str)
+                    
+                    for i, img in enumerate(images[:6], 1):
+                        key = f'image_{i}'
+                        data[key] = img.split('_')[0] + '.jpg' if '_' in img else img
                 
-                if title and desc:
-                    specs[title.lower()] = desc
+                # Look for product price
+                price_match = re.search(r'"price":\s*"([^"]+)"', script_text)
+                if price_match:
+                    data['price'] = price_match.group(1)
+                
+                # Look for trade quantity
+                trade_match = re.search(r'"tradeCount":\s*"([^"]+)"', script_text)
+                if trade_match:
+                    data['sales_count'] = trade_match.group(1)
+                
+                # Look for shipping info
+                ship_match = re.search(r'"shipmentWay":\s*"([^"]+)"', script_text)
+                if ship_match:
+                    data['shipping'] = ship_match.group(1)
+                
             except:
                 pass
-    except:
-        pass
     
-    return specs
+    except Exception as e:
+        print(f"[scraper] Warning extracting JS data: {e}")
+    
+    return data
 
 
-def map_specifications_to_fields(specs):
-    """
-    Map extracted specifications to template fields
-    """
-    mapped = {}
+def extract_from_dom(page):
+    """Extract data from DOM elements"""
+    data = {}
     
-    # Mapping of specification keys to template fields
-    spec_mapping = {
-        'brand name': 'brand',
-        'main color': 'color',
-        'color': 'color',
-        'dimensions': 'dimensions',
-        'width': 'dimensions',
-        'material': 'material',
-        'certification': 'certifications',
-        'place of origin': 'country_of_origin',
-        'origin': 'country_of_origin',
-        'product weight': 'weight',
-        'warranty': 'warranty',
-        'gender': 'gender',
-        'recommend age': 'age',
-        'power source': 'power_source',
-        'style': 'product_type',
-        'capacity': 'capacity',
-        'warning': 'safety_warning',
-    }
+    # ========================
+    # TITLE
+    # ========================
+    title_selectors = [
+        '[data-pl="product-title"]',
+        '.title--line-one',
+        'h1',
+        '.product-title'
+    ]
     
-    for spec_key, spec_value in specs.items():
-        for template_key, field_name in spec_mapping.items():
-            if template_key in spec_key:
-                if field_name not in mapped:
-                    mapped[field_name] = spec_value
+    for selector in title_selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                title = page.locator(selector).first.inner_text().strip()
+                if title and len(title) > 5:
+                    data['title'] = title
+                    break
+        except:
+            pass
     
-    return mapped
-
-
-def extract_description_from_dom(page):
-    """
-    Extract description from AliExpress product detail sections
-    Priority:
-    1. detailmodule_text div with detail-desc-decorate-content spans
-    2. All divs with detailmodule_text class
-    3. Generic description selectors
-    """
+    # ========================
+    # DESCRIPTION (FIXED - From detailmodule_text)
+    # ========================
+    
+    page.mouse.wheel(0, 3000)
+    page.wait_for_timeout(1000)
     
     description = ""
     
-    print("[scraper] 📝 Extracting description from DOM...")
-    
-    # PRIMARY: Extract from detailmodule_text section with detail-desc-decorate-content
+    # PRIMARY: Extract from detailmodule_text section (most comprehensive)
     try:
         detail_modules = page.locator('div.detailmodule_text').all()
         if detail_modules:
-            print(f"[scraper]    Found {len(detail_modules)} detail modules")
             detail_texts = []
             
             for module in detail_modules:
@@ -112,16 +137,14 @@ def extract_description_from_dom(page):
             if detail_texts:
                 # Join all descriptions with pipe separator
                 description = " | ".join(detail_texts)
-                print(f"[scraper]    ✅ Extracted {len(detail_texts)} sections ({len(description)} chars)")
-    except Exception as e:
-        print(f"[scraper]    ⚠️  Error: {e}")
+    except:
+        pass
     
     # SECONDARY: Extract from any span with detail-desc-decorate-content (orphaned spans)
     if not description or len(description) < 50:
         try:
             desc_spans = page.locator('span.detail-desc-decorate-content').all()
             if desc_spans:
-                print(f"[scraper]    Found {len(desc_spans)} orphaned description spans")
                 span_texts = []
                 
                 for span in desc_spans:
@@ -131,13 +154,11 @@ def extract_description_from_dom(page):
                 
                 if span_texts:
                     description = " | ".join(span_texts)
-                    print(f"[scraper]    ✅ Extracted from {len(span_texts)} spans ({len(description)} chars)")
-        except Exception as e:
-            print(f"[scraper]    ⚠️  Error: {e}")
+        except:
+            pass
     
-    # TERTIARY: Generic description selectors
+    # TERTIARY: Generic description selectors (fallback)
     if not description or len(description) < 50:
-        print(f"[scraper]    Trying generic description selectors...")
         desc_selectors = [
             '[data-pl="product-detail-description"]',
             '.product-description',
@@ -149,9 +170,8 @@ def extract_description_from_dom(page):
             try:
                 if page.locator(selector).count() > 0:
                     desc = page.locator(selector).first.inner_text().strip()
-                    if desc and len(desc) > 50:
+                    if desc and len(desc) > 10:
                         description = desc
-                        print(f"[scraper]    ✅ Found using selector: {selector}")
                         break
             except:
                 pass
@@ -165,15 +185,142 @@ def extract_description_from_dom(page):
         # Limit to 2000 characters
         description = description[:2000]
     
-    return description
+    data['description'] = description
+    
+    # ========================
+    # PRICE
+    # ========================
+    price_selectors = [
+        '[data-pl="product-price"]',
+        '.price-main',
+        '.product-price',
+        '[class*="price"]'
+    ]
+    
+    for selector in price_selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                price = page.locator(selector).first.inner_text().strip()
+                if price and ('$' in price or any(c.isdigit() for c in price)):
+                    data['price'] = price
+                    break
+        except:
+            pass
+    
+    # ========================
+    # BRAND
+    # ========================
+    brand_selectors = [
+        '[data-pl="product-brand"]',
+        '.shop-name',
+        'a[class*="store"]',
+        '.brand-name'
+    ]
+    
+    for selector in brand_selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                brand = page.locator(selector).first.inner_text().strip()
+                if brand and len(brand) < 100:
+                    data['brand'] = brand
+                    break
+        except:
+            pass
+    
+    # ========================
+    # SPECIFICATIONS
+    # ========================
+    spec_data = {}
+    
+    # Try to find specification tables
+    try:
+        spec_rows = page.locator('[class*="spec"]').all()
+        for row in spec_rows[:20]:
+            try:
+                text = row.inner_text().strip()
+                if ':' in text:
+                    key, value = text.split(':', 1)
+                    spec_data[key.lower().strip()] = value.strip()
+            except:
+                pass
+    except:
+        pass
+    
+    # Map specifications to attributes
+    if 'color' in spec_data or 'colour' in spec_data:
+        data['color'] = spec_data.get('color') or spec_data.get('colour')
+    
+    if 'size' in spec_data or 'dimensions' in spec_data:
+        data['dimensions'] = spec_data.get('size') or spec_data.get('dimensions')
+    
+    if 'weight' in spec_data:
+        data['weight'] = spec_data.get('weight')
+    
+    if 'material' in spec_data:
+        data['material'] = spec_data.get('material')
+    
+    # ========================
+    # BULLET POINTS / FEATURES
+    # ========================
+    bullets = []
+    
+    try:
+        # Try common selectors for bullet points
+        bullet_selectors = [
+            'ul li',
+            '[class*="feature"] li',
+            '[class*="highlight"] li'
+        ]
+        
+        for selector in bullet_selectors:
+            if page.locator(selector).count() > 0:
+                items = page.locator(selector).all_text_contents()
+                bullets = [b.strip() for b in items[:8] if b.strip() and len(b.strip()) > 5]
+                if bullets:
+                    break
+    except:
+        pass
+    
+    data['bullet_points'] = bullets
+    
+    # ========================
+    # RATINGS & REVIEWS
+    # ========================
+    try:
+        rating = page.locator('[class*="rating"]').first.inner_text().strip()
+        if rating:
+            data['rating'] = rating
+    except:
+        pass
+    
+    try:
+        reviews = page.locator('[class*="review"]').first.inner_text().strip()
+        if reviews:
+            data['reviews'] = reviews
+    except:
+        pass
+    
+    # ========================
+    # SHIPPING INFO
+    # ========================
+    try:
+        shipping = page.locator('[class*="ship"]').first.inner_text().strip()
+        if shipping:
+            data['shipping'] = shipping
+    except:
+        pass
+    
+    return data
 
 
 def get_product_info(url):
     """
-    Main scraper function - HYBRID approach
-    - Title: Uses meta + h1 (from old scraper - PROVEN WORKING)
-    - Description: Uses detailmodule_text + detail-desc-decorate-content (from new scraper - FIXED)
-    - Everything else: From old scraper (proven working)
+    Main scraper function - optimized for AliExpress
+    
+    Priority:
+    1. Meta tags (most reliable)
+    2. JavaScript embedded data
+    3. DOM elements
     """
     
     try:
@@ -197,7 +344,7 @@ def get_product_info(url):
             
             page = context.new_page()
             
-            print(f"\n[scraper] 🌐 Opening: {url}")
+            print(f"[scraper] Opening: {url}")
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
             
             # Simulate human behavior
@@ -207,194 +354,19 @@ def get_product_info(url):
             page.wait_for_timeout(2000)
             
             # =====================================================
-            # 1. TITLE (BEST FROM OLD SCRAPER)
+            # EXTRACT DATA - Priority Order
             # =====================================================
-            print("[scraper] Extracting title...")
-            title = ""
             
-            # Try meta tag first
-            try:
-                title_meta = page.locator('meta[property="og:title"]').get_attribute('content')
-                if title_meta:
-                    title = title_meta.split(" - AliExpress")[0].strip()
-            except:
-                pass
+            print("[scraper] Extracting from meta tags...")
+            data = extract_from_meta_tags(page)
             
-            # Fallback to h1
-            if not title:
-                try:
-                    h1_elem = page.locator('h1[data-pl="product-title"]')
-                    if h1_elem.count() > 0:
-                        title = h1_elem.first.inner_text().strip()
-                except:
-                    pass
+            print("[scraper] Extracting from JavaScript...")
+            js_data = extract_from_javascript(page)
+            data.update({k: v for k, v in js_data.items() if v and k not in data})
             
-            # =====================================================
-            # 2. PRICE (from price-default--current class)
-            # =====================================================
-            print("[scraper] Extracting price...")
-            price = ""
-            
-            try:
-                price_elem = page.locator('span.price-default--current--F8OlYIo')
-                if price_elem.count() > 0:
-                    price = price_elem.first.inner_text().strip()
-            except:
-                pass
-            
-            # =====================================================
-            # 3. IMAGES (from meta or JavaScript)
-            # =====================================================
-            print("[scraper] Extracting images...")
-            images = {}
-            
-            try:
-                image_meta = page.locator('meta[property="og:image"]').get_attribute('content')
-                if image_meta:
-                    images['image_1'] = image_meta
-            except:
-                pass
-            
-            # Try to get more images from scripts
-            try:
-                scripts = page.locator('script').all()
-                for script in scripts:
-                    try:
-                        script_text = script.text_content()
-                        
-                        # Look for image URLs in imagePathList
-                        img_matches = re.findall(r'"(https://[^"]+\.jpg[^"]*)"', script_text)
-                        for idx, img in enumerate(img_matches[:6], 1):
-                            if f'image_{idx}' not in images:
-                                # Clean URL
-                                clean_url = img.split('_')[0] + '.jpg' if '_' in img else img
-                                images[f'image_{idx}'] = clean_url
-                    except:
-                        pass
-            except:
-                pass
-            
-            # =====================================================
-            # 4. DESCRIPTION (BEST FROM NEW SCRAPER - FIXED)
-            # =====================================================
-            # Scroll to ensure description elements are loaded
-            page.mouse.wheel(0, 3000)
-            page.wait_for_timeout(2000)
-            
-            description = extract_description_from_dom(page)
-            
-            # =====================================================
-            # 5. SPECIFICATIONS
-            # =====================================================
-            print("[scraper] Extracting specifications...")
-            specs = extract_specifications(page)
-            spec_fields = map_specifications_to_fields(specs)
-            
-            # =====================================================
-            # 6. EXTRACT BRAND
-            # =====================================================
-            brand = spec_fields.get('brand', '')
-            
-            # =====================================================
-            # 7. EXTRACT COLOR (from SKU selector FIRST, then specifications)
-            # =====================================================
-            color = ""
-            
-            # PRIORITY 1: Get from SKU/Variant selector (the actual selected color option)
-            try:
-                # SKU color is in: <div class="sku--wrap--xgoW06M">
-                sku_wrap = page.locator('div.sku--wrap--xgoW06M')
-                
-                if sku_wrap.count() > 0:
-                    # Get all spans with data-spm-anchor-id (these are the selected values)
-                    color_spans = sku_wrap.locator('span[data-spm-anchor-id]').all()
-                    
-                    if color_spans:
-                        # The first span with data-spm-anchor-id after SKU title is usually the color
-                        for span in color_spans[:2]:
-                            text = span.inner_text().strip()
-                            # Make sure it's not empty and not a link text
-                            if text and len(text) > 0 and 'shop' not in text.lower():
-                                color = text
-                                break
-            except:
-                pass
-            
-            # PRIORITY 2: Fallback to specifications if no color found from SKU
-            if not color:
-                color = spec_fields.get('color', '')
-            
-            # =====================================================
-            # 8. OTHER SPECIFICATIONS
-            # =====================================================
-            dimensions = spec_fields.get('dimensions', '')
-            weight = spec_fields.get('weight', '')
-            material = spec_fields.get('material', '')
-            certifications = spec_fields.get('certifications', '')
-            country_of_origin = spec_fields.get('country_of_origin', '')
-            warranty = spec_fields.get('warranty', '')
-            product_type = spec_fields.get('product_type', '')
-            
-            # =====================================================
-            # 9. SHIPPING INFO
-            # =====================================================
-            shipping = ""
-            try:
-                ship_spans = page.locator('[class*="ship"]').all()
-                for span in ship_spans[:1]:
-                    shipping = span.inner_text().strip()
-                    break
-            except:
-                pass
-            
-            # =====================================================
-            # 10. BULLET POINTS / FEATURES
-            # =====================================================
-            print("[scraper] Extracting bullet points...")
-            bullets = []
-            
-            try:
-                # Look for seo-sellpoints
-                bullet_items = page.locator('.seo-sellpoints--sellerPoint--RcmFO_y li').all()
-                if bullet_items:
-                    for item in bullet_items[:8]:
-                        text = item.inner_text().strip()
-                        if text:
-                            bullets.append(text)
-                
-                # Fallback: look for ul > li patterns
-                if not bullets:
-                    ul_items = page.locator('ul li').all()
-                    for item in ul_items[:8]:
-                        text = item.inner_text().strip()
-                        if text and len(text) > 10:
-                            bullets.append(text)
-            except:
-                pass
-            
-            # =====================================================
-            # COMPILE RESULTS
-            # =====================================================
-            result = {
-                'title': title,
-                'description': description,
-                'brand': brand,
-                'color': color,
-                'weight': weight,
-                'material': material,
-                'certifications': certifications,
-                'country_of_origin': country_of_origin,
-                'warranty': warranty,
-                'product_type': product_type,
-                'dimensions': dimensions,
-                'price': price,
-                'shipping': shipping,
-                'bullet_points': bullets,
-            }
-            
-            # Add images
-            for i in range(1, 7):
-                result[f'image_{i}'] = images.get(f'image_{i}', '')
+            print("[scraper] Extracting from DOM...")
+            dom_data = extract_from_dom(page)
+            data.update({k: v for k, v in dom_data.items() if v and k not in data})
             
             browser.close()
             
@@ -402,22 +374,27 @@ def get_product_info(url):
             # VALIDATION
             # =====================================================
             
-            if not result.get('title'):
-                print("[scraper] ❌ ERROR: No title extracted")
+            if not data.get('title'):
+                print("[scraper] ERROR: No title extracted")
                 return None
             
-            print(f"[scraper] ✅ Successfully extracted all attributes")
-            print(f"[scraper]    Title: {result['title'][:50]}...")
-            print(f"[scraper]    Description: {len(result['description'])} chars")
-            print(f"[scraper]    Images: {sum(1 for i in range(1, 7) if result.get(f'image_{i}'))}")
-            print(f"[scraper]    Bullet points: {len(result['bullet_points'])}")
+            print(f"[scraper] ✅ Successfully extracted {len(data)} attributes")
             
-            return result
+            # Add defaults for missing fields
+            for key in ['description', 'brand', 'color', 'dimensions', 'weight', 
+                       'material', 'shipping', 'price', 'rating', 'reviews']:
+                if key not in data or not data[key]:
+                    data[key] = ""
+            
+            # Ensure images list
+            for i in range(1, 7):
+                if f'image_{i}' not in data:
+                    data[f'image_{i}'] = ""
+            
+            return data
     
     except Exception as e:
-        print(f"[scraper] ❌ ERROR: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"[scraper] ERROR: {e}")
         return None
 
 
@@ -432,16 +409,11 @@ if __name__ == "__main__":
     result = get_product_info(test_url)
     
     if result:
-        print("\n" + "="*70)
-        print("=== SCRAPED DATA ===")
-        print("="*70)
-        for key, value in sorted(result.items()):
+        print("\n=== SCRAPED DATA ===")
+        for key, value in result.items():
             if isinstance(value, list):
-                print(f"{key:25s}: {len(value)} items")
-                for item in value[:3]:
-                    print(f"  - {item[:60]}")
+                print(f"{key}: {len(value)} items")
             else:
-                val_str = str(value)[:100] if len(str(value)) > 100 else str(value)
-                print(f"{key:25s}: {val_str}")
+                print(f"{key}: {str(value)[:80]}")
     else:
-        print("❌ Failed to scrape")
+        print("Failed to scrape")
