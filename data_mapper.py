@@ -1,8 +1,3 @@
-"""
-Data Mapper: Maps scraped product attributes to 71 Octopia template columns
-FIXED: Uses EXACT keys from scraper.py output
-"""
-
 TEMPLATE_MAPPING = {
     # ============================================================
     # REQUIRED FIELDS (marked with *)
@@ -121,6 +116,20 @@ TEMPLATE_MAPPING = {
 }
 
 
+def strip_html(text):
+    """Remove HTML tags from text"""
+    if not text:
+        return ""
+    
+    import re
+    # Remove HTML tags
+    clean = re.compile('<.*?>')
+    text = re.sub(clean, '', text)
+    # Remove extra whitespace
+    text = ' '.join(text.split())
+    return text
+
+
 def map_scraped_data_to_template(scraped_data):
     """
     Maps scraped product data to 71 Octopia template columns
@@ -173,7 +182,8 @@ def map_scraped_data_to_template(scraped_data):
             value = value[:132]
         
         elif mapping_key == "description" and value:
-            # Max 2000 characters for description
+            # Strip HTML and limit to 2000 characters
+            value = strip_html(value)
             value = value[:2000]
         
         elif mapping_key and "image" in mapping_key:
