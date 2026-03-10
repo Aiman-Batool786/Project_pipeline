@@ -1,3 +1,8 @@
+"""
+FastAPI Server - COMPLETE INFO IN RESPONSE
+Returns all product details immediately (processing happens, returns full data)
+"""
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
@@ -443,6 +448,96 @@ def view_processing_logs(limit: int = 500):
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(f"SELECT * FROM processing_logs ORDER BY log_time DESC LIMIT {min(limit, 1000)}")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [dict(row) for row in rows] if rows else {"message": "No records"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/enhanced-products", tags=["Database"])
+def view_enhanced_products(limit: int = 100):
+    """View enhanced products (OpenAI enhanced content)"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT * FROM enhanced_content ORDER BY id DESC LIMIT {min(limit, 1000)}")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [dict(row) for row in rows] if rows else {"message": "No records"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/complete-products", tags=["Database"])
+def view_complete_products(limit: int = 100):
+    """
+    View COMPLETE product information
+    Combines: scraped + enhanced + category + mapped data
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Join all tables to get complete product info
+        query = """
+        SELECT 
+            sp.product_id,
+            sp.url,
+            sp.title as scraped_title,
+            sp.description as scraped_description,
+            sp.brand,
+            sp.color,
+            sp.dimensions,
+            sp.weight,
+            sp.material,
+            sp.certifications,
+            sp.country_of_origin,
+            sp.price,
+            sp.shipping,
+            sp.warranty,
+            sp.image_1, sp.image_2, sp.image_3, sp.image_4, sp.image_5, sp.image_6,
+            sp.bullet_points as scraped_bullets,
+            sp.scraped_at,
+            
+            ec.title as enhanced_title,
+            ec.description as enhanced_description,
+            ec.bullet_points as enhanced_bullets,
+            
+            ca.original_category_id,
+            ca.original_category_name,
+            ca.enhanced_category_id,
+            ca.enhanced_category_name,
+            ca.confidence,
+            
+            mp.titre as template_title,
+            mp.description as template_description,
+            mp.marque,
+            mp.couleur_principale,
+            mp.dimensions as template_dimensions,
+            mp.poids,
+            mp.matiere,
+            mp.certifications as template_certifications,
+            mp.pays_origine,
+            mp.garantie,
+            mp.mapped_at,
+            
+            to_.file_name as template_file,
+            to_.created_at as template_created
+            
+        FROM scraped_products sp
+        LEFT JOIN enhanced_content ec ON sp.product_id = ec.product_id
+        LEFT JOIN category_assignments ca ON sp.product_id = ca.product_id
+        LEFT JOIN mapped_products mp ON sp.product_id = mp.product_id
+        LEFT JOIN template_outputs to_ ON sp.product_id = to_.product_id
+        
+        ORDER BY sp.scraped_at DESC
+        LIMIT ?
+        """
+        
+        cursor.execute(query, (min(limit, 1000),))
         rows = cursor.fetchall()
         conn.close()
         
