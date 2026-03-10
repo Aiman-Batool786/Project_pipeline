@@ -12,8 +12,8 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 DB_NAME = "products.db"
 
-# similarity threshold
-CONFIDENCE_THRESHOLD = 0.60
+# similarity threshold (lowered to 0.40 for better matching)
+CONFIDENCE_THRESHOLD = 0.40
 
 
 # ------------------------------------------------
@@ -40,7 +40,8 @@ def load_categories():
         embeddings = []
 
         for row in rows:
-            category_ids.append(row[0])
+            # Convert category_id to string (it's TEXT in database)
+            category_ids.append(str(row[0]))
             category_names.append(row[1])
 
             try:
@@ -49,8 +50,10 @@ def load_categories():
                 print("[category] WARNING: Failed to load embedding")
 
         if len(embeddings) == 0:
+            print("[category] ERROR: No embeddings loaded!")
             return [], [], np.array([])
 
+        print(f"[category] ✅ Loaded {len(category_ids)} categories")
         return category_ids, category_names, np.array(embeddings)
 
     except Exception as e:
@@ -103,7 +106,7 @@ def assign_category(title, description):
         print("[category] WARNING: Empty title and description")
 
         return {
-            "category_id": 0,
+            "category_id": "0",
             "category_name": "Uncategorized",
             "confidence": 0.0
         }
@@ -125,7 +128,7 @@ def assign_category(title, description):
         print(f"[category] WARNING: Blocked page detected: '{title}'")
 
         return {
-            "category_id": 0,
+            "category_id": "0",
             "category_name": "Uncategorized",
             "confidence": 0.0
         }
@@ -135,10 +138,10 @@ def assign_category(title, description):
     # ------------------------------------------------
     if len(category_embeddings) == 0:
 
-        print("[category] WARNING: No category embeddings loaded")
+        print("[category] ❌ ERROR: No category embeddings loaded")
 
         return {
-            "category_id": 0,
+            "category_id": "0",
             "category_name": "Uncategorized",
             "confidence": 0.0
         }
@@ -150,8 +153,9 @@ def assign_category(title, description):
 
     if product_embedding is None:
 
+        print("[category] ERROR: Could not generate embedding")
         return {
-            "category_id": 0,
+            "category_id": "0",
             "category_name": "Uncategorized",
             "confidence": 0.0
         }
@@ -174,17 +178,19 @@ def assign_category(title, description):
     print(f"[category] Best match: {best_category_name} ({best_score:.3f})")
 
     # ------------------------------------------------
-    # FIX 4: Confidence threshold
+    # FIX 4: Confidence threshold (lowered to 0.40)
     # ------------------------------------------------
     if best_score < CONFIDENCE_THRESHOLD:
 
-        print("[category] Low confidence → Uncategorized")
+        print(f"[category] Low confidence ({best_score:.3f} < {CONFIDENCE_THRESHOLD}) → Uncategorized")
 
         return {
-            "category_id": 0,
+            "category_id": "0",
             "category_name": "Uncategorized",
             "confidence": best_score
         }
+
+    print(f"[category] ✅ Assigned: {best_category_name}")
 
     return {
         "category_id": best_category_id,
