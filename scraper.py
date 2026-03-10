@@ -21,7 +21,7 @@ def extract_from_meta_tags(page):
     except:
         data['image_1'] = ""
     
-    # Description from og:description
+    # Description from og:description (FALLBACK ONLY)
     try:
         desc_meta = page.locator('meta[property="og:description"]').get_attribute('content')
         data['description'] = desc_meta or ""
@@ -77,6 +77,103 @@ def extract_from_javascript(page):
     return data
 
 
+def extract_description_from_dom(page):
+    """
+    Extract description from AliExpress product detail sections
+    Priority:
+    1. detailmodule_text div with detail-desc-decorate-content spans
+    2. All divs with detailmodule_text class
+    3. Generic description selectors
+    """
+    
+    description = ""
+    
+    print("[scraper] 📝 Extracting description from DOM...")
+    
+    # PRIMARY: Extract from detailmodule_text section with detail-desc-decorate-content
+    try:
+        detail_modules = page.locator('div.detailmodule_text').all()
+        if detail_modules:
+            print(f"[scraper] Found {len(detail_modules)} detail modules")
+            detail_texts = []
+            
+            for module in detail_modules:
+                try:
+                    # Try to get span.detail-desc-decorate-content inside this module
+                    spans = module.locator('span.detail-desc-decorate-content').all()
+                    if spans:
+                        for span in spans:
+                            text = span.inner_text().strip()
+                            if text and len(text) > 5:
+                                detail_texts.append(text)
+                    
+                    # Also try direct text from module
+                    if not spans:
+                        module_text = module.inner_text().strip()
+                        if module_text and len(module_text) > 20:
+                            detail_texts.append(module_text)
+                except:
+                    pass
+            
+            if detail_texts:
+                # Join all descriptions with pipe separator
+                description = " | ".join(detail_texts)
+                print(f"[scraper] ✅ Extracted {len(detail_texts)} description sections ({len(description)} chars)")
+    except Exception as e:
+        print(f"[scraper] ⚠️  Error extracting from detailmodule_text: {e}")
+    
+    # SECONDARY: Extract from any span with detail-desc-decorate-content (orphaned spans)
+    if not description or len(description) < 50:
+        try:
+            desc_spans = page.locator('span.detail-desc-decorate-content').all()
+            if desc_spans:
+                print(f"[scraper] Found {len(desc_spans)} orphaned description spans")
+                span_texts = []
+                
+                for span in desc_spans:
+                    text = span.inner_text().strip()
+                    if text and len(text) > 5:
+                        span_texts.append(text)
+                
+                if span_texts:
+                    description = " | ".join(span_texts)
+                    print(f"[scraper] ✅ Extracted from {len(span_texts)} spans ({len(description)} chars)")
+        except Exception as e:
+            print(f"[scraper] ⚠️  Error extracting from spans: {e}")
+    
+    # TERTIARY: Generic description selectors
+    if not description or len(description) < 50:
+        print(f"[scraper] Trying generic description selectors...")
+        desc_selectors = [
+            '[data-pl="product-detail-description"]',
+            '.product-description',
+            'div[class*="description"]',
+            '.detail-desc-text'
+        ]
+        
+        for selector in desc_selectors:
+            try:
+                if page.locator(selector).count() > 0:
+                    desc = page.locator(selector).first.inner_text().strip()
+                    if desc and len(desc) > 50:
+                        description = desc
+                        print(f"[scraper] ✅ Found description using selector: {selector}")
+                        break
+            except:
+                pass
+    
+    # Clean and normalize description
+    if description:
+        # Replace multiple newlines with pipe separator
+        description = re.sub(r'\n+', ' | ', description)
+        # Remove excessive whitespace
+        description = re.sub(r'\s+', ' ', description).strip()
+        # Limit to 2000 characters
+        description = description[:2000]
+    
+    return description
+
+
 def extract_from_dom(page):
     """Extract data from DOM elements"""
     data = {}
@@ -102,27 +199,16 @@ def extract_from_dom(page):
             pass
     
     # ========================
-    # DESCRIPTION
+    # DESCRIPTION (PRIMARY EXTRACTION)
     # ========================
-    desc_selectors = [
-        '[data-pl="product-detail-description"]',
-        '.product-description',
-        'div[class*="description"]',
-        '.detail-desc-text'
-    ]
     
+    # Scroll to ensure all description elements are loaded
     page.mouse.wheel(0, 3000)
-    page.wait_for_timeout(1000)
+    page.wait_for_timeout(2000)
     
-    for selector in desc_selectors:
-        try:
-            if page.locator(selector).count() > 0:
-                desc = page.locator(selector).first.inner_text().strip()
-                if desc and len(desc) > 10:
-                    data['description'] = desc[:2000]
-                    break
-        except:
-            pass
+    description = extract_description_from_dom(page)
+    if description:
+        data['description'] = description
     
     # ========================
     # PRICE
@@ -255,9 +341,9 @@ def get_product_info(url):
     Main scraper function - optimized for AliExpress
     
     Priority:
-    1. Meta tags (most reliable)
-    2. JavaScript embedded data
-    3. DOM elements
+    1. Meta tags (for basic info)
+    2. JavaScript embedded data (images, price)
+    3. DOM elements (detailed description, specs)
     """
     
     try:
@@ -281,10 +367,11 @@ def get_product_info(url):
             
             page = context.new_page()
             
-            print(f"[scraper] Opening: {url}")
+            print(f"[scraper] 🌐 Opening: {url}")
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
             
             # Simulate human behavior
+            print(f"[scraper] ⏳ Waiting for page to fully load...")
             page.wait_for_timeout(3000)
             page.mouse.move(200, 300)
             page.mouse.wheel(0, 2000)
@@ -294,14 +381,14 @@ def get_product_info(url):
             # EXTRACT DATA - Priority Order
             # =====================================================
             
-            print("[scraper] Extracting from meta tags...")
+            print("[scraper] 🔍 Extracting from meta tags...")
             data = extract_from_meta_tags(page)
             
-            print("[scraper] Extracting from JavaScript...")
+            print("[scraper] 🔍 Extracting from JavaScript...")
             js_data = extract_from_javascript(page)
             data.update({k: v for k, v in js_data.items() if v and k not in data})
             
-            print("[scraper] Extracting from DOM...")
+            print("[scraper] 🔍 Extracting from DOM...")
             dom_data = extract_from_dom(page)
             data.update({k: v for k, v in dom_data.items() if v and k not in data})
             
@@ -312,7 +399,7 @@ def get_product_info(url):
             # =====================================================
             
             if not data.get('title'):
-                print("[scraper] ERROR: No title extracted")
+                print("[scraper] ❌ ERROR: No title extracted")
                 return None
             
             print(f"[scraper] ✅ Successfully extracted {len(data)} attributes")
@@ -331,7 +418,9 @@ def get_product_info(url):
             return data
     
     except Exception as e:
-        print(f"[scraper] ERROR: {e}")
+        print(f"[scraper] ❌ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -351,6 +440,7 @@ if __name__ == "__main__":
             if isinstance(value, list):
                 print(f"{key}: {len(value)} items")
             else:
-                print(f"{key}: {str(value)[:80]}")
+                val_str = str(value)[:100] if len(str(value)) > 100 else str(value)
+                print(f"{key}: {val_str}")
     else:
-        print("Failed to scrape")
+        print("❌ Failed to scrape")
