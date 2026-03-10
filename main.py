@@ -1,8 +1,3 @@
-"""
-FastAPI Server - COMPLETE INFO IN RESPONSE
-Returns all product details immediately (processing happens, returns full data)
-"""
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
