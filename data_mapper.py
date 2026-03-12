@@ -1,162 +1,172 @@
 """
 data_mapper.py
 ──────────────
-Maps scraped and LLM-enhanced product data into the Octopia xlsm template.
+Maps enriched scraped product data to Octopia template field keys.
 
-Template column layout (1-indexed):
-  Col 1  – GTIN
-  Col 2  – Référence vendeur (sellerProductReference)
-  Col 3  – Titre* (title)
-  Col 4  – Description* (raw scraped text)
-  Col 5  – URL image 1*
-  Col 6  – Groupe de variation
-  Col 7  – Référence de Regroupement des Variants*
-  Col 8  – Marque (brand)
-  Col 9  – Description marketing (richMarketingDescription → HTML)
-  Col 10 – URL image 2
-  Col 11 – URL image 3
-  Col 12 – URL image 4
-  Col 13 – URL image 5
-  Col 14 – URL image 6
+main.py calls:
+    mapped_data = map_scraped_data_to_template(enriched_data)
+    is_valid, missing = validate_mapped_data(mapped_data)
 
-Row 1:  OCTOPIA | Catégorie | category_code | leaf_category
-Row 4:  Human-readable column headers
-Row 5:  Field key names
-Rows 9+: Product data rows
+mapped_data is a flat dict keyed by Octopia field names (row 5 of template):
+    title, description, richMarketingDescription, brand,
+    sellerPictureUrls_1..6, gtin, sellerProductReference,
+    plus numeric attribute IDs for optional fields.
 """
 
-import os
 import re
-import shutil
-from datetime import datetime
-
-import openpyxl
 
 
 # ─────────────────────────────────────────
-# CATEGORY PARSING
+# REQUIRED FIELDS (Octopia mandatory)
+# ─────────────────────────────────────────
+REQUIRED_FIELDS = [
+    "title",
+    "description",
+    "sellerPictureUrls_1",
+    "sellerProductReference",
+    "gtinReference",
+]
+
+
+# ─────────────────────────────────────────
+# CATEGORY HELPERS
 # ─────────────────────────────────────────
 
-def parse_category(category_name: str) -> tuple[str, str]:
+def parse_category(category_name: str) -> tuple:
     """
-    Given a full category string like:
-        "ADULT - EROTIC/ARTICLES WITH SEXUAL CONNOTATIONS/DISHWASHER"
-    Return (category_code, leaf_category).
+    Given:  "ADULT - EROTIC/ARTICLES WITH SEXUAL CONNOTATIONS/DISHWASHER"
+    Return: ("", "DISHWASHER")
 
-    If category_name already contains a code prefix (e.g. "0V0702 | DISHWASHER"),
-    split on | and return both parts.
-    Otherwise return ("", category_name.split("/")[-1].strip())
+    Given:  "0V0702 | DISHWASHER"
+    Return: ("0V0702", "DISHWASHER")
     """
     if not category_name:
         return ("", "")
-
-    # Already formatted as "code | leaf"
     if "|" in category_name:
         parts = [p.strip() for p in category_name.split("|")]
         return (parts[0], parts[-1])
-
-    # Raw CSV format: extract leaf (last segment after /)
     leaf = category_name.split("/")[-1].strip()
     return ("", leaf)
 
 
-def format_category_cell(category_code: str, leaf_category: str) -> str:
-    """
-    Return: OCTOPIA | Catégorie | category_code | leaf_category
-    """
+def format_octopia_category(category_code: str, leaf_category: str) -> str:
+    """Returns:  OCTOPIA | Catégorie | code | leaf"""
     return f"OCTOPIA | Catégorie | {category_code} | {leaf_category}"
 
 
 # ─────────────────────────────────────────
-# TEMPLATE WRITER
+# MAIN MAPPER
 # ─────────────────────────────────────────
 
-def write_product_to_template(
-    template_path: str,
-    output_path: str,
-    products: list[dict],
-) -> str:
+def map_scraped_data_to_template(enriched_data: dict) -> dict:
     """
-    Load the Octopia xlsm template, append product rows, save to output_path.
+    Convert enriched_data (from scraper + OpenAI) into a flat dict
+    using Octopia template field keys.
 
-    Each product dict must contain:
-        title           str  – improved product title
-        description     str  – raw scraped description (plain text)
-        html_description str – LLM HTML description
-        bullet_points   list – 5 marketing bullet points (stored in notes column)
-        image_url       str  – primary image URL
-        extra_images    list – up to 5 additional image URLs
-        brand           str  – brand name (optional)
-        gtin            str  – GTIN/EAN (optional)
-        seller_ref      str  – seller reference (optional)
-        category_name   str  – full category string from categories.csv
-        category_code   str  – category code (optional, can be parsed from category_name)
-
-    Returns the output_path on success.
+    enriched_data keys expected:
+        title, description, html_description, bullet_points,
+        brand, price, color, dimensions, weight, material,
+        certifications, country_of_origin, warranty, shipping,
+        image_1..image_6  OR  image_url + extra_images,
+        gtin, seller_ref
     """
-    # Copy template so we never mutate the original
-    shutil.copy2(template_path, output_path)
 
-    wb = openpyxl.load_workbook(output_path, keep_vba=True)
-    ws = wb.active  # Main product sheet
+    # ── Images ────────────────────────────────────────────────
+    # Support both image_1/image_2... and image_url/extra_images formats
+    images = []
+    if enriched_data.get("image_url"):
+        images.append(enriched_data["image_url"])
+        for img in enriched_data.get("extra_images", []):
+            images.append(img)
+    for i in range(1, 7):
+        val = enriched_data.get(f"image_{i}", "")
+        if val and val not in images:
+            images.append(val)
 
-    # ── Find first empty data row (rows 1–10 are headers/meta) ──
-    data_start_row = 11  # conservative default
-    for r in range(9, ws.max_row + 2):
-        if ws.cell(row=r, column=3).value is None:
-            data_start_row = r
-            break
+    image_fields = {}
+    for i, img in enumerate(images[:6], 1):
+        key = "sellerPictureUrls_1" if i == 1 else f"sellerPictureUrls_{i}"
+        image_fields[key] = img
 
-    for idx, product in enumerate(products):
-        row = data_start_row + idx
+    # ── Title (max 132 chars) ─────────────────────────────────
+    title = (enriched_data.get("title") or "").strip()[:132]
 
-        # ── Category ───────────────────────────────────────────
-        category_code = product.get("category_code", "")
-        category_name = product.get("category_name", "")
+    # ── Raw description (plain text, max 2000) ────────────────
+    description = (enriched_data.get("description") or "").strip()[:2000]
 
-        if not category_code:
-            category_code, leaf = parse_category(category_name)
-        else:
-            _, leaf = parse_category(category_name)
-            if not leaf:
-                leaf = category_name.split("/")[-1].strip() if "/" in category_name else category_name
+    # ── HTML marketing description (max 5000) ─────────────────
+    html_desc = (enriched_data.get("html_description") or "").strip()[:5000]
 
-        # Update row 1 with category for this batch (last product wins if multiple)
-        ws.cell(row=1, column=1).value = "OCTOPIA"
-        ws.cell(row=1, column=2).value = "Catégorie"
-        ws.cell(row=1, column=3).value = category_code
-        ws.cell(row=1, column=4).value = leaf
+    # ── Seller reference: derive from title slug ──────────────
+    seller_ref = enriched_data.get("seller_ref") or enriched_data.get("sellerProductReference") or ""
+    if not seller_ref and title:
+        slug = re.sub(r"[^a-zA-Z0-9]", "-", title[:40]).strip("-").upper()
+        seller_ref = f"AE-{slug}"
 
-        # ── Images ────────────────────────────────────────────
-        extra = product.get("extra_images", [])
-        image_cols = [5, 10, 11, 12, 13, 14]  # image 1–6
-        all_images = [product.get("image_url", "")] + list(extra)
-
-        # ── Write columns ─────────────────────────────────────
-        ws.cell(row=row, column=1).value = product.get("gtin", "")
-        ws.cell(row=row, column=2).value = product.get("seller_ref", "")
-        ws.cell(row=row, column=3).value = product.get("title", "")[:132]
-        ws.cell(row=row, column=4).value = product.get("description", "")[:2000]   # raw text
-        ws.cell(row=row, column=8).value = product.get("brand", "")
-
-        # Description marketing = HTML only
-        html_desc = product.get("html_description", "")
-        ws.cell(row=row, column=9).value = html_desc[:5000] if html_desc else ""
+    # ── Build mapped dict ─────────────────────────────────────
+    mapped = {
+        # Core required fields
+        "gtin":                    enriched_data.get("gtin", ""),
+        "sellerProductReference":  seller_ref[:50],
+        "gtinReference":           enriched_data.get("gtin", seller_ref)[:50],
+        "title":                   title,
+        "description":             description,               # Description* (plain text)
+        "richMarketingDescription": html_desc,               # Description marketing (HTML)
 
         # Images
-        for i, col in enumerate(image_cols):
-            if i < len(all_images) and all_images[i]:
-                ws.cell(row=row, column=col).value = all_images[i]
+        **image_fields,
 
-        print(f"[data_mapper] Row {row} written: {product.get('title', '')[:60]}")
+        # Brand / manufacturer
+        "brand":                   (enriched_data.get("brand") or "").strip()[:30],
 
-    wb.save(output_path)
-    print(f"[data_mapper] Saved to: {output_path}")
-    return output_path
+        # Optional product attributes mapped to Octopia numeric IDs
+        # Col 26 / ID 3264  → Couleur principale
+        "3264":  (enriched_data.get("color") or enriched_data.get("colour") or "").strip(),
+        # Col 34 / ID 999999 → Dimension maximum (cm)
+        "999999": (enriched_data.get("dimension_max") or enriched_data.get("dimensions") or "").strip(),
+        # Col 35 / ID 999998 → Dimension medium (cm)
+        "999998": (enriched_data.get("dimension_med") or "").strip(),
+        # Col 36 / ID 999997 → Dimension minimum (cm)
+        "999997": (enriched_data.get("dimension_min") or "").strip(),
+        # Col 37 / ID 999996 → Poids emballé (kg)
+        "999996": (enriched_data.get("weight") or enriched_data.get("poids") or "").strip(),
+        # Col 47 / ID 24061  → Matières
+        "24061":  (enriched_data.get("material") or enriched_data.get("matiere") or "").strip(),
+        # Col 49 / ID 6720   → Certifications et normes
+        "6720":   (enriched_data.get("certifications") or "").strip(),
+        # Col 50 / ID 37937  → Garantie
+        "37937":  (enriched_data.get("warranty") or enriched_data.get("garantie") or "").strip(),
+        # Col 72 / ID 11429  → Pays d'origine
+        "11429":  (enriched_data.get("country_of_origin") or enriched_data.get("pays_origine") or "").strip(),
+        # Col 44 / ID 24069  → Dimensions
+        "24069":  (enriched_data.get("dimensions") or "").strip(),
+        # Col 60 / ID 24072  → Poids
+        "24072":  (enriched_data.get("weight") or "").strip(),
+    }
+
+    # Remove empty optional fields to keep dict clean
+    mapped = {k: v for k, v in mapped.items() if v != "" or k in REQUIRED_FIELDS}
+
+    return mapped
 
 
 # ─────────────────────────────────────────
-# PIPELINE HELPER
+# VALIDATOR
+# ─────────────────────────────────────────
+
+def validate_mapped_data(mapped_data: dict) -> tuple:
+    """
+    Check all required Octopia fields are present and non-empty.
+
+    Returns:
+        (is_valid: bool, missing_fields: list[str])
+    """
+    missing = [f for f in REQUIRED_FIELDS if not mapped_data.get(f)]
+    return (len(missing) == 0, missing)
+
+
+# ─────────────────────────────────────────
+# PIPELINE CONVENIENCE (kept for backward compat)
 # ─────────────────────────────────────────
 
 def map_pipeline_result_to_template(
@@ -167,37 +177,33 @@ def map_pipeline_result_to_template(
     output_path: str = None,
 ) -> str:
     """
-    Convenience function: given outputs of the full pipeline, write one
-    product row into the template and return the output file path.
-
-    Args:
-        template_path  – path to the base .xlsm template
-        scraped        – dict returned by scraper.get_product_info()
-        enhanced       – dict returned by openai_client.improve_product_content()
-        category_info  – dict returned by category_utils.assign_category()
-                         must include 'category_id' and 'category_name'
-        output_path    – where to save; auto-generated if None
-
-    Returns:
-        output_path
+    Legacy convenience wrapper used by older main.py versions.
+    Merges scraped + enhanced into enriched_data, then writes the template.
     """
+    from template_filler import fill_template_for_product
+    import os
+    from datetime import datetime
+
+    enriched = scraped.copy()
+    enriched["title"] = enhanced.get("title", scraped.get("title", ""))
+    enriched["description"] = scraped.get("description", "")
+    enriched["html_description"] = enhanced.get("html_description", "")
+    enriched["bullet_points"] = enhanced.get("bullet_points", [])
+
+    mapped = map_scraped_data_to_template(enriched)
+
+    # Inject category into mapped data
+    cat_code = str(category_info.get("category_id", ""))
+    cat_name = category_info.get("category_name", "")
+    _, leaf = parse_category(cat_name)
+    mapped["_category_code"] = cat_code
+    mapped["_category_leaf"] = leaf
+
     if output_path is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = os.path.splitext(template_path)[0]
         output_path = f"{base}_output_{ts}.xlsm"
 
-    product = {
-        "title":            enhanced.get("title", scraped.get("title", "")),
-        "description":      scraped.get("description", ""),          # raw text → Description*
-        "html_description": enhanced.get("html_description", ""),    # HTML → Description marketing
-        "bullet_points":    enhanced.get("bullet_points", []),
-        "image_url":        scraped.get("image_url", ""),
-        "extra_images":     scraped.get("extra_images", []),
-        "brand":            "",
-        "gtin":             "",
-        "seller_ref":       "",
-        "category_name":    category_info.get("category_name", ""),
-        "category_code":    str(category_info.get("category_id", "")),
-    }
-
-    return write_product_to_template(template_path, output_path, [product])
+    product_id = 0
+    out_dir = os.path.dirname(output_path) or "."
+    return fill_template_for_product(template_path, mapped, product_id, out_dir)
