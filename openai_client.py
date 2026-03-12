@@ -4,65 +4,77 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+
 def improve_product_content(title, description, category=None):
+
     category_line = f"Category: {category}" if category else ""
 
     prompt = f"""
-You are a professional Amazon product copywriter.
-Rewrite the following product content to be engaging, clear, and optimized for eCommerce listings.
+You are a professional eCommerce copywriter.
 
-Product Details:
+Improve the product listing below.
+
 Title: {title}
 Description: {description}
 {category_line}
 
 Instructions:
-- Write a compelling, keyword-rich title (max 200 characters)
-- Write a clear, benefit-focused description (2-3 sentences)
-- Write 5 bullet points highlighting key features and benefits
-- If category is provided, tailor the tone and keywords for that category
 
-Return ONLY valid JSON. No extra text, no markdown, no code blocks.
-Format:
+1. Improve the title (max 200 characters)
+2. Create 5 bullet points highlighting key benefits
+3. Convert the description into CLEAN HTML
+
+Use this structure:
+
+<p><strong>Content:</strong> ...</p>
+
+<h3>Features</h3>
+<ul>
+<li>Feature 1</li>
+<li>Feature 2</li>
+<li>Feature 3</li>
+<li>Feature 4</li>
+<li>Feature 5</li>
+</ul>
+
+<h3>Package Includes</h3>
+<ul>
+<li>Item</li>
+</ul>
+
+Return ONLY JSON:
+
 {{
-    "title": "...",
-    "description": "...",
-    "bullet_points": ["...", "...", "...", "...", "..."]
+"title": "...",
+"description_html": "...",
+"bullet_points": ["...", "...", "...", "...", "..."]
 }}
 """
-    content = ""
+
     try:
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are a professional eCommerce copywriter. Always respond with valid JSON only."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "system", "content": "Return valid JSON only"},
+                {"role": "user", "content": prompt},
             ],
             temperature=0.7,
-            max_tokens=1000,
+            max_tokens=900,
         )
+
         content = response.choices[0].message.content.strip()
 
         if content.startswith("```"):
             content = content.split("```")[1]
             if content.startswith("json"):
                 content = content[4:]
-            content = content.strip()
 
         return json.loads(content)
 
-    except json.JSONDecodeError as e:
-        print(" OpenAI returned invalid JSON:", e)
-        print("Raw response:", content)
-        return None
     except Exception as e:
-        print(" OpenAI API error:", e)
+        print("OpenAI error:", e)
         return None
