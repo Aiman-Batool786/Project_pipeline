@@ -1,3 +1,8 @@
+"""
+Data Mapper: Maps scraped product data to 71 Octopia template columns
+UPDATED: Handles LLM-enriched descriptions + category mapping
+"""
+
 TEMPLATE_MAPPING = {
     # ============================================================
     # REQUIRED FIELDS (marked with *)
@@ -5,7 +10,7 @@ TEMPLATE_MAPPING = {
     "GTIN (EAN, ISBN, UPC…)*": None,  # Not available from AliExpress
     "Référence vendeur*": None,  # Not available from AliExpress
     "Titre*": "title",  # ✅ from scraper
-    "Description*": "description",  # ✅ from scraper
+    "Description*": "description",  # ✅ from scraper (raw/original)
     "URL image 1*": "image_1",  # ✅ from scraper
     "Référence de Regroupement des Variants*": None,  # Not available
     
@@ -13,7 +18,7 @@ TEMPLATE_MAPPING = {
     # BRAND & MARKETING
     # ============================================================
     "Marque": "brand",  # ✅ from scraper
-    "Description marketing": "description",  # Use description
+    "Description marketing": "description_html_enriched",  # ✅ LLM-generated HTML description
     
     # ============================================================
     # ADDITIONAL IMAGES (6 images extracted)
@@ -76,6 +81,11 @@ TEMPLATE_MAPPING = {
     "Description du produit": "description",  # ✅ from scraper
     
     # ============================================================
+    # CATEGORY MAPPING (NEW)
+    # ============================================================
+    # Note: OCTOPIA row in template handles category_id and leaf_category
+    
+    # ============================================================
     # BABY PHONE SPECIFIC (Optional - may be empty)
     # ============================================================
     "Mode économie d'énergie": None,
@@ -136,6 +146,7 @@ def map_scraped_data_to_template(scraped_data):
     
     Args:
         scraped_data: Dict with scraped product attributes from scraper.py
+                      Can include 'description_html_enriched' key from LLM
         
     Returns:
         Dict with template fields as keys and scraped values as values
@@ -167,6 +178,17 @@ def map_scraped_data_to_template(scraped_data):
             else:
                 value = ""
         
+        elif mapping_key == "description_html_enriched":
+            # This is the LLM-generated HTML description for "Description marketing"
+            # Should be stored as-is (HTML format)
+            html_desc = scraped_data.get("description_html_enriched", "")
+            if html_desc:
+                # Keep HTML format, don't strip tags
+                value = html_desc
+            else:
+                # Fallback: if no enriched description, use original
+                value = scraped_data.get("description", "")
+        
         else:
             # Get value directly from scraped data
             value = scraped_data.get(mapping_key, "")
@@ -181,10 +203,14 @@ def map_scraped_data_to_template(scraped_data):
             # Max 132 characters for title
             value = value[:132]
         
-        elif mapping_key == "description" and value:
-            # Strip HTML and limit to 2000 characters
+        elif mapping_key == "description" and value and mapping_key != "description_html_enriched":
+            # Strip HTML and limit to 2000 characters (for "Description*" field)
+            # This is the raw scraped description
             value = strip_html(value)
             value = value[:2000]
+        
+        # For description_html_enriched, keep HTML - don't strip it!
+        # (handled above in the mapping_key check)
         
         elif mapping_key and "image" in mapping_key:
             # Validate image URLs
@@ -234,8 +260,8 @@ def create_template_row(mapped_data, product_id, category_id, category_name):
     Args:
         mapped_data: Dict with mapped template fields
         product_id: Product ID from database
-        category_id: Octopia category ID
-        category_name: Octopia category name
+        category_id: Octopia category ID (from categories CSV)
+        category_name: Octopia leaf category name (from categories CSV)
         
     Returns:
         Dict with complete row data
