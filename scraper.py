@@ -2,119 +2,104 @@ from playwright.sync_api import sync_playwright
 import re
 
 
-def extract_description(page):
+# ─────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────
+
+BLOCKED_DESCRIPTIONS = [
+    "smarter shopping, better living",
+    "aliexpress.com",
+    "just a moment",
+    "attention required",
+    "access denied",
+    "captcha",
+    "enable javascript",
+    "please turn javascript on",
+]
+
+
+def _is_blocked_text(text: str) -> bool:
+    low = text.lower().strip()
+    return any(b in low for b in BLOCKED_DESCRIPTIONS) or len(low) < 20
+
+
+def _html_to_text(html: str) -> str:
+    """Convert inner HTML to clean readable text."""
+    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    lines = [line.strip() for line in text.splitlines()]
+    return "\n".join(lines).strip()
+
+
+# ─────────────────────────────────────────
+# DESCRIPTION EXTRACTION
+# ─────────────────────────────────────────
+
+def _extract_description_from_frame(frame) -> str:
+    """Extract description from div.detailmodule_text inside a frame/page."""
+    selectors = [
+        "div.detailmodule_text",
+        "div[class*='detailmodule_text']",
+        "div[class*='detail-desc-decorate-richtext']",
+        "div[class*='description--product-description']",
+        "div#product-description",
+        "div[id*='description']",
+    ]
+
+    for sel in selectors:
+        try:
+            loc = frame.locator(sel)
+            if loc.count() > 0:
+                inner_html = loc.first.inner_html()
+                text = _html_to_text(inner_html)
+                if text and not _is_blocked_text(text):
+                    print(f"[scraper] Description found via selector: {sel}")
+                    return text
+        except Exception:
+            continue
+
+    return ""
+
+
+def _extract_description(page) -> str:
     """
-    Extract the real product description from AliExpress.
-
-    Correct container:
-    div.detailmodule_text
+    1. Try to find a description iframe and switch context.
+    2. If no iframe, extract directly from main page.
     """
+    iframe_selectors = [
+        "iframe[id*='desc']",
+        "iframe[src*='description']",
+        "iframe[id*='description']",
+        "iframe[class*='description']",
+    ]
 
-    print("[scraper] Extracting description from div.detailmodule_text...")
+    for iframe_sel in iframe_selectors:
+        try:
+            iframe_loc = page.locator(iframe_sel)
+            if iframe_loc.count() > 0:
+                print(f"[scraper] Description iframe detected: {iframe_sel}")
+                frame = iframe_loc.first.content_frame()
+                if frame:
+                    try:
+                        frame.wait_for_load_state("domcontentloaded", timeout=10000)
+                    except Exception:
+                        pass
+                    text = _extract_description_from_frame(frame)
+                    if text:
+                        return text
+        except Exception:
+            continue
 
-    try:
-        page.wait_for_selector("div.detailmodule_text", timeout=10000)
-
-        desc_block = page.locator("div.detailmodule_text").first
-
-        if desc_block.count() == 0:
-            print("[scraper] Description container not found")
-            return ""
-
-        html = desc_block.inner_html()
-
-        # Convert <br> to newline
-        html = re.sub(r"<br\s*/?>", "\n", html)
-
-        # Remove remaining HTML tags
-        text = re.sub(r"<.*?>", "", html)
-
-        # Clean whitespace
-        text = re.sub(r"\n+", "\n", text).strip()
-
-        if "Smarter Shopping, Better Living" in text:
-            return ""
-
-        print(f"[scraper] Description length: {len(text)} characters")
-
-        return text
-
-    except Exception as e:
-        print("[scraper] Description extraction failed:", e)
-        return ""
+    print("[scraper] No description iframe found, scraping main page")
+    return _extract_description_from_frame(page)
 
 
-def extract_images(page):
-    """Extract product images"""
+# ─────────────────────────────────────────
+# MAIN SCRAPER
+# ─────────────────────────────────────────
 
-    images = {}
-
-    try:
-        scripts = page.locator("script").all()
-
-        for script in scripts:
-            content = script.text_content()
-
-            match = re.search(r'"imagePathList":\[(.*?)\]', content)
-
-            if match:
-                urls = re.findall(r'"(https://[^"]+\.jpg[^"]*)"', match.group(1))
-
-                for i, img in enumerate(urls[:20], start=1):
-                    key = f"image_{i}"
-                    images[key] = re.sub(r'_\d+x\d+', '', img)
-
-                break
-
-    except Exception as e:
-        print("[scraper] Image extraction error:", e)
-
-    return images
-
-
-def extract_meta(page):
-    """Extract title from meta"""
-
-    data = {}
-
-    try:
-        title = page.locator('meta[property="og:title"]').get_attribute("content")
-        data["title"] = title or ""
-    except:
-        data["title"] = ""
-
-    return data
-
-
-def extract_price(page):
-    """Extract price from JS"""
-
-    price = ""
-    shipping = ""
-
-    try:
-        scripts = page.locator("script").all()
-
-        for script in scripts:
-            content = script.text_content()
-
-            price_match = re.search(r'"price":"([^"]+)"', content)
-            ship_match = re.search(r'"shipmentWay":"([^"]+)"', content)
-
-            if price_match:
-                price = price_match.group(1)
-
-            if ship_match:
-                shipping = ship_match.group(1)
-
-    except:
-        pass
-
-    return price, shipping
-
-
-def get_product_info(url):
-
+def get_product_info(url: str) -> dict | None:
     try:
         with sync_playwright() as p:
 
@@ -123,56 +108,113 @@ def get_product_info(url):
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
-                ]
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ],
             )
 
             context = browser.new_context(
-                user_agent="Mozilla/5.0",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
                 viewport={"width": 1366, "height": 768},
                 locale="en-US",
-                timezone_id="Asia/Karachi"
+                timezone_id="Asia/Karachi",
             )
+
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                window.chrome = { runtime: {} };
+            """)
 
             page = context.new_page()
 
-            print("[scraper] Opening:", url)
-
-            page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            print(f"[scraper] Opening URL: {url}")
+            page.goto(url, timeout=90000, wait_until="domcontentloaded")
 
             page.wait_for_timeout(4000)
+            page.mouse.move(200, 300)
+            page.mouse.wheel(0, 2000)
+            page.wait_for_timeout(3000)
 
-            data = {}
+            # ── TITLE ──────────────────────────────────────────
+            title = ""
+            for sel in [
+                "h1[data-pl='product-title']",
+                "h1[class*='product-title']",
+                "h1",
+            ]:
+                if page.locator(sel).count() > 0:
+                    t = page.locator(sel).first.inner_text().strip()
+                    if t:
+                        title = t
+                        break
 
-            # TITLE
-            data.update(extract_meta(page))
+            if not title or _is_blocked_text(title):
+                print("[scraper] Blocked page or empty title — aborting")
+                browser.close()
+                return None
 
-            # DESCRIPTION
-            description = extract_description(page)
-            data["description"] = description
+            # ── PRICE ──────────────────────────────────────────
+            price = ""
+            for sel in [
+                "div[class*='price--currentPriceText']",
+                "span[class*='price--current']",
+                "div[class*='product-price-value']",
+                "span[class*='uniform-banner-box-price']",
+            ]:
+                if page.locator(sel).count() > 0:
+                    p_text = page.locator(sel).first.inner_text().strip()
+                    if p_text:
+                        price = p_text
+                        break
 
-            # IMAGES
-            images = extract_images(page)
-            data.update(images)
+            # ── IMAGES ─────────────────────────────────────────
+            images = []
+            for sel in [
+                "img[class*='magnifier--image']",
+                "img[class*='product-image']",
+                "img[class*='main-image']",
+            ]:
+                locs = page.locator(sel)
+                if locs.count() > 0:
+                    for i in range(min(locs.count(), 6)):
+                        src = locs.nth(i).get_attribute("src") or ""
+                        if src and src.startswith("http"):
+                            images.append(src)
+                    if images:
+                        break
 
-            # PRICE
-            price, shipping = extract_price(page)
+            if not images and page.locator("img").count() > 0:
+                src = page.locator("img").first.get_attribute("src") or ""
+                if src:
+                    images.append(src)
 
-            data["price"] = price
-            data["shipping"] = shipping
+            # ── DESCRIPTION ────────────────────────────────────
+            # Scroll down so lazy-loaded description content renders
+            page.mouse.wheel(0, 4000)
+            page.wait_for_timeout(3000)
+
+            description = _extract_description(page)
+
+            if not description:
+                print("[scraper] WARNING: Description could not be extracted")
 
             browser.close()
 
-            return data
+            return {
+                "title": title,
+                "description": description,
+                "price": price,
+                "image_url": images[0] if images else "",
+                "extra_images": images[1:] if len(images) > 1 else [],
+            }
 
     except Exception as e:
-        print("Scraper error:", e)
+        print(f"[scraper] Scraping failed for URL: {url}")
+        print(f"[scraper] Error: {e}")
         return None
-
-
-if __name__ == "__main__":
-
-    url = "https://www.aliexpress.com/item/1005009666264769.html"
-
-    result = get_product_info(url)
-
-    print(result)
