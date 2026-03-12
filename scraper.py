@@ -3,68 +3,131 @@ import re
 import json
 
 
-def extract_description_from_detailmodule(page):
+def extract_description_from_correct_selector(page):
     """
-    Extract CORRECT description from AliExpress product detail sections
+    Extract description from the CORRECT AliExpress structure:
+    
+    <h2 class="title--title--O6xcB1q">Description</h2>
+    <p style="...">
+        Description
+        Content: 15ml
+        Size: 10*7cm
+        Features
+        1. High-purity retinol formula...
+        ...
+        Package includes:
+        1 * Retinol Firming Enhancer
+    </p>
     
     Priority:
-    1. div.detailmodule_text - main product description section
-    2. Fallback to other generic selectors only if detailmodule_text is empty
-    3. NEVER use og:description from meta tags (contains generic Aliexpress text)
+    1. h2.title--title--O6xcB1q + following p tag
+    2. div.detailmodule_text (fallback)
+    3. Generic selectors (last resort)
     """
     
     description = ""
     
-    print("[scraper] 📝 Extracting description from div.detailmodule_text...")
+    print("[scraper] 📝 Extracting description from h2 + p structure...")
     
-    # PRIMARY: Extract ALL content from div.detailmodule_text
+    # PRIMARY: Find h2 with "Description" text and get next p tag
     try:
-        detail_modules = page.locator('div.detailmodule_text').all()
-        if detail_modules:
-            print(f"[scraper]    Found {len(detail_modules)} detail module(s)")
-            detail_texts = []
+        h2_elements = page.locator('h2.title--title--O6xcB1q').all()
+        if h2_elements:
+            print(f"[scraper]    Found {len(h2_elements)} h2 element(s)")
             
-            for idx, module in enumerate(detail_modules):
+            for idx, h2 in enumerate(h2_elements):
                 try:
-                    # Get all text content from this module (including nested elements)
-                    module_text = module.inner_text().strip()
-                    if module_text and len(module_text) > 5:
-                        detail_texts.append(module_text)
-                        print(f"[scraper]    Module {idx+1}: {len(module_text)} chars")
+                    h2_text = h2.inner_text().strip()
+                    print(f"[scraper]    Checking h2 {idx+1}: '{h2_text}'")
+                    
+                    # Check if this is the Description header
+                    if "description" in h2_text.lower():
+                        print(f"[scraper]    ✅ Found Description header")
+                        
+                        # Try multiple ways to get the next p element
+                        # Method 1: Using XPath to get next sibling
+                        try:
+                            # Get all p tags on page and find the one after this h2
+                            all_p_tags = page.locator('p').all()
+                            
+                            # Get h2 position to find next p
+                            h2_outer = page.locator('h2.title--title--O6xcB1q').first
+                            
+                            # Get parent container
+                            try:
+                                parent_html = page.evaluate('() => document.querySelector("h2.title--title--O6xcB1q").parentElement.innerHTML')
+                                print(f"[scraper]    Parent contains: {len(parent_html)} chars")
+                            except:
+                                pass
+                            
+                            # Try to get next element (any tag)
+                            next_elem_html = page.evaluate('''() => {
+                                let h2 = document.querySelector("h2.title--title--O6xcB1q");
+                                let next = h2.nextElementSibling;
+                                while (next && next.tagName !== "P") {
+                                    next = next.nextElementSibling;
+                                }
+                                return next ? next.innerText : null;
+                            }''')
+                            
+                            if next_elem_html and len(next_elem_html) > 50:
+                                description = next_elem_html
+                                print(f"[scraper]    ✅ Found p tag after h2 ({len(description)} chars)")
+                                break
+                        except Exception as e:
+                            print(f"[scraper]    ⚠️  Error with JavaScript extraction: {e}")
+                        
+                        # Method 2: Direct p tag search right after h2
+                        if not description:
+                            try:
+                                # Get all elements and find p tags that come after h2
+                                p_elements = page.locator('p').all()
+                                for p in p_elements[:10]:  # Check first 10 p tags
+                                    p_text = p.inner_text().strip()
+                                    # Check if p contains description-like content
+                                    if any(keyword in p_text for keyword in ['content:', 'features', 'package', 'size:', 'description']):
+                                        if len(p_text) > 50:
+                                            description = p_text
+                                            print(f"[scraper]    ✅ Found p with keywords ({len(description)} chars)")
+                                            break
+                            except Exception as e:
+                                print(f"[scraper]    ⚠️  Error with p tag search: {e}")
                 except Exception as e:
-                    print(f"[scraper]    ⚠️  Error reading module {idx+1}: {e}")
-            
-            if detail_texts:
-                # Join all detail modules with pipe separator
-                description = " | ".join(detail_texts)
-                print(f"[scraper]    ✅ Extracted {len(detail_texts)} sections ({len(description)} total chars)")
+                    print(f"[scraper]    ⚠️  Error processing h2 {idx+1}: {e}")
+                
+                if description:
+                    break
     except Exception as e:
-        print(f"[scraper]    ⚠️  Error extracting from detailmodule_text: {e}")
+        print(f"[scraper]    ⚠️  Error with h2 search: {e}")
     
-    # SECONDARY: Try to extract from description section header if primary failed
+    # SECONDARY: Extract from div.detailmodule_text
     if not description or len(description) < 50:
-        print("[scraper]    Trying description section header...")
+        print("[scraper]    Trying div.detailmodule_text...")
         try:
-            # Look for divs with Description title
-            desc_sections = page.locator('div.title--text--Otu0bLr').all()
-            if desc_sections:
-                print(f"[scraper]    Found {len(desc_sections)} description header(s)")
-                for section in desc_sections:
-                    section_text = section.inner_text().strip()
-                    if "description" in section_text.lower():
-                        # Get the text following this header
-                        next_elem = section.locator('..').inner_text().strip()
-                        if next_elem and len(next_elem) > 50:
-                            description = next_elem
-                            print(f"[scraper]    ✅ Found from header section ({len(description)} chars)")
-                            break
+            detail_modules = page.locator('div.detailmodule_text').all()
+            if detail_modules:
+                print(f"[scraper]    Found {len(detail_modules)} detail module(s)")
+                detail_texts = []
+                
+                for idx, module in enumerate(detail_modules):
+                    try:
+                        module_text = module.inner_text().strip()
+                        if module_text and len(module_text) > 5:
+                            detail_texts.append(module_text)
+                    except:
+                        pass
+                
+                if detail_texts:
+                    description = " | ".join(detail_texts)
+                    print(f"[scraper]    ✅ Extracted from {len(detail_texts)} modules ({len(description)} chars)")
         except Exception as e:
-            print(f"[scraper]    ⚠️  Error with header section: {e}")
+            print(f"[scraper]    ⚠️  Error with detailmodule_text: {e}")
     
-    # TERTIARY: Fallback to generic selectors (ONLY if detailmodule_text was empty)
+    # TERTIARY: Fallback to generic selectors
     if not description or len(description) < 50:
         print("[scraper]    Fallback to generic selectors...")
         desc_selectors = [
+            'p[style*="font"]',  # P tags with style (common for descriptions)
             '[data-pl="product-detail-description"]',
             '.product-description',
             'div[class*="detail-desc"]',
@@ -79,52 +142,47 @@ def extract_description_from_detailmodule(page):
                         description = desc
                         print(f"[scraper]    ✅ Found using selector: {selector} ({len(description)} chars)")
                         break
-            except Exception as e:
-                print(f"[scraper]    ⚠️  Error with {selector}: {e}")
+            except:
+                pass
     
     # Clean and normalize description
     if description:
+        # Remove "Description" header text if it starts with it
+        if description.lower().startswith("description"):
+            description = re.sub(r'^description\s*', '', description, flags=re.IGNORECASE).strip()
+        
         # Normalize whitespace and newlines
-        description = re.sub(r'\n+', ' | ', description)  # Replace multiple newlines with separator
+        description = re.sub(r'\n+', ' | ', description)  # Replace multiple newlines
         description = re.sub(r'\s+', ' ', description)    # Collapse multiple spaces
         description = description.strip()
         
-        # Limit to 3000 characters for detailed content
+        # Limit to 3000 characters
         if len(description) > 3000:
             description = description[:3000]
-            print(f"[scraper]    Trimmed to 3000 chars")
     
     if not description:
-        print("[scraper]    ⚠️  WARNING: No detailed description found!")
+        print("[scraper]    ⚠️  WARNING: No description found!")
     
     return description
 
 
 def extract_from_meta_tags(page):
-    """
-    Extract data from meta tags
-    
-    ⚠️ NOTE: og:description is SKIPPED - it contains generic Aliexpress text
-    Only use og:title and og:image which are reliable
-    """
+    """Extract title and image from meta tags (SKIP description)"""
     data = {}
     
-    # Title from og:title (RELIABLE)
     try:
         title_meta = page.locator('meta[property="og:title"]').get_attribute('content')
         data['title'] = title_meta or ""
     except:
         data['title'] = ""
     
-    # Main image from og:image (RELIABLE)
     try:
         image_meta = page.locator('meta[property="og:image"]').get_attribute('content')
         data['image_1'] = image_meta or ""
     except:
         data['image_1'] = ""
     
-    # ⚠️ SKIP og:description - it's generic "Smarter Shopping, Better Living" text
-    # Description will be extracted from div.detailmodule_text instead
+    # ⚠️ SKIP og:description - use DOM extraction instead
     
     return data
 
@@ -199,12 +257,12 @@ def extract_from_dom(page):
             pass
     
     # ========================
-    # DESCRIPTION (FIXED - Using detailmodule_text)
+    # DESCRIPTION (FIXED)
     # ========================
     page.mouse.wheel(0, 3000)
     page.wait_for_timeout(1500)
     
-    description = extract_description_from_detailmodule(page)
+    description = extract_description_from_correct_selector(page)
     if description:
         data['description'] = description
     
@@ -335,13 +393,7 @@ def extract_from_dom(page):
 def get_product_info(url):
     """
     Main scraper function - optimized for AliExpress
-    
-    Priority:
-    1. Meta tags (for title and image ONLY)
-    2. JavaScript embedded data (images, price)
-    3. DOM elements (description from div.detailmodule_text, specs, bullets)
-    
-    IMPORTANT: Description is extracted from div.detailmodule_text, NOT from og:description meta tag
+    Extracts description from h2.title--title--O6xcB1q + following p tag
     """
     
     try:
@@ -375,17 +427,17 @@ def get_product_info(url):
             page.wait_for_timeout(2000)
             
             # =====================================================
-            # EXTRACT DATA - Priority Order
+            # EXTRACT DATA
             # =====================================================
             
-            print("[scraper] 🔍 Extracting from meta tags (title, image)...")
+            print("[scraper] 🔍 Extracting from meta tags...")
             data = extract_from_meta_tags(page)
             
             print("[scraper] 🔍 Extracting from JavaScript...")
             js_data = extract_from_javascript(page)
             data.update({k: v for k, v in js_data.items() if v and k not in data})
             
-            print("[scraper] 🔍 Extracting from DOM (including description)...")
+            print("[scraper] 🔍 Extracting from DOM...")
             dom_data = extract_from_dom(page)
             data.update({k: v for k, v in dom_data.items() if v and k not in data})
             
