@@ -2,7 +2,10 @@
 FastAPI Server - COMPLETE INFO IN RESPONSE
 Returns all product details immediately (processing happens, returns full data)
 
-UPDATED: Uses category_leaf for template Row 1
+UPDATED: Solution 1 + Store Original Specs
+- Passes specifications to OpenAI for enhancement
+- Merges enhanced specs with original (prefers enhanced)
+- Uses category_leaf for template Row 1
 """
 
 from fastapi import FastAPI, HTTPException
@@ -10,6 +13,7 @@ from pydantic import BaseModel
 import os
 import sqlite3
 import logging
+import json
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
@@ -79,7 +83,7 @@ def root():
         "version": "2.0.0",
         "features": [
             "Advanced scraping (25+ attributes, 6+ images)",
-            "Content enhancement (OpenAI with HTML)",
+            "Content enhancement (OpenAI with HTML + Specs)",
             "Octopia categorization (5,806 categories with leaf extraction)",
             "Template mapping (71 columns)",
             "Excel XLSM generation with category Row 1"
@@ -105,6 +109,7 @@ def health_check():
 def process_product_complete(url: str) -> Dict[str, Any]:
     """
     Process product and return COMPLETE INFO
+    Implements Solution 1 + Store Original Specs
     """
     
     product_id = None
@@ -161,6 +166,12 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         
         logger.info(f"✅ Extracted {len(scraped_data)} attributes")
         
+        # Log original specs
+        spec_fields = ['brand', 'color', 'dimensions', 'weight', 'material', 
+                      'certifications', 'country_of_origin', 'warranty', 'product_type']
+        scraped_specs_count = len([k for k in spec_fields if scraped_data.get(k)])
+        logger.info(f"   Specifications: {scraped_specs_count} fields")
+        
         # ================= STEP 2: STORE SCRAPED DATA =================
         logger.info("💾 Storing scraped data...")
         product_id = insert_scraped_product(url, scraped_data)
@@ -176,15 +187,27 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         log_processing(product_id, url, "scraping", "success")
         
         # ================= STEP 3: ENHANCE CONTENT =================
-        logger.info("🤖 Enhancing content...")
+        logger.info("🤖 Enhancing content with OpenAI...")
+        logger.info("   Sending to OpenAI:")
+        logger.info(f"   - Title: {title[:60]}...")
+        logger.info(f"   - Description: {len(description)} chars")
+        logger.info(f"   - Specifications: {scraped_specs_count} fields")
+        
         try:
-            enhanced = improve_product_content(title, description)
+            # ✅ KEY: Pass specifications to OpenAI for enhancement
+            enhanced = improve_product_content(
+                title=title,
+                description=description,
+                specifications=scraped_data,  # ✅ Pass all scraped data including specs!
+                category=None
+            )
             if not enhanced:
                 enhanced = {
                     "title": title,
                     "description": description,
                     "bullet_points": scraped_data.get("bullet_points", []),
-                    "html_description": ""
+                    "html_description": "",
+                    "specifications_enhanced": {}
                 }
         except Exception as e:
             logger.warning(f"Enhancement skipped: {e}")
@@ -192,13 +215,52 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                 "title": title,
                 "description": description,
                 "bullet_points": scraped_data.get("bullet_points", []),
-                "html_description": ""
+                "html_description": "",
+                "specifications_enhanced": {}
             }
         
         logger.info("✅ Content enhanced")
         
+        # ================= STEP 3B: MERGE SPECS (Solution 1!) =================
+        logger.info("\n🔄 Merging specifications (enhanced preferred, original fallback):")
+        
+        # Start with ORIGINAL scraped data
+        enriched_data = scraped_data.copy()
+        
+        # Update TEXT content with ENHANCED versions
+        enriched_data['title'] = enhanced.get('title', title)
+        enriched_data['description'] = enhanced.get('description', description)
+        enriched_data['bullet_points'] = enhanced.get('bullet_points', [])
+        enriched_data['html_description'] = enhanced.get('html_description', '')
+        
+        logger.info("   ✅ Text content updated (title, description, bullets, HTML)")
+        
+        # ✅ FOR SPECS: Use enhanced IF available, OTHERWISE keep original
+        specs_enhanced = enhanced.get('specifications_enhanced', {})
+        
+        specs_merged = {}
+        for spec_field in spec_fields:
+            original_value = scraped_data.get(spec_field, '')
+            enhanced_value = specs_enhanced.get(spec_field, '')
+            
+            if enhanced_value and enhanced_value.strip() != "":
+                # Use enhanced version
+                enriched_data[spec_field] = enhanced_value
+                specs_merged[spec_field] = enhanced_value
+                logger.info(f"   ✅ {spec_field}: {enhanced_value[:50]} (ENHANCED)")
+            elif original_value and original_value.strip() != "":
+                # Keep original version
+                enriched_data[spec_field] = original_value
+                specs_merged[spec_field] = original_value
+                logger.info(f"   ✅ {spec_field}: {original_value[:50]} (ORIGINAL)")
+            else:
+                # No value
+                enriched_data[spec_field] = ""
+        
+        logger.info(f"\n✅ Enriched data ready with {len(enriched_data)} fields")
+        
         # ================= STEP 4: CATEGORIZE =================
-        logger.info("🏷️ Categorizing...")
+        logger.info("🏷️  Categorizing...")
         try:
             category = assign_category(
                 enhanced.get("title", title),
@@ -209,13 +271,13 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             category = {
                 "category_id": "0",
                 "category_name": "Unknown",
-                "category_leaf": "Unknown",  # ✅ ADD default
+                "category_leaf": "Unknown",
                 "confidence": 0.0
             }
         
         logger.info(f"✅ Category: {category['category_name']}")
         logger.info(f"   Code: {category['category_id']}")
-        logger.info(f"   Leaf: {category.get('category_leaf', 'Unknown')}")  # ✅ LOG IT
+        logger.info(f"   Leaf: {category.get('category_leaf', 'Unknown')}")
         
         # Store category
         insert_category_assignment(
@@ -229,41 +291,67 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         log_processing(product_id, url, "categorization", "success")
         
         # ================= STEP 5: MAP =================
-        logger.info("🗺️ Mapping to template...")
+        logger.info("\n🗺️  Mapping to template...")
         mapped_data = {}
         is_valid = False
         
         try:
-            enriched_data = scraped_data.copy()
-            enriched_data['title'] = enhanced.get('title', title)
-            enriched_data['description'] = enhanced.get('description', description)
-            enriched_data['bullet_points'] = enhanced.get('bullet_points', [])
-            enriched_data['html_description'] = enhanced.get('html_description', '')  # ✅ ADD THIS
-            
+            # Map enriched_data (which has merged specs)
             mapped_data = map_scraped_data_to_template(enriched_data)
             is_valid, missing = validate_mapped_data(mapped_data)
             
             insert_mapped_product(product_id, category.get("category_id", "0"), mapped_data)
             log_processing(product_id, url, "mapping", "success" if is_valid else "warning")
-            logger.info("✅ Data mapped")
+            logger.info(f"✅ Data mapped to {len(mapped_data)} fields")
         except Exception as e:
             logger.warning(f"Mapping error: {e}")
             log_processing(product_id, url, "mapping", "error", str(e))
         
-        # ================= STEP 6: GENERATE TEMPLATE =================
-        logger.info("📋 Generating template...")
+        # ================= STEP 6: STORE ENHANCED CONTENT =================
+        logger.info("\n💾 Storing enhanced content...")
+        try:
+            cursor = sqlite3.connect(DB_NAME).cursor()
+            cursor.execute("""
+                INSERT INTO enhanced_content
+                (product_id, title, description, bullet_points, html_description,
+                 brand, color, dimensions, weight, material, certifications,
+                 country_of_origin, warranty, product_type)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                product_id,
+                enriched_data.get('title', ''),
+                enriched_data.get('description', ''),
+                json.dumps(enriched_data.get('bullet_points', [])),
+                enriched_data.get('html_description', ''),
+                enriched_data.get('brand', ''),
+                enriched_data.get('color', ''),
+                enriched_data.get('dimensions', ''),
+                enriched_data.get('weight', ''),
+                enriched_data.get('material', ''),
+                enriched_data.get('certifications', ''),
+                enriched_data.get('country_of_origin', ''),
+                enriched_data.get('warranty', ''),
+                enriched_data.get('product_type', '')
+            ))
+            sqlite3.connect(DB_NAME).commit()
+            logger.info("✅ Enhanced content stored in database")
+        except Exception as e:
+            logger.warning(f"Could not store enhanced content: {e}")
+        
+        # ================= STEP 7: GENERATE TEMPLATE =================
+        logger.info("\n📋 Generating template...")
         template_file = None
         
         if os.path.exists(TEMPLATE_PATH):
             try:
-                # ✅ PASS category_id and category_leaf to template_filler
+                # ✅ Pass category_id and category_leaf (NOT category_name)
                 template_file = fill_template_for_product(
                     TEMPLATE_PATH,
                     mapped_data,
                     product_id,
                     FILLED_TEMPLATES_DIR,
                     category_id=category.get("category_id", "0"),
-                    category_name=category.get("category_leaf", "Unknown")  # ✅ USE category_leaf!
+                    category_name=category.get("category_leaf", "Unknown")  # ✅ Use leaf!
                 )
                 
                 if template_file:
@@ -287,37 +375,66 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             "success": True,
             "product_id": product_id,
             "url": url,
+            
+            # Original data (from scraper)
             "original": {
                 "title": title,
                 "description": description[:200] + "..." if len(description) > 200 else description,
                 "brand": scraped_data.get("brand", ""),
-                "images": sum(1 for i in range(1, 20) if scraped_data.get(f"image_{i}"))  # ✅ Check up to 20 images
+                "color": scraped_data.get("color", ""),
+                "dimensions": scraped_data.get("dimensions", ""),
+                "weight": scraped_data.get("weight", ""),
+                "material": scraped_data.get("material", ""),
+                "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}"))
             },
+            
+            # Enhanced data (from OpenAI)
             "enhanced": {
                 "title": enhanced.get("title", ""),
                 "description": enhanced.get("description", "")[:200] + "..." if enhanced.get("description") else "",
-                "bullet_points": enhanced.get("bullet_points", [])[:3],  # First 3 bullet points
-                "has_html_description": bool(enhanced.get("html_description", ""))  # ✅ Show if HTML was generated
+                "bullet_points": enhanced.get("bullet_points", [])[:3],
+                "has_html_description": bool(enhanced.get("html_description", "")),
+                "specifications_enhanced": enhanced.get("specifications_enhanced", {})
             },
+            
+            # Merged data (what goes to template)
+            "merged": {
+                "brand": enriched_data.get("brand", ""),
+                "color": enriched_data.get("color", ""),
+                "dimensions": enriched_data.get("dimensions", ""),
+                "weight": enriched_data.get("weight", ""),
+                "material": enriched_data.get("material", ""),
+                "certifications": enriched_data.get("certifications", ""),
+                "country_of_origin": enriched_data.get("country_of_origin", ""),
+                "warranty": enriched_data.get("warranty", ""),
+                "product_type": enriched_data.get("product_type", "")
+            },
+            
+            # Category info
             "category": {
                 "id": category.get("category_id", ""),
                 "name": category.get("category_name", ""),
-                "leaf": category.get("category_leaf", ""),  # ✅ INCLUDE LEAF
+                "leaf": category.get("category_leaf", ""),
                 "confidence": round(category.get("confidence", 0.0), 2)
             },
+            
+            # Template info
             "template": {
                 "file": os.path.basename(template_file) if template_file else None,
                 "columns_mapped": len(mapped_data),
                 "fields_valid": is_valid,
-                "category_row": {  # ✅ SHOW WHAT WAS WRITTEN TO ROW 1
+                "category_row": {
                     "code": category.get("category_id", "0"),
                     "leaf": category.get("category_leaf", "Unknown")
                 }
             },
+            
+            # Extracted data summary
             "extracted": {
-                "attributes": len(scraped_data),
-                "images": sum(1 for i in range(1, 20) if scraped_data.get(f"image_{i}"))  # ✅ Count all images
+                "specifications": sum(1 for k in spec_fields if enriched_data.get(k)),
+                "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}"))
             },
+            
             "timestamp": datetime.now().isoformat()
         }
     
@@ -342,13 +459,13 @@ def generate_product(req: ProductURLRequest):
     ✅ SINGLE PRODUCT - Complete Response
     
     Returns ALL product information:
-    - Original scraped data (25+ attributes, 6+ images)
-    - Enhanced content (LLM-generated title, description, HTML)
+    - Original scraped data (25+ attributes, 20+ images)
+    - Enhanced content (OpenAI: title, description, HTML, specs)
+    - Merged data (enhanced preferred, original fallback)
     - Category assignment (code + leaf category)
-    - Template file path with Row 1 category info
-    - All extracted attributes
+    - Template file with Row 1 category info
     
-    **Time:** 30-60 seconds (processing + response)
+    **Time:** 30-60 seconds
     """
     
     if not req.url:
@@ -576,7 +693,8 @@ def get_stats():
             "mapped_products",
             "template_outputs",
             "processing_logs",
-            "category_assignments"
+            "category_assignments",
+            "enhanced_content"
         ]
         
         for table in tables:
@@ -603,7 +721,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8686))
     
     logger.info("\n" + "="*70)
-    logger.info("🚀 Octopia Template Pipeline - Complete Response")
+    logger.info("🚀 Octopia Template Pipeline - Solution 1 + Store Original Specs")
     logger.info("="*70 + "\n")
     
     uvicorn.run(
