@@ -1,6 +1,8 @@
 """
 FastAPI Server - COMPLETE INFO IN RESPONSE
 Returns all product details immediately (processing happens, returns full data)
+
+UPDATED: Uses category_leaf for template Row 1
 """
 
 from fastapi import FastAPI, HTTPException
@@ -76,11 +78,11 @@ def root():
         "service": "Octopia Template Pipeline",
         "version": "2.0.0",
         "features": [
-            "Advanced scraping (25+ attributes, 6 images)",
-            "Content enhancement (OpenAI)",
-            "Octopia categorization (5,806 categories)",
+            "Advanced scraping (25+ attributes, 6+ images)",
+            "Content enhancement (OpenAI with HTML)",
+            "Octopia categorization (5,806 categories with leaf extraction)",
             "Template mapping (71 columns)",
-            "Excel XLSM generation"
+            "Excel XLSM generation with category Row 1"
         ]
     }
 
@@ -181,14 +183,16 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                 enhanced = {
                     "title": title,
                     "description": description,
-                    "bullet_points": scraped_data.get("bullet_points", [])
+                    "bullet_points": scraped_data.get("bullet_points", []),
+                    "html_description": ""
                 }
         except Exception as e:
             logger.warning(f"Enhancement skipped: {e}")
             enhanced = {
                 "title": title,
                 "description": description,
-                "bullet_points": scraped_data.get("bullet_points", [])
+                "bullet_points": scraped_data.get("bullet_points", []),
+                "html_description": ""
             }
         
         logger.info("✅ Content enhanced")
@@ -205,10 +209,13 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             category = {
                 "category_id": "0",
                 "category_name": "Unknown",
+                "category_leaf": "Unknown",  # ✅ ADD default
                 "confidence": 0.0
             }
         
         logger.info(f"✅ Category: {category['category_name']}")
+        logger.info(f"   Code: {category['category_id']}")
+        logger.info(f"   Leaf: {category.get('category_leaf', 'Unknown')}")  # ✅ LOG IT
         
         # Store category
         insert_category_assignment(
@@ -231,6 +238,7 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             enriched_data['title'] = enhanced.get('title', title)
             enriched_data['description'] = enhanced.get('description', description)
             enriched_data['bullet_points'] = enhanced.get('bullet_points', [])
+            enriched_data['html_description'] = enhanced.get('html_description', '')  # ✅ ADD THIS
             
             mapped_data = map_scraped_data_to_template(enriched_data)
             is_valid, missing = validate_mapped_data(mapped_data)
@@ -248,11 +256,14 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         
         if os.path.exists(TEMPLATE_PATH):
             try:
+                # ✅ PASS category_id and category_leaf to template_filler
                 template_file = fill_template_for_product(
                     TEMPLATE_PATH,
                     mapped_data,
                     product_id,
-                    FILLED_TEMPLATES_DIR
+                    FILLED_TEMPLATES_DIR,
+                    category_id=category.get("category_id", "0"),
+                    category_name=category.get("category_leaf", "Unknown")  # ✅ USE category_leaf!
                 )
                 
                 if template_file:
@@ -280,26 +291,32 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                 "title": title,
                 "description": description[:200] + "..." if len(description) > 200 else description,
                 "brand": scraped_data.get("brand", ""),
-                "images": sum(1 for i in range(1, 7) if scraped_data.get(f"image_{i}"))
+                "images": sum(1 for i in range(1, 20) if scraped_data.get(f"image_{i}"))  # ✅ Check up to 20 images
             },
             "enhanced": {
                 "title": enhanced.get("title", ""),
                 "description": enhanced.get("description", "")[:200] + "..." if enhanced.get("description") else "",
-                "bullet_points": enhanced.get("bullet_points", [])[:3]  # First 3 bullet points
+                "bullet_points": enhanced.get("bullet_points", [])[:3],  # First 3 bullet points
+                "has_html_description": bool(enhanced.get("html_description", ""))  # ✅ Show if HTML was generated
             },
             "category": {
                 "id": category.get("category_id", ""),
                 "name": category.get("category_name", ""),
+                "leaf": category.get("category_leaf", ""),  # ✅ INCLUDE LEAF
                 "confidence": round(category.get("confidence", 0.0), 2)
             },
             "template": {
                 "file": os.path.basename(template_file) if template_file else None,
                 "columns_mapped": len(mapped_data),
-                "fields_valid": is_valid
+                "fields_valid": is_valid,
+                "category_row": {  # ✅ SHOW WHAT WAS WRITTEN TO ROW 1
+                    "code": category.get("category_id", "0"),
+                    "leaf": category.get("category_leaf", "Unknown")
+                }
             },
             "extracted": {
                 "attributes": len(scraped_data),
-                "images": sum(1 for i in range(1, 7) if scraped_data.get(f"image_{i}"))
+                "images": sum(1 for i in range(1, 20) if scraped_data.get(f"image_{i}"))  # ✅ Count all images
             },
             "timestamp": datetime.now().isoformat()
         }
@@ -325,10 +342,10 @@ def generate_product(req: ProductURLRequest):
     ✅ SINGLE PRODUCT - Complete Response
     
     Returns ALL product information:
-    - Original scraped data
-    - Enhanced content
-    - Category assignment
-    - Template file path
+    - Original scraped data (25+ attributes, 6+ images)
+    - Enhanced content (LLM-generated title, description, HTML)
+    - Category assignment (code + leaf category)
+    - Template file path with Row 1 category info
     - All extracted attributes
     
     **Time:** 30-60 seconds (processing + response)
