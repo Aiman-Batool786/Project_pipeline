@@ -3,81 +3,135 @@ import re
 import json
 
 
-def extract_description_correct(page):
-    """
-    Extract description using CORRECT selectors from inspected HTML
+def extract_specifications(page):
+    """Extract specifications from nav-specification section"""
     
-    Primary selectors (in priority order):
-    1. div.richTextContainer[data-rich-text-render="true"] - BEST (full description)
-    2. div[id="product-description"] - Good fallback
-    3. div[id="nav-description"] - Section wrapper
-    4. div.detailmodule_text - Fallback
-    5. p.detail-desc-decorate-content - Individual paragraphs
-    """
+    specs = {}
+    print("[scraper] 📋 Extracting specifications...")
+    
+    try:
+        spec_items = page.locator('[id*="nav-specification"] [class*="specification--prop"]').all()
+        
+        if len(spec_items) > 0:
+            print(f"[scraper]    Found {len(spec_items)} specification items")
+        
+        for idx, item in enumerate(spec_items):
+            try:
+                title_elem = item.locator('[class*="specification--title"] span').first
+                title = title_elem.inner_text().strip() if title_elem.count() > 0 else ""
+                
+                desc_elem = item.locator('[class*="specification--desc"] span').first
+                desc = desc_elem.inner_text().strip() if desc_elem.count() > 0 else ""
+                
+                if title and desc:
+                    specs[title.lower()] = desc
+                    print(f"[scraper]      {title}: {desc[:60]}")
+            except:
+                pass
+        
+        if specs:
+            print(f"[scraper]    ✅ Extracted {len(specs)} specifications")
+        
+        return specs
+    
+    except Exception as e:
+        print(f"[scraper]    ⚠️  Error: {e}")
+        return specs
+
+
+def map_specifications_to_fields(specs):
+    """Map specifications to template fields"""
+    
+    mapped = {}
+    
+    mapping_rules = {
+        'brand': ['brand name', 'brand', 'marque'],
+        'color': ['main color', 'color', 'colour', 'couleur'],
+        'dimensions': ['dimensions', 'size', 'taille', 'dimensions (cm)'],
+        'weight': ['weight', 'poids', 'net weight', 'weight (kg)'],
+        'material': ['material', 'matière', 'materials', 'material composition'],
+        'certifications': ['certification', 'certifications', 'normes', 'standards'],
+        'country_of_origin': ['country of origin', 'origin', 'country', 'pays'],
+        'warranty': ['warranty', 'garantie', 'guarantee'],
+        'product_type': ['product type', 'type', 'type de produit', 'product category'],
+        'age_from': ['age from', 'recommended age from', 'age (from)'],
+        'age_to': ['age to', 'recommended age to', 'age (to)'],
+        'gender': ['gender', 'suitable for'],
+    }
+    
+    for template_field, keywords in mapping_rules.items():
+        for spec_key, spec_value in specs.items():
+            if any(keyword in spec_key for keyword in keywords):
+                if template_field not in mapped:
+                    mapped[template_field] = spec_value
+                break
+    
+    return mapped
+
+
+def extract_description_correct(page):
+    """Extract description with corrected selectors and multiple fallbacks"""
     
     description = ""
-    print("[scraper] 📝 Extracting description (corrected selectors)...")
+    print("[scraper] 📝 Extracting description...")
     
-    # METHOD 1: richTextContainer (PRIMARY - has most complete description)
+    # METHOD 1: richTextContainer
     try:
         rich_container = page.locator('div.richTextContainer[data-rich-text-render="true"]')
         if rich_container.count() > 0:
             text = rich_container.first.inner_text().strip()
             if text and len(text) > 50:
                 description = text
-                print(f"[scraper]    ✅ Method 1: richTextContainer ({len(description)} chars)")
+                print(f"[scraper]    ✅ richTextContainer ({len(description)} chars)")
                 return description
-    except Exception as e:
-        print(f"[scraper]    ⚠️  Method 1 error: {e}")
+    except:
+        pass
     
-    # METHOD 2: product-description div
+    # METHOD 2: product-description
     try:
         prod_desc = page.locator('div[id="product-description"]')
         if prod_desc.count() > 0:
             text = prod_desc.first.inner_text().strip()
             if text and len(text) > 50:
                 description = text
-                print(f"[scraper]    ✅ Method 2: product-description ({len(description)} chars)")
+                print(f"[scraper]    ✅ product-description ({len(description)} chars)")
                 return description
-    except Exception as e:
-        print(f"[scraper]    ⚠️  Method 2 error: {e}")
+    except:
+        pass
     
-    # METHOD 3: nav-description section
+    # METHOD 3: nav-description
     try:
         nav_desc = page.locator('div[id="nav-description"]')
         if nav_desc.count() > 0:
             text = nav_desc.first.inner_text().strip()
-            # Remove header
             text = re.sub(r'^.*?Description\s+report\s+', '', text, flags=re.IGNORECASE | re.DOTALL)
             if text and len(text) > 50 and "Smarter Shopping" not in text:
                 description = text
-                print(f"[scraper]    ✅ Method 3: nav-description ({len(description)} chars)")
+                print(f"[scraper]    ✅ nav-description ({len(description)} chars)")
                 return description
-    except Exception as e:
-        print(f"[scraper]    ⚠️  Method 3 error: {e}")
+    except:
+        pass
     
-    # METHOD 4: detailmodule_text divs
+    # METHOD 4: detailmodule_text
     try:
         detail_modules = page.locator('div.detailmodule_text')
         if detail_modules.count() > 0:
-            print(f"[scraper]    Found {detail_modules.count()} detailmodule_text elements")
             for idx in range(detail_modules.count()):
                 try:
                     text = detail_modules.nth(idx).inner_text().strip()
                     if text and len(text) > 50:
                         description = text
-                        print(f"[scraper]    ✅ Method 4: detailmodule_text[{idx}] ({len(description)} chars)")
+                        print(f"[scraper]    ✅ detailmodule_text ({len(description)} chars)")
                         return description
                 except:
                     pass
-    except Exception as e:
-        print(f"[scraper]    ⚠️  Method 4 error: {e}")
+    except:
+        pass
     
-    # METHOD 5: detail-desc-decorate-content paragraphs
+    # METHOD 5: detail-desc-decorate-content
     try:
         content_para = page.locator('p.detail-desc-decorate-content')
         if content_para.count() > 0:
-            print(f"[scraper]    Found {content_para.count()} detail-desc-decorate-content elements")
             description_parts = []
             for idx in range(content_para.count()):
                 try:
@@ -89,30 +143,27 @@ def extract_description_correct(page):
             
             if description_parts:
                 description = " | ".join(description_parts)
-                print(f"[scraper]    ✅ Method 5: detail-desc-decorate-content ({len(description)} chars)")
+                print(f"[scraper]    ✅ detail-desc-decorate-content ({len(description)} chars)")
                 return description
-    except Exception as e:
-        print(f"[scraper]    ⚠️  Method 5 error: {e}")
+    except:
+        pass
     
-    print("[scraper]    ⚠️  WARNING: No description extracted!")
+    print("[scraper]    ⚠️  No description found")
     return ""
 
 
 def extract_all_images(page):
-    """Extract ALL images from product page"""
+    """Extract all images from product page"""
     images = {}
     
     print("[scraper] 🖼️  Extracting images...")
     
     try:
         scripts = page.locator("script")
-        script_count = scripts.count()
         
-        for idx in range(script_count):
+        for idx in range(scripts.count()):
             try:
                 script_text = scripts.nth(idx).text_content()
-                
-                # Look for imagePathList
                 image_match = re.search(r'"imagePathList":\s*\[(.*?)\]', script_text)
                 
                 if image_match:
@@ -125,20 +176,19 @@ def extract_all_images(page):
                         images[key] = clean_url
                     
                     if images:
-                        print(f"[scraper]    ✅ Found {len(images)} images from script")
+                        print(f"[scraper]    ✅ Found {len(images)} images")
                         return images
             except:
                 pass
+    except:
+        pass
     
-    except Exception as e:
-        print(f"[scraper]    ⚠️  Script search error: {e}")
-    
-    # Fallback: og:image
+    # Fallback
     try:
         og_image = page.locator('meta[property="og:image"]').get_attribute('content')
         if og_image:
             images['image_1'] = og_image
-            print(f"[scraper]    ✅ Found 1 image from meta tag (fallback)")
+            print(f"[scraper]    ✅ 1 image from meta tag")
     except:
         pass
     
@@ -148,42 +198,32 @@ def extract_all_images(page):
 def extract_from_meta_tags(page):
     """Extract title from meta tags"""
     data = {}
-    
     try:
         title_meta = page.locator('meta[property="og:title"]').get_attribute("content")
         data["title"] = title_meta or ""
     except:
         data["title"] = ""
-    
     return data
 
 
 def extract_from_javascript(page):
     """Extract price and shipping from JavaScript"""
     data = {}
-    
     try:
         scripts = page.locator("script")
-        
         for idx in range(scripts.count()):
             try:
                 script_text = scripts.nth(idx).text_content()
-                
-                # Look for product price
                 price_match = re.search(r'"price":\s*"([^"]+)"', script_text)
                 if price_match:
                     data["price"] = price_match.group(1)
-                
-                # Look for shipping info
                 ship_match = re.search(r'"shipmentWay":\s*"([^"]+)"', script_text)
                 if ship_match:
                     data["shipping"] = ship_match.group(1)
             except:
                 pass
-    
-    except Exception as e:
-        print(f"[scraper]    ⚠️  JS extraction error: {e}")
-    
+    except:
+        pass
     return data
 
 
@@ -191,16 +231,21 @@ def extract_from_dom(page):
     """Extract data from DOM elements"""
     data = {}
     
-    # Scroll down to ensure all content is loaded
+    # Scroll
     page.mouse.wheel(0, 3000)
     page.wait_for_timeout(2000)
     
-    # Extract description with corrected selectors
+    # Specifications
+    specs = extract_specifications(page)
+    spec_fields = map_specifications_to_fields(specs)
+    data.update(spec_fields)
+    
+    # Description
     description = extract_description_correct(page)
     if description:
         data["description"] = description
     
-    # Extract images
+    # Images
     images_dict = extract_all_images(page)
     data.update(images_dict)
     
@@ -208,10 +253,7 @@ def extract_from_dom(page):
 
 
 def get_product_info(url):
-    """
-    Main scraper function with CORRECTED description extraction
-    using selectors from HTML inspection
-    """
+    """Main scraper with all improvements"""
     
     try:
         with sync_playwright() as p:
@@ -237,7 +279,6 @@ def get_product_info(url):
             print(f"\n[scraper] 🌐 Opening: {url}")
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
             
-            # Simulate human behavior
             page.wait_for_timeout(3000)
             page.mouse.move(200, 300)
             page.mouse.wheel(0, 2000)
@@ -245,16 +286,11 @@ def get_product_info(url):
             
             print("[scraper] 🔍 Extracting data...")
             
-            # Extract all data
             data = extract_from_meta_tags(page)
             data.update(extract_from_javascript(page))
             data.update(extract_from_dom(page))
             
             browser.close()
-            
-            # =====================================================
-            # VALIDATION
-            # =====================================================
             
             if not data.get('title'):
                 print("[scraper] ❌ ERROR: No title extracted")
@@ -264,10 +300,13 @@ def get_product_info(url):
             print(f"[scraper]    Title: {data.get('title', '')[:60]}...")
             print(f"[scraper]    Description: {len(data.get('description', ''))} chars")
             
+            specs_count = len([k for k in data.keys() if k in ['brand', 'color', 'dimensions', 'weight', 'material', 'certifications', 'country_of_origin', 'warranty', 'product_type']])
+            print(f"[scraper]    Specifications: {specs_count} fields")
+            
             image_count = sum(1 for i in range(1, 21) if data.get(f'image_{i}'))
             print(f"[scraper]    Images: {image_count}")
             
-            # Add defaults for missing fields
+            # Add defaults
             defaults = {
                 'description': '',
                 'brand': '',
@@ -275,6 +314,10 @@ def get_product_info(url):
                 'dimensions': '',
                 'weight': '',
                 'material': '',
+                'certifications': '',
+                'country_of_origin': '',
+                'warranty': '',
+                'product_type': '',
                 'shipping': '',
                 'price': '',
                 'rating': '',
@@ -284,17 +327,12 @@ def get_product_info(url):
                 'age_to': '',
                 'gender': '',
                 'safety_warning': '',
-                'certifications': '',
-                'country_of_origin': '',
-                'warranty': '',
-                'product_type': ''
             }
             
             for key, default_val in defaults.items():
                 if key not in data or not data[key]:
                     data[key] = default_val
             
-            # Ensure image keys exist
             for i in range(1, 21):
                 if f'image_{i}' not in data:
                     data[f'image_{i}'] = ""
@@ -310,7 +348,6 @@ def get_product_info(url):
 
 if __name__ == "__main__":
     test_url = "https://www.aliexpress.com/item/1005006156465150.html"
-    
     result = get_product_info(test_url)
     
     if result:
@@ -318,10 +355,9 @@ if __name__ == "__main__":
         print("=== SCRAPED DATA ===")
         print("="*80)
         print(f"Title: {result['title']}")
-        print(f"\nDescription ({len(result['description'])} chars):")
-        print(result['description'][:300] + "..." if len(result['description']) > 300 else result['description'])
-        
-        image_count = sum(1 for i in range(1, 21) if result.get(f'image_{i}'))
-        print(f"\nImages: {image_count}")
+        print(f"Brand: {result.get('brand', 'N/A')}")
+        print(f"Color: {result.get('color', 'N/A')}")
+        print(f"Dimensions: {result.get('dimensions', 'N/A')}")
+        print(f"Description ({len(result['description'])} chars): {result['description'][:200]}...")
     else:
         print("Failed to scrape")
