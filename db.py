@@ -1,3 +1,8 @@
+"""
+db.py - HYBRID APPROACH
+Updated with audit trail columns to track original vs enhanced specs
+"""
+
 import sqlite3
 import json
 
@@ -184,9 +189,76 @@ def create_all_tables():
     )
     """)
 
+    # ═══════════════════════════════════════════════════════════════════════════════════
+    # ✅ HYBRID TABLES - AUDIT TRAIL FOR SPECS
+    # ═══════════════════════════════════════════════════════════════════════════════════
+
+    # 10. ✅ Original specifications table (what scraper extracted)
+    print("Creating HYBRID audit trail tables...")
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS original_specifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER UNIQUE,
+        brand TEXT,
+        color TEXT,
+        dimensions TEXT,
+        weight TEXT,
+        material TEXT,
+        certifications TEXT,
+        country_of_origin TEXT,
+        warranty TEXT,
+        product_type TEXT,
+        age_from TEXT,
+        age_to TEXT,
+        gender TEXT,
+        source TEXT DEFAULT 'scraper',
+        extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )
+    """)
+
+    # 11. ✅ Enhanced specifications table (what OpenAI enhanced)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS enhanced_specifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER UNIQUE,
+        brand TEXT,
+        color TEXT,
+        dimensions TEXT,
+        weight TEXT,
+        material TEXT,
+        certifications TEXT,
+        country_of_origin TEXT,
+        warranty TEXT,
+        product_type TEXT,
+        age_from TEXT,
+        age_to TEXT,
+        gender TEXT,
+        source TEXT DEFAULT 'openai',
+        enhanced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )
+    """)
+
+    # 12. ✅ Specification audit log (track what was used where)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS specification_audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER,
+        spec_field TEXT,
+        original_value TEXT,
+        enhanced_value TEXT,
+        template_value TEXT,
+        source_used TEXT,
+        notes TEXT,
+        recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )
+    """)
+
     conn.commit()
     conn.close()
-    print("✅ All tables created")
+    print("✅ All tables created (including HYBRID audit trail tables)")
 
 
 # ─────────────────────────────────────────
@@ -436,6 +508,128 @@ def get_product_by_id(product_id):
     conn.close()
     
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════
+# ✅ HYBRID FUNCTIONS - AUDIT TRAIL FOR SPECS
+# ═══════════════════════════════════════════════════════════════════════════════════
+
+def insert_original_specifications(product_id, original_specs):
+    """
+    Store original specifications (what scraper extracted)
+    
+    original_specs: dict with brand, color, dimensions, weight, etc.
+    """
+    conn = create_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO original_specifications
+            (product_id, brand, color, dimensions, weight, material,
+             certifications, country_of_origin, warranty, product_type,
+             age_from, age_to, gender)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            original_specs.get("brand", ""),
+            original_specs.get("color", ""),
+            original_specs.get("dimensions", ""),
+            original_specs.get("weight", ""),
+            original_specs.get("material", ""),
+            original_specs.get("certifications", ""),
+            original_specs.get("country_of_origin", ""),
+            original_specs.get("warranty", ""),
+            original_specs.get("product_type", ""),
+            original_specs.get("age_from", ""),
+            original_specs.get("age_to", ""),
+            original_specs.get("gender", "")
+        ))
+        
+        conn.commit()
+        print(f"✅ Original specifications saved (product_id={product_id})")
+        conn.close()
+        return True
+        
+    except Exception as e:
+        print(f"⚠ Could not save original specs: {e}")
+        conn.close()
+        return False
+
+
+def insert_enhanced_specifications(product_id, enhanced_specs):
+    """
+    Store enhanced specifications (what OpenAI enhanced)
+    
+    enhanced_specs: dict with brand, color, dimensions, weight, etc.
+    """
+    conn = create_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO enhanced_specifications
+            (product_id, brand, color, dimensions, weight, material,
+             certifications, country_of_origin, warranty, product_type,
+             age_from, age_to, gender)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            enhanced_specs.get("brand", ""),
+            enhanced_specs.get("color", ""),
+            enhanced_specs.get("dimensions", ""),
+            enhanced_specs.get("weight", ""),
+            enhanced_specs.get("material", ""),
+            enhanced_specs.get("certifications", ""),
+            enhanced_specs.get("country_of_origin", ""),
+            enhanced_specs.get("warranty", ""),
+            enhanced_specs.get("product_type", ""),
+            enhanced_specs.get("age_from", ""),
+            enhanced_specs.get("age_to", ""),
+            enhanced_specs.get("gender", "")
+        ))
+        
+        conn.commit()
+        print(f"✅ Enhanced specifications saved (product_id={product_id})")
+        conn.close()
+        return True
+        
+    except Exception as e:
+        print(f"⚠ Could not save enhanced specs: {e}")
+        conn.close()
+        return False
+
+
+def log_specification_audit(product_id, spec_field, original_value, enhanced_value, template_value, source_used, notes=""):
+    """
+    Log which specification was used where (audit trail)
+    
+    source_used: 'original', 'enhanced', or 'empty'
+    """
+    conn = create_connection()
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute("""
+            INSERT INTO specification_audit_log
+            (product_id, spec_field, original_value, enhanced_value, template_value, source_used, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            spec_field,
+            original_value or "",
+            enhanced_value or "",
+            template_value or "",
+            source_used,
+            notes
+        ))
+        
+        conn.commit()
+        conn.close()
+        
+    except Exception as e:
+        print(f"⚠ Error logging spec audit: {e}")
+        conn.close()
 
 
 # Keep old function names working (backward compatibility)
