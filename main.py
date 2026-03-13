@@ -1,11 +1,11 @@
 """
-FastAPI Server - COMPLETE INFO IN RESPONSE
-Returns all product details immediately (processing happens, returns full data)
+FastAPI Server - HYBRID APPROACH
+API shows both original and enhanced specs
+Template stores ONLY enhanced specs
 
-UPDATED: Solution 1 + Store Original Specs
-- Passes specifications to OpenAI for enhancement
-- Merges enhanced specs with original (prefers enhanced)
-- Uses category_leaf for template Row 1
+Two data objects:
+1. enriched_data → for API response (merged specs)
+2. enriched_data_for_template → for template (enhanced only)
 """
 
 from fastapi import FastAPI, HTTPException
@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 # FASTAPI APP INITIALIZATION
 # ─────────────────────────────────────────
 app = FastAPI(
-    title="Octopia Template Pipeline - Complete Response",
-    version="2.0.0"
+    title="Octopia Template Pipeline - HYBRID Approach",
+    version="2.1.0"
 )
 
 DB_NAME = "products.db"
@@ -80,13 +80,14 @@ def root():
     return {
         "status": "running",
         "service": "Octopia Template Pipeline",
-        "version": "2.0.0",
+        "version": "2.1.0",
+        "approach": "HYBRID - API shows both, template stores enhanced only",
         "features": [
-            "Advanced scraping (25+ attributes, 6+ images)",
-            "Content enhancement (OpenAI with HTML + Specs)",
-            "Octopia categorization (5,806 categories with leaf extraction)",
+            "Advanced scraping (25+ attributes, 20+ images)",
+            "Content enhancement (OpenAI with specifications)",
+            "Octopia categorization (5,806 categories)",
             "Template mapping (71 columns)",
-            "Excel XLSM generation with category Row 1"
+            "Excel XLSM generation with enhanced specs only"
         ]
     }
 
@@ -109,7 +110,9 @@ def health_check():
 def process_product_complete(url: str) -> Dict[str, Any]:
     """
     Process product and return COMPLETE INFO
-    Implements Solution 1 + Store Original Specs
+    Implements HYBRID approach:
+    - API response shows: original, enhanced, merged
+    - Template stores: ONLY enhanced specs
     """
     
     product_id = None
@@ -194,11 +197,11 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         logger.info(f"   - Specifications: {scraped_specs_count} fields")
         
         try:
-            # ✅ KEY: Pass specifications to OpenAI for enhancement
+            # ✅ Pass specifications to OpenAI
             enhanced = improve_product_content(
                 title=title,
                 description=description,
-                specifications=scraped_data,  # ✅ Pass all scraped data including specs!
+                specifications=scraped_data,  # ✅ Pass scraped data with specs
                 category=None
             )
             if not enhanced:
@@ -221,8 +224,10 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         
         logger.info("✅ Content enhanced")
         
-        # ================= STEP 3B: MERGE SPECS (Solution 1!) =================
-        logger.info("\n🔄 Merging specifications (enhanced preferred, original fallback):")
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        # ✅ STEP 3B: CREATE DATA FOR API RESPONSE (merged specs)
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        logger.info("\n🔄 Creating API data with merged specifications...")
         
         # Start with ORIGINAL scraped data
         enriched_data = scraped_data.copy()
@@ -235,7 +240,7 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         
         logger.info("   ✅ Text content updated (title, description, bullets, HTML)")
         
-        # ✅ FOR SPECS: Use enhanced IF available, OTHERWISE keep original
+        # ✅ FOR API SPECS: Use enhanced preferred, fallback to original (for display)
         specs_enhanced = enhanced.get('specifications_enhanced', {})
         
         specs_merged = {}
@@ -244,23 +249,53 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             enhanced_value = specs_enhanced.get(spec_field, '')
             
             if enhanced_value and enhanced_value.strip() != "":
-                # Use enhanced version
                 enriched_data[spec_field] = enhanced_value
                 specs_merged[spec_field] = enhanced_value
                 logger.info(f"   ✅ {spec_field}: {enhanced_value[:50]} (ENHANCED)")
             elif original_value and original_value.strip() != "":
-                # Keep original version
                 enriched_data[spec_field] = original_value
                 specs_merged[spec_field] = original_value
                 logger.info(f"   ✅ {spec_field}: {original_value[:50]} (ORIGINAL)")
             else:
-                # No value
                 enriched_data[spec_field] = ""
         
-        logger.info(f"\n✅ Enriched data ready with {len(enriched_data)} fields")
+        logger.info(f"✅ API data ready with {len(enriched_data)} fields (merged specs)")
+        
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        # ✅ STEP 3C: CREATE DATA FOR TEMPLATE (ONLY enhanced specs, NO original fallback)
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        logger.info("\n🔄 Creating template data with ONLY enhanced specifications...")
+        
+        # Start with ORIGINAL scraped data
+        enriched_data_for_template = scraped_data.copy()
+        
+        # Update TEXT content with ENHANCED versions
+        enriched_data_for_template['title'] = enhanced.get('title', title)
+        enriched_data_for_template['description'] = enhanced.get('description', description)
+        enriched_data_for_template['bullet_points'] = enhanced.get('bullet_points', [])
+        enriched_data_for_template['html_description'] = enhanced.get('html_description', '')
+        
+        logger.info("   ✅ Text content updated (title, description, bullets, HTML)")
+        
+        # ✅ FOR TEMPLATE SPECS: Use ONLY enhanced (NOT fallback to original!)
+        specs_template = {}
+        for spec_field in spec_fields:
+            enhanced_value = specs_enhanced.get(spec_field, '')
+            
+            if enhanced_value and enhanced_value.strip() != "":
+                enriched_data_for_template[spec_field] = enhanced_value
+                specs_template[spec_field] = enhanced_value
+                logger.info(f"   ✅ {spec_field}: {enhanced_value[:50]} (ENHANCED)")
+            else:
+                # ✅ IMPORTANT: Set to EMPTY (NOT original!)
+                enriched_data_for_template[spec_field] = ""
+                logger.info(f"   ⭕ {spec_field}: EMPTY (no enhanced version)")
+        
+        logger.info(f"\n✅ Template data ready with {len(enriched_data_for_template)} fields")
+        logger.info("   Using ONLY enhanced specs (no original fallback)")
         
         # ================= STEP 4: CATEGORIZE =================
-        logger.info("🏷️  Categorizing...")
+        logger.info("\n🏷️  Categorizing...")
         try:
             category = assign_category(
                 enhanced.get("title", title),
@@ -290,19 +325,23 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         )
         log_processing(product_id, url, "categorization", "success")
         
-        # ================= STEP 5: MAP =================
-        logger.info("\n🗺️  Mapping to template...")
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        # ✅ STEP 5: MAP - USE TEMPLATE DATA (ONLY ENHANCED SPECS)
+        # ═══════════════════════════════════════════════════════════════════════════════════
+        logger.info("\n🗺️  Mapping to template (using enhanced specs ONLY)...")
         mapped_data = {}
         is_valid = False
         
         try:
-            # Map enriched_data (which has merged specs)
-            mapped_data = map_scraped_data_to_template(enriched_data)
+            # ✅ CRITICAL: Pass enriched_data_for_template (with ONLY enhanced specs)
+            # NOT enriched_data (which has merged specs for API)
+            mapped_data = map_scraped_data_to_template(enriched_data_for_template)
             is_valid, missing = validate_mapped_data(mapped_data)
             
             insert_mapped_product(product_id, category.get("category_id", "0"), mapped_data)
             log_processing(product_id, url, "mapping", "success" if is_valid else "warning")
             logger.info(f"✅ Data mapped to {len(mapped_data)} fields")
+            logger.info("   Using template-only data (enhanced specs, no original fallback)")
         except Exception as e:
             logger.warning(f"Mapping error: {e}")
             log_processing(product_id, url, "mapping", "error", str(e))
@@ -319,22 +358,22 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 product_id,
-                enriched_data.get('title', ''),
-                enriched_data.get('description', ''),
-                json.dumps(enriched_data.get('bullet_points', [])),
-                enriched_data.get('html_description', ''),
-                enriched_data.get('brand', ''),
-                enriched_data.get('color', ''),
-                enriched_data.get('dimensions', ''),
-                enriched_data.get('weight', ''),
-                enriched_data.get('material', ''),
-                enriched_data.get('certifications', ''),
-                enriched_data.get('country_of_origin', ''),
-                enriched_data.get('warranty', ''),
-                enriched_data.get('product_type', '')
+                enriched_data_for_template.get('title', ''),
+                enriched_data_for_template.get('description', ''),
+                json.dumps(enriched_data_for_template.get('bullet_points', [])),
+                enriched_data_for_template.get('html_description', ''),
+                enriched_data_for_template.get('brand', ''),
+                enriched_data_for_template.get('color', ''),
+                enriched_data_for_template.get('dimensions', ''),
+                enriched_data_for_template.get('weight', ''),
+                enriched_data_for_template.get('material', ''),
+                enriched_data_for_template.get('certifications', ''),
+                enriched_data_for_template.get('country_of_origin', ''),
+                enriched_data_for_template.get('warranty', ''),
+                enriched_data_for_template.get('product_type', '')
             ))
             sqlite3.connect(DB_NAME).commit()
-            logger.info("✅ Enhanced content stored in database")
+            logger.info("✅ Enhanced content stored (template-only version)")
         except Exception as e:
             logger.warning(f"Could not store enhanced content: {e}")
         
@@ -344,14 +383,13 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         
         if os.path.exists(TEMPLATE_PATH):
             try:
-                # ✅ Pass category_id and category_leaf (NOT category_name)
                 template_file = fill_template_for_product(
                     TEMPLATE_PATH,
                     mapped_data,
                     product_id,
                     FILLED_TEMPLATES_DIR,
                     category_id=category.get("category_id", "0"),
-                    category_name=category.get("category_leaf", "Unknown")  # ✅ Use leaf!
+                    category_name=category.get("category_leaf", "Unknown")
                 )
                 
                 if template_file:
@@ -397,7 +435,7 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                 "specifications_enhanced": enhanced.get("specifications_enhanced", {})
             },
             
-            # Merged data (what goes to template)
+            # Merged data (for API display: enhanced preferred, original fallback)
             "merged": {
                 "brand": enriched_data.get("brand", ""),
                 "color": enriched_data.get("color", ""),
@@ -408,6 +446,19 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                 "country_of_origin": enriched_data.get("country_of_origin", ""),
                 "warranty": enriched_data.get("warranty", ""),
                 "product_type": enriched_data.get("product_type", "")
+            },
+            
+            # Template specs (ONLY enhanced, no fallback)
+            "template_specs": {
+                "brand": enriched_data_for_template.get("brand", ""),
+                "color": enriched_data_for_template.get("color", ""),
+                "dimensions": enriched_data_for_template.get("dimensions", ""),
+                "weight": enriched_data_for_template.get("weight", ""),
+                "material": enriched_data_for_template.get("material", ""),
+                "certifications": enriched_data_for_template.get("certifications", ""),
+                "country_of_origin": enriched_data_for_template.get("country_of_origin", ""),
+                "warranty": enriched_data_for_template.get("warranty", ""),
+                "product_type": enriched_data_for_template.get("product_type", "")
             },
             
             # Category info
@@ -431,7 +482,7 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             
             # Extracted data summary
             "extracted": {
-                "specifications": sum(1 for k in spec_fields if enriched_data.get(k)),
+                "specifications": sum(1 for k in spec_fields if enriched_data_for_template.get(k)),
                 "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}"))
             },
             
@@ -456,14 +507,15 @@ def process_product_complete(url: str) -> Dict[str, Any]:
 @app.post("/generate-product", tags=["Product Processing"])
 def generate_product(req: ProductURLRequest):
     """
-    ✅ SINGLE PRODUCT - Complete Response
+    ✅ SINGLE PRODUCT - HYBRID Approach
     
-    Returns ALL product information:
-    - Original scraped data (25+ attributes, 20+ images)
-    - Enhanced content (OpenAI: title, description, HTML, specs)
-    - Merged data (enhanced preferred, original fallback)
-    - Category assignment (code + leaf category)
-    - Template file with Row 1 category info
+    API Response shows:
+    - Original: specs from scraper
+    - Enhanced: specs from OpenAI
+    - Merged: enhanced preferred, original fallback (for display)
+    - Template Specs: ONLY enhanced (what goes to template)
+    
+    Template stores: ONLY enhanced specs
     
     **Time:** 30-60 seconds
     """
@@ -482,7 +534,7 @@ def generate_product(req: ProductURLRequest):
 @app.post("/generate-products", tags=["Product Processing"])
 def generate_products(req: BulkProductRequest):
     """
-    ✅ BULK PRODUCTS - Complete Response for Each
+    ✅ BULK PRODUCTS - HYBRID Approach
     
     - Up to 20 URLs per request
     - Returns complete info for each product
@@ -539,7 +591,6 @@ def view_scraped_products(limit: int = 100):
         cursor.execute(f"SELECT * FROM scraped_products ORDER BY scraped_at DESC LIMIT {min(limit, 1000)}")
         rows = cursor.fetchall()
         conn.close()
-        
         return [dict(row) for row in rows] if rows else {"message": "No records"}
     except Exception as e:
         return {"error": str(e)}
@@ -554,7 +605,6 @@ def view_mapped_products(limit: int = 100):
         cursor.execute(f"SELECT * FROM mapped_products ORDER BY mapped_at DESC LIMIT {min(limit, 1000)}")
         rows = cursor.fetchall()
         conn.close()
-        
         return [dict(row) for row in rows] if rows else {"message": "No records"}
     except Exception as e:
         return {"error": str(e)}
@@ -569,7 +619,6 @@ def view_template_outputs(limit: int = 100):
         cursor.execute(f"SELECT * FROM template_outputs ORDER BY created_at DESC LIMIT {min(limit, 1000)}")
         rows = cursor.fetchall()
         conn.close()
-        
         return [dict(row) for row in rows] if rows else {"message": "No records"}
     except Exception as e:
         return {"error": str(e)}
@@ -584,7 +633,6 @@ def view_processing_logs(limit: int = 500):
         cursor.execute(f"SELECT * FROM processing_logs ORDER BY log_time DESC LIMIT {min(limit, 1000)}")
         rows = cursor.fetchall()
         conn.close()
-        
         return [dict(row) for row in rows] if rows else {"message": "No records"}
     except Exception as e:
         return {"error": str(e)}
@@ -599,82 +647,6 @@ def view_enhanced_products(limit: int = 100):
         cursor.execute(f"SELECT * FROM enhanced_content ORDER BY id DESC LIMIT {min(limit, 1000)}")
         rows = cursor.fetchall()
         conn.close()
-        
-        return [dict(row) for row in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/complete-products", tags=["Database"])
-def view_complete_products(limit: int = 100):
-    """
-    View COMPLETE product information
-    Combines: scraped + enhanced + category + mapped data
-    """
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Join all tables to get complete product info
-        query = """
-        SELECT 
-            sp.product_id,
-            sp.url,
-            sp.title as scraped_title,
-            sp.description as scraped_description,
-            sp.brand,
-            sp.color,
-            sp.dimensions,
-            sp.weight,
-            sp.material,
-            sp.certifications,
-            sp.country_of_origin,
-            sp.price,
-            sp.shipping,
-            sp.warranty,
-            sp.image_1, sp.image_2, sp.image_3, sp.image_4, sp.image_5, sp.image_6,
-            sp.bullet_points as scraped_bullets,
-            sp.scraped_at,
-            
-            ec.title as enhanced_title,
-            ec.description as enhanced_description,
-            ec.bullet_points as enhanced_bullets,
-            
-            ca.original_category_id,
-            ca.original_category_name,
-            ca.enhanced_category_id,
-            ca.enhanced_category_name,
-            ca.confidence,
-            
-            mp.titre as template_title,
-            mp.description as template_description,
-            mp.marque,
-            mp.couleur_principale,
-            mp.dimensions as template_dimensions,
-            mp.poids,
-            mp.matiere,
-            mp.certifications as template_certifications,
-            mp.pays_origine,
-            mp.garantie,
-            mp.mapped_at,
-            
-            to_.file_name as template_file,
-            to_.created_at as template_created
-            
-        FROM scraped_products sp
-        LEFT JOIN enhanced_content ec ON sp.product_id = ec.product_id
-        LEFT JOIN category_assignments ca ON sp.product_id = ca.product_id
-        LEFT JOIN mapped_products mp ON sp.product_id = mp.product_id
-        LEFT JOIN template_outputs to_ ON sp.product_id = to_.product_id
-        
-        ORDER BY sp.scraped_at DESC
-        LIMIT ?
-        """
-        
-        cursor.execute(query, (min(limit, 1000),))
-        rows = cursor.fetchall()
-        conn.close()
-        
         return [dict(row) for row in rows] if rows else {"message": "No records"}
     except Exception as e:
         return {"error": str(e)}
@@ -721,7 +693,9 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8686))
     
     logger.info("\n" + "="*70)
-    logger.info("🚀 Octopia Template Pipeline - Solution 1 + Store Original Specs")
+    logger.info("🚀 Octopia Template Pipeline - HYBRID Approach")
+    logger.info("   API shows: original + enhanced + merged")
+    logger.info("   Template stores: ONLY enhanced specs")
     logger.info("="*70 + "\n")
     
     uvicorn.run(
