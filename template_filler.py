@@ -1,6 +1,6 @@
 """
-template_filler.py - FIXED VERSION
-Writes category to Row 1 AND data to Row 11
+template_filler.py - COMPLETE VERSION
+Writes category to Row 1 AND data to Row 11+
 """
 
 import json
@@ -27,7 +27,7 @@ class TemplateFiller:
             self.ws = self.wb.active
             self._build_field_map()
             print(f"[template] ✅ Loaded: {self.ws.title}")
-            print(f"[template] 📋 {len(self._field_col)} field keys mapped from ROW {FIELD_KEY_ROW}")
+            print(f"[template] 📋 {len(self._field_col)} fields from ROW {FIELD_KEY_ROW}")
             return True
         except Exception as e:
             print(f"[template] ❌ Load error: {e}")
@@ -47,7 +47,7 @@ class TemplateFiller:
         return self.ws.max_row + 1
 
     def fill_category_row(self, category_id: str, category_name: str) -> bool:
-        """Write category information to ROW 1"""
+        """Write category to ROW 1"""
         try:
             print(f"\n[template] 🏷️  Writing category to ROW {CATEGORY_ROW}...")
             
@@ -59,29 +59,23 @@ class TemplateFiller:
             self.ws.cell(row=CATEGORY_ROW, column=3).value = cat_id
             self.ws.cell(row=CATEGORY_ROW, column=4).value = cat_name
             
-            print(f"[template]    ✅ A1: OCTOPIA")
-            print(f"[template]    ✅ B1: Catégorie")
-            print(f"[template]    ✅ C1: {cat_id}")
-            print(f"[template]    ✅ D1: {cat_name}")
-            
+            print(f"[template]    ✅ C1: {cat_id} | D1: {cat_name}")
             return True
         except Exception as e:
-            print(f"[template] ❌ Category row error: {e}")
+            print(f"[template] ❌ Error: {e}")
             return False
 
     def fill_product_data(self, mapped_data: dict) -> bool:
-        """Write mapped_data to first available data row"""
+        """Write product data to Row 11+"""
         try:
             row = self._find_next_data_row()
             filled = 0
-            skipped = []
 
             print(f"\n[template] 📝 Writing {len(mapped_data)} fields → ROW {row}...")
 
             for field_key, value in mapped_data.items():
                 col = self._field_col.get(field_key)
                 if col is None:
-                    skipped.append(field_key)
                     continue
 
                 if isinstance(value, list):
@@ -99,20 +93,11 @@ class TemplateFiller:
                 self.ws.cell(row=row, column=col).value = cell_val
                 filled += 1
 
-                preview = cell_val[:50].replace("\n", " ")
-                if len(preview) < 50:
-                    print(f"[template]   col {col:2d}  {field_key:35s} = {preview}")
-                else:
-                    print(f"[template]   col {col:2d}  {field_key:35s} = {preview}...")
-
             print(f"[template] ✅ {filled} fields written to ROW {row}")
-            if skipped:
-                print(f"[template] ⚠️  Skipped: {', '.join(skipped[:3])}")
-
             return True
 
         except Exception as e:
-            print(f"[template] ❌ fill error: {e}")
+            print(f"[template] ❌ Error: {e}")
             return False
 
     def save_template(self, output_path: str) -> bool:
@@ -137,22 +122,10 @@ def fill_template_for_product(
     category_id: str = "0",
     category_name: str = "Uncategorized"
 ) -> str | None:
-    """
-    Fill template with category row (Row 1) and product data (Row 11+)
+    """Fill template with category and product data"""
     
-    Args:
-        template_path – base .xlsm file
-        mapped_data – dict with Octopia field keys
-        product_id – used in output filename
-        output_dir – directory to write filled file
-        category_id – Octopia category ID (Row 1, Column C)
-        category_name – Octopia category name (Row 1, Column D)
-    
-    Returns:
-        Absolute path of saved file, or None on failure
-    """
     if not os.path.exists(template_path):
-        print(f"[template] ❌ Template not found: {template_path}")
+        print(f"[template] ❌ Template not found")
         return None
 
     os.makedirs(output_dir, exist_ok=True)
@@ -171,14 +144,12 @@ def fill_template_for_product(
             os.remove(output_path)
         return None
 
-    # ✅ WRITE CATEGORY ROW
     if not filler.fill_category_row(category_id, category_name):
         filler.close()
         if os.path.exists(output_path):
             os.remove(output_path)
         return None
 
-    # ✅ WRITE PRODUCT DATA ROW
     if not filler.fill_product_data(mapped_data):
         filler.close()
         if os.path.exists(output_path):
