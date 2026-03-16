@@ -1,40 +1,47 @@
 """
 openai_client.py - HYBRID APPROACH
 ────────────────────────────────────
-Sends title + description + scraped specifications to GPT-4o-mini.
+Sends title + description + all scraped specifications to GPT-4o-mini.
 
 Returns:
-    title                  – improved marketing title (max 200 chars)
-    description            – plain-text refined description (2-3 sentences)
-    bullet_points          – list of 5 marketing bullet points
-    html_description       – full structured HTML description
-    specifications_enhanced – dict of ONLY the specs that were enhanced
-                              (empty string "" for any field not enhanced)
+    title                   – improved marketing title (max 200 chars)
+    description             – plain-text 2-3 sentence description
+    bullet_points           – list of 5 marketing bullet points
+    html_description        – full structured HTML description
+    specifications_enhanced – dict of enhanced spec fields
+                              (empty string "" for any not enhanced)
 """
 
 import os
 import json
+import logging
 from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+logger = logging.getLogger(__name__)
 
-# Spec fields that the LLM is asked to enhance
-SPEC_FIELDS = [
+# ── Core spec fields sent to and returned from LLM ───────────────────────────
+CORE_SPEC_FIELDS = [
     'brand', 'color', 'dimensions', 'weight', 'material',
     'certifications', 'country_of_origin', 'warranty', 'product_type'
 ]
 
+# ── Extra fields included in prompt but NOT required back ────────────────────
+EXTRA_SPEC_FIELDS = [
+    'capacity', 'freezer_capacity', 'voltage', 'model_number',
+    'power_source', 'installation', 'style'
+]
+
 
 def _build_spec_text(specifications: dict) -> str:
-    """Format scraped spec fields for the prompt."""
+    """Format all spec fields for the prompt."""
     if not specifications or not isinstance(specifications, dict):
         return ""
 
     lines = []
-    extra_keys = ['age_from', 'age_to', 'gender']
-    all_keys = SPEC_FIELDS + extra_keys
+    all_keys = CORE_SPEC_FIELDS + EXTRA_SPEC_FIELDS
 
     for key in all_keys:
         value = specifications.get(key)
@@ -46,8 +53,8 @@ def _build_spec_text(specifications: dict) -> str:
 
 
 def _empty_spec_dict() -> dict:
-    """Return the expected spec dict with all fields empty."""
-    return {field: "" for field in SPEC_FIELDS}
+    """Return the expected output skeleton with all core fields empty."""
+    return {field: "" for field in CORE_SPEC_FIELDS}
 
 
 def improve_product_content(
@@ -59,16 +66,15 @@ def improve_product_content(
     """
     Enhance product content via OpenAI.
 
-    Rules enforced on the LLM response:
-    - specifications_enhanced must contain ALL SPEC_FIELDS keys
-    - Fields the LLM couldn't enhance must be returned as ""
-    - The LLM must NOT invent specs that weren't in the original data
+    Rules enforced:
+    - specifications_enhanced must contain ALL CORE_SPEC_FIELDS keys
+    - Fields that cannot be enhanced must be returned as ""
+    - LLM must NOT invent specs not present in original data
+    - Extra fields (voltage, capacity, etc.) are used for context only
     """
 
     spec_text     = _build_spec_text(specifications)
     category_line = f"\nCategory: {category}" if category else ""
-
-    # Build the expected JSON skeleton so the LLM knows the exact output shape
     spec_skeleton = json.dumps(_empty_spec_dict(), indent=4)
 
     prompt = f"""You are a professional eCommerce copywriter for marketplace listings
@@ -96,28 +102,33 @@ Return ONLY valid JSON — no markdown, no code fences, no extra text:
 
 RULES for specifications_enhanced:
 1. ALL keys listed above MUST be present in your response.
-2. Only enhance / clarify a field if its value was present in the scraped data above.
+2. Only enhance / clarify a field if its value was present in the scraped data.
 3. If a field was not in the scraped data, return exactly "" (empty string).
 4. Do NOT invent or assume values that were not provided.
-5. If a value exists but needs no improvement, return the original value unchanged.
+5. Use the extra specs (voltage, capacity, model, etc.) to write richer
+   bullet points and html_description — but do not add them to
+   specifications_enhanced.
 
-html_description rules:
+html_description format rules:
 - <p><strong>Label:</strong> value</p> for individual product specs
-- <h3>Section Title</h3> then <ul><li>…</li></ul> for Features, Package Includes, Notes
+- <h3>Section Title</h3> then <ul><li>…</li></ul> for Features, Package Includes
+- Include relevant technical specs (capacity, voltage, dimensions) in the HTML
 - No <html>, <body>, <head>, or wrapper tags
 - Valid, clean, semantic HTML only
 
-Example html_description structure:
-<p><strong>Content:</strong> 15ml</p>
-<p><strong>Size:</strong> 10×7cm</p>
+Example:
+<p><strong>Capacity:</strong> 118L (84L fridge + 34L freezer)</p>
+<p><strong>Dimensions:</strong> 453×525×1181mm</p>
+<p><strong>Voltage:</strong> 220V</p>
 <h3>Features</h3>
 <ul>
-<li>High-purity formula promotes collagen production</li>
-<li>Gentle formula for sensitive skin</li>
+<li>Energy-efficient Grade 3 compressor cooling</li>
+<li>Frost-free operation for easy maintenance</li>
+<li>Freestanding or built-in installation options</li>
 </ul>
 <h3>Package Includes</h3>
 <ul>
-<li>1 × Product Name</li>
+<li>1 × Mini Refrigerator</li>
 </ul>
 """
 
@@ -153,33 +164,34 @@ Example html_description structure:
 
         result = json.loads(content)
 
-        # ── Validate required text keys ─────────────────────────────────────
+        # ── Validate required text keys ───────────────────────────────────────
         for key in ("title", "description", "bullet_points", "html_description"):
             if key not in result:
-                logger.warning(f"[openai] WARNING: Missing key '{key}' — using fallback")
+                logger.warning(f"[openai] Missing key '{key}' — using fallback")
                 result[key] = "" if key != "bullet_points" else []
 
-        # ── Validate / normalise specifications_enhanced ────────────────────
+        # ── Normalise specifications_enhanced ─────────────────────────────────
         raw_specs = result.get("specifications_enhanced", {})
         if not isinstance(raw_specs, dict):
             raw_specs = {}
 
-        # Ensure every expected key is present; unknown keys are discarded
-        normalised_specs = {}
-        for field in SPEC_FIELDS:
+        normalised = {}
+        for field in CORE_SPEC_FIELDS:
             val = raw_specs.get(field, "")
-            # Treat None, non-strings, or whitespace-only as empty
             if val is None or not isinstance(val, str) or not val.strip():
-                normalised_specs[field] = ""
+                normalised[field] = ""
             else:
-                normalised_specs[field] = val.strip()
+                normalised[field] = val.strip()
 
-        result["specifications_enhanced"] = normalised_specs
+        result["specifications_enhanced"] = normalised
 
-        enhanced_count = len([v for v in normalised_specs.values() if v])
+        enhanced_count = len([v for v in normalised.values() if v])
         print(f"[openai] ✅ Content enhanced")
-        print(f"[openai]    Title, description, bullets, HTML — OK")
-        print(f"[openai]    Specifications enhanced: {enhanced_count} / {len(SPEC_FIELDS)} fields")
+        print(f"[openai]    Text fields (title, desc, bullets, HTML) — OK")
+        print(f"[openai]    Specs enhanced: {enhanced_count} / {len(CORE_SPEC_FIELDS)}")
+        for k, v in normalised.items():
+            if v:
+                print(f"[openai]       {k}: {v[:60]}")
 
         return result
 
@@ -190,8 +202,3 @@ Example html_description structure:
     except Exception as e:
         print(f"[openai] ❌ API error: {e}")
         return None
-
-
-# Expose logger so the validate block above can use it
-import logging
-logger = logging.getLogger(__name__)
