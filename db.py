@@ -1,537 +1,705 @@
 """
-scraper.py
-──────────
-Captures the mtop.aliexpress.pdp.pc.query API response.
-Extracts: specs, images, title, price, description, AND seller info.
-
-Seller info comes from: result.SHOP_CARD_PC (confirmed from debug output)
-  - store_name          : SHOP_CARD_PC.storeName
-  - store_id            : SHOP_CARD_PC.sellerInfo.storeNum
-  - store_url           : SHOP_CARD_PC.sellerInfo.storeURL
-  - seller_id           : SHOP_CARD_PC.sellerInfo.adminSeq
-  - seller_positive_rate: SHOP_CARD_PC.sellerPositiveRate
-  - seller_rating       : benefitInfoList[title=store rating].value
-  - seller_country      : SHOP_CARD_PC.sellerInfo.countryCompleteName
-  - store_open_date     : SHOP_CARD_PC.sellerInfo.formatOpenTime
-  - seller_level        : SHOP_CARD_PC.sellerLevel
-  - seller_total_reviews: SHOP_CARD_PC.sellerTotalNum
-
-RULE: Seller info is NEVER sent to LLM. Always stored as original scraped values.
+db.py - HYBRID APPROACH + SELLER INFO
+Complete schema with audit trail and seller information table.
+Seller info is stored as original — never LLM-enhanced.
 """
 
-from playwright.sync_api import sync_playwright
-import re
+import sqlite3
 import json
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SPEC MAPPING
-# ─────────────────────────────────────────────────────────────────────────────
-
-SPEC_MAPPING = {
-    'brand':             ['brand name', 'brand', 'marque'],
-    'color':             ['main color', 'color', 'colour', 'couleur'],
-    'dimensions':        ['dimensions (l x w x h', 'dimensions (cm)', 'dimensions',
-                          'size', 'taille', 'product size', 'item size',
-                          'package size', 'product dimensions'],
-    'weight':            ['net weight', 'weight (kg)', 'weight', 'poids',
-                          'gross weight', 'item weight', 'package weight'],
-    'material':          ['material composition', 'material', 'matière', 'materials',
-                          'body material'],
-    'certifications':    ['certification', 'certifications', 'normes', 'standards',
-                          'energy efficiency rating', 'energy consumption grade',
-                          'energy rating', 'energy class'],
-    'country_of_origin': ['place of origin', 'country of origin', 'origin',
-                          'country', 'pays', 'made in', 'manufactured in'],
-    'warranty':          ['warranty', 'garantie', 'guarantee', 'warranty period'],
-    'product_type':      ['refrigeration type', 'cooling method', 'defrost type',
-                          'product type', 'type de produit', 'item type', 'type',
-                          'application', 'design', 'operation system', 'use'],
-    'age_from':          ['age from', 'recommended age from', 'age (from)', 'minimum age'],
-    'age_to':            ['age to', 'recommended age to', 'age (to)', 'maximum age'],
-    'gender':            ['gender', 'suitable for', 'sexe'],
-    'capacity':          ['capacity', 'fridge capacity', 'net capacity', 'total capacity'],
-    'freezer_capacity':  ['freezer capacity'],
-    'voltage':           ['voltage', 'rated voltage', 'operating voltage'],
-    'model_number':      ['model number', 'model no', 'model', 'item model'],
-    'power_source':      ['power source', 'power supply'],
-    'installation':      ['installation', 'mounting type'],
-    'style':             ['style'],
-    'battery':           ['battery capacity', 'battery capacity(mah)', 'battery capacity range'],
-    'display':           ['display size', 'screen size', 'display resolution', 'screen material'],
-    'camera':            ['rear camera pixel', 'front camera pixel'],
-    'connectivity':      ['cellular', 'wifi', 'nfc', 'bluetooth'],
-    'os':                ['operation system', 'android version'],
-    'height':            ['height'],
-    'width':             ['width'],
-}
+DB_NAME = "products.db"
 
 
-def map_props_to_fields(props: list) -> tuple:
-    raw = {}
-    for item in props:
-        name  = str(item.get('attrName',  '') or '').strip()
-        value = str(item.get('attrValue', '') or '').strip()
-        if name and value:
-            raw[name.lower()] = value
-
-    mapped = {}
-    for field, keywords in SPEC_MAPPING.items():
-        for raw_key, raw_val in raw.items():
-            if any(kw in raw_key for kw in keywords):
-                if field not in mapped:
-                    mapped[field] = raw_val
-                    break
-
-    # Build dimensions from H/W
-    if not mapped.get('dimensions'):
-        h = mapped.get('height', raw.get('height', ''))
-        w = mapped.get('width',  raw.get('width',  ''))
-        if h and w:
-            mapped['dimensions'] = f"{h} x {w}"
-
-    cap = mapped.pop('capacity', '')
-    if cap:
-        mapped['dimensions'] = (mapped.get('dimensions', '') + f" | Capacity: {cap}").strip(' |')
-
-    fcap = mapped.pop('freezer_capacity', '')
-    if fcap and mapped.get('dimensions'):
-        mapped['dimensions'] += f" | Freezer: {fcap}"
-
-    return mapped, raw
+def create_connection():
+    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    return conn
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SELLER INFO EXTRACTOR
-# Path confirmed from debug: result.SHOP_CARD_PC
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
+# CREATE ALL TABLES
+# ─────────────────────────────────────────
 
-def extract_seller_info(result: dict) -> dict:
-    """
-    Extract seller/store information from SHOP_CARD_PC.
-    Returns original values — never modified by LLM.
-    """
-    seller = {
-        'store_name':           '',
-        'store_id':             '',
-        'store_url':            '',
-        'seller_id':            '',
-        'seller_positive_rate': '',
-        'seller_rating':        '',
-        'seller_communication': '',
-        'seller_shipping_speed':'',
-        'seller_country':       '',
-        'store_open_date':      '',
-        'seller_level':         '',
-        'seller_total_reviews': '',
-        'seller_positive_num':  '',
-        'is_top_rated':         '',
-    }
+def create_all_tables():
+    conn   = create_connection()
+    cursor = conn.cursor()
 
     try:
-        shop = result.get('SHOP_CARD_PC', {}) or {}
-        if not shop:
-            print("[scraper]    ⚠️  SHOP_CARD_PC not found in API response")
-            return seller
-
-        # Store name
-        seller['store_name'] = str(shop.get('storeName', '') or '')
-
-        # Seller level
-        seller['seller_level'] = str(shop.get('sellerLevel', '') or '')
-
-        # Positive rate & review counts
-        seller['seller_positive_rate'] = str(shop.get('sellerPositiveRate', '') or '')
-        seller['seller_total_reviews'] = str(shop.get('sellerTotalNum', '') or '')
-        seller['seller_positive_num']  = str(shop.get('sellerPositiveNum', '') or '')
-
-        # Detailed ratings from benefitInfoList
-        benefit_list = shop.get('benefitInfoList', []) or []
-        for item in benefit_list:
-            title = str(item.get('title', '') or '').lower().strip()
-            value = str(item.get('value', '') or '').strip()
-            if 'store rating' in title:
-                seller['seller_rating'] = value
-            elif 'communication' in title:
-                seller['seller_communication'] = value
-
-        # sellerInfo sub-object
-        seller_info = shop.get('sellerInfo', {}) or {}
-        if seller_info:
-            seller['seller_id']      = str(seller_info.get('adminSeq', '') or '')
-            seller['store_id']       = str(seller_info.get('storeNum', '') or '')
-            seller['seller_country'] = str(seller_info.get('countryCompleteName', '') or '')
-            seller['store_open_date']= str(seller_info.get('formatOpenTime', '') or '')
-            seller['is_top_rated']   = str(seller_info.get('topRatedSeller', '') or '')
-
-            raw_url = str(seller_info.get('storeURL', '') or '')
-            if raw_url:
-                if raw_url.startswith('//'):
-                    raw_url = 'https:' + raw_url
-                seller['store_url'] = raw_url
-
-        # Also try GLOBAL_DATA for store name fallback
-        if not seller['store_name']:
-            try:
-                seller['store_name'] = str(
-                    result['GLOBAL_DATA']['globalData']['storeName'] or ''
-                )
-            except (KeyError, TypeError):
-                pass
-
-        # Store ID fallback from GLOBAL_DATA
-        if not seller['store_id']:
-            try:
-                seller['store_id'] = str(
-                    result['GLOBAL_DATA']['globalData']['storeId'] or ''
-                )
-            except (KeyError, TypeError):
-                pass
-
-        print(f"[scraper]    ✅ Seller info extracted:")
-        for k, v in seller.items():
-            if v:
-                print(f"[scraper]       {k}: {v}")
-
-    except Exception as e:
-        print(f"[scraper]    ⚠️  Seller info extraction error: {e}")
-
-    return seller
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN API RESPONSE PARSER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_pdp_response(text: str) -> dict | None:
-    try:
-        text = text.strip()
-        m = re.match(r'^[a-zA-Z_$][a-zA-Z0-9_$]*\s*\((.*)\)\s*;?\s*$', text, re.DOTALL)
-        if m:
-            text = m.group(1)
-
-        data   = json.loads(text)
-        result = (data.get('data', {}) or {}).get('result', {}) or {}
-
-        if not result:
-            print("[scraper]    ⚠️  Empty result in API response")
-            return None
-
-        extracted = {}
-
-        # ── Title ──────────────────────────────────────────────────────────
-        try:
-            extracted['title'] = result['GLOBAL_DATA']['globalData']['subject']
-        except (KeyError, TypeError):
-            pass
-        if not extracted.get('title'):
-            try:
-                extracted['title'] = result['titleModule']['subject']
-            except (KeyError, TypeError):
-                pass
-        if extracted.get('title'):
-            extracted['title'] = str(extracted['title']).strip()
-
-        # ── Specifications ─────────────────────────────────────────────────
-        props = []
-        try:
-            props = result['PRODUCT_PROP_PC']['showedProps'] or []
-        except (KeyError, TypeError):
-            pass
-        if not props:
-            try:
-                props = result['PRODUCT_PROP_PC']['outerProps'] or []
-            except (KeyError, TypeError):
-                pass
-
-        if props:
-            print(f"[scraper]    ✅ Found {len(props)} spec props in API JSON")
-            mapped, raw = map_props_to_fields(props)
-            extracted.update(mapped)
-            for k, v in raw.items():
-                print(f"[scraper]       {k}: {v[:60]}")
-        else:
-            print("[scraper]    ⚠️  No specs found in PRODUCT_PROP_PC")
-
-        # ── Seller Info ────────────────────────────────────────────────────
-        seller_info = extract_seller_info(result)
-        extracted.update(seller_info)
-
-        # ── Images ─────────────────────────────────────────────────────────
-        images = []
-        try:
-            images = result['imageModule']['imagePathList'] or []
-        except (KeyError, TypeError):
-            pass
-        if not images:
-            def find_images(obj, depth=0):
-                if depth > 6 or not isinstance(obj, dict):
-                    return []
-                if 'imagePathList' in obj:
-                    v = obj['imagePathList']
-                    if isinstance(v, list) and v:
-                        return v
-                for v in obj.values():
-                    r = find_images(v, depth + 1)
-                    if r:
-                        return r
-                return []
-            images = find_images(result)
-
-        for idx, img in enumerate(images[:20], 1):
-            if img:
-                if img.startswith('//'):
-                    img = 'https:' + img
-                elif not img.startswith('http'):
-                    img = 'https://' + img
-                extracted[f'image_{idx}'] = re.sub(r'_\d+x\d+', '', img)
-
-        if images:
-            print(f"[scraper]    ✅ Found {len(images)} images")
-
-        # ── Price ──────────────────────────────────────────────────────────
-        try:
-            pm = result.get('priceModule', {}) or result.get('PRICE_MODULE', {}) or {}
-            price = (pm.get('formatedActivityPrice') or
-                     pm.get('formatedPrice') or
-                     pm.get('minActivityAmount', {}).get('formatedAmount', '') or '')
-            if price:
-                extracted['price'] = str(price)
-        except Exception:
-            pass
-
-        # ── Description ────────────────────────────────────────────────────
-        try:
-            dm   = result.get('descriptionModule', {}) or {}
-            desc = dm.get('description', '') or dm.get('content', '')
-            if desc and len(desc) > 50:
-                desc = re.sub(r'<[^>]+>', ' ', desc)
-                extracted['description'] = ' '.join(desc.split())[:2000]
-        except Exception:
-            pass
-
-        return extracted if (extracted.get('title') or extracted.get('image_1')) else None
-
-    except json.JSONDecodeError as e:
-        print(f"[scraper]    ⚠️  JSON parse error: {e}")
-        return None
-    except Exception as e:
-        print(f"[scraper]    ⚠️  Parse error: {e}")
-        return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DOM FALLBACKS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_title_from_dom(page) -> str:
-    for selector in ['meta[property="og:title"]', 'h1[data-pl="product-title"]']:
-        try:
-            el = page.locator(selector).first
-            if el.count() > 0:
-                val = (el.get_attribute('content') or el.inner_text() or '').strip()
-                if val:
-                    return val
-        except Exception:
-            pass
-    return ''
-
-
-def get_images_from_dom(page) -> dict:
-    images = {}
-    try:
-        for script in page.locator('script').all():
-            try:
-                txt = script.text_content() or ''
-                m   = re.search(r'"imagePathList"\s*:\s*\[(.*?)\]', txt, re.DOTALL)
-                if m:
-                    urls = re.findall(r'"(https?://[^"]+\.jpg[^"]*)"', m.group(1))
-                    if not urls:
-                        urls = re.findall(r'"(//[^"]+\.jpg[^"]*)"', m.group(1))
-                    for idx, url in enumerate(urls[:20], 1):
-                        if url.startswith('//'):
-                            url = 'https:' + url
-                        images[f'image_{idx}'] = re.sub(r'_\d+x\d+', '', url)
-                    if images:
-                        print(f"[scraper]    ✅ {len(images)} images from DOM script")
-                        return images
-            except Exception:
-                pass
-    except Exception:
+        cursor.execute("ALTER TABLE categories RENAME TO categories_old")
+    except sqlite3.OperationalError:
         pass
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS categories (
+        category_id   INTEGER PRIMARY KEY,
+        category_name TEXT,
+        embedding     BLOB
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS original_content (
+        product_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+        url         TEXT UNIQUE,
+        title       TEXT,
+        description TEXT,
+        image_url   TEXT
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS enhanced_content (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id        INTEGER UNIQUE,
+        title             TEXT,
+        description       TEXT,
+        bullet_points     TEXT,
+        html_description  TEXT,
+        brand             TEXT,
+        color             TEXT,
+        dimensions        TEXT,
+        weight            TEXT,
+        material          TEXT,
+        certifications    TEXT,
+        country_of_origin TEXT,
+        warranty          TEXT,
+        product_type      TEXT,
+        enhanced_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS category_assignments (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id             INTEGER UNIQUE,
+        original_category_id   INTEGER,
+        original_category_name TEXT,
+        enhanced_category_id   INTEGER,
+        enhanced_category_name TEXT,
+        confidence             REAL,
+        FOREIGN KEY (product_id) REFERENCES original_content(product_id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS products (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        url                  TEXT UNIQUE,
+        title                TEXT,
+        description          TEXT,
+        improved_title       TEXT,
+        improved_description TEXT,
+        bullet_points        TEXT,
+        category_id          INTEGER,
+        category_name        TEXT,
+        confidence           REAL,
+        enhanced_category    TEXT
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS scraped_products (
+        product_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        url                TEXT UNIQUE,
+        title              TEXT,
+        description        TEXT,
+        brand              TEXT,
+        image_1            TEXT,
+        image_2            TEXT,
+        image_3            TEXT,
+        image_4            TEXT,
+        image_5            TEXT,
+        image_6            TEXT,
+        color              TEXT,
+        dimensions         TEXT,
+        weight             TEXT,
+        material           TEXT,
+        age_from           TEXT,
+        age_to             TEXT,
+        certifications     TEXT,
+        country_of_origin  TEXT,
+        bullet_points      TEXT,
+        price              TEXT,
+        shipping           TEXT,
+        warranty           TEXT,
+        product_type       TEXT,
+        store_name         TEXT,
+        raw_json           TEXT,
+        scraped_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS mapped_products (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id         INTEGER UNIQUE,
+        gtin               TEXT,
+        seller_reference   TEXT,
+        titre              TEXT,
+        description        TEXT,
+        url_image_1        TEXT,
+        marque             TEXT,
+        couleur_principale TEXT,
+        dimensions         TEXT,
+        poids              TEXT,
+        matiere            TEXT,
+        age_from           TEXT,
+        age_to             TEXT,
+        certifications     TEXT,
+        pays_origine       TEXT,
+        fabricant_nom      TEXT,
+        garantie           TEXT,
+        notes              TEXT,
+        additional_fields  TEXT,
+        mapped_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS template_outputs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id  INTEGER,
+        category_id TEXT,
+        output_type TEXT,
+        file_path   TEXT,
+        file_name   TEXT,
+        status      TEXT,
+        notes       TEXT,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS processing_logs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id  INTEGER,
+        url         TEXT,
+        step        TEXT,
+        status      TEXT,
+        message     TEXT,
+        log_time    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS original_specifications (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id        INTEGER UNIQUE,
+        brand             TEXT,
+        color             TEXT,
+        dimensions        TEXT,
+        weight            TEXT,
+        material          TEXT,
+        certifications    TEXT,
+        country_of_origin TEXT,
+        warranty          TEXT,
+        product_type      TEXT,
+        age_from          TEXT,
+        age_to            TEXT,
+        gender            TEXT,
+        source            TEXT DEFAULT 'scraper',
+        extracted_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS enhanced_specifications (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id        INTEGER UNIQUE,
+        brand             TEXT,
+        color             TEXT,
+        dimensions        TEXT,
+        weight            TEXT,
+        material          TEXT,
+        certifications    TEXT,
+        country_of_origin TEXT,
+        warranty          TEXT,
+        product_type      TEXT,
+        age_from          TEXT,
+        age_to            TEXT,
+        gender            TEXT,
+        source            TEXT DEFAULT 'openai',
+        enhanced_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS specification_audit_log (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id      INTEGER,
+        spec_field      TEXT,
+        original_value  TEXT,
+        enhanced_value  TEXT,
+        template_value  TEXT,
+        source_used     TEXT,
+        notes           TEXT,
+        recorded_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    # ── SELLER INFO TABLE (new) ────────────────────────────────────────────
+    # Stores original seller data — never LLM-enhanced
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS seller_info (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id            INTEGER UNIQUE,
+        store_name            TEXT,
+        store_id              TEXT,
+        store_url             TEXT,
+        seller_id             TEXT,
+        seller_positive_rate  TEXT,
+        seller_rating         TEXT,
+        seller_communication  TEXT,
+        seller_shipping_speed TEXT,
+        seller_country        TEXT,
+        store_open_date       TEXT,
+        seller_level          TEXT,
+        seller_total_reviews  TEXT,
+        seller_positive_num   TEXT,
+        is_top_rated          TEXT,
+        scraped_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    conn.commit()
+    conn.close()
+    print("✅ All tables created (including seller_info table)")
+
+
+# ─────────────────────────────────────────
+# LEGACY INSERT FUNCTIONS
+# ─────────────────────────────────────────
+
+def insert_original_content(url, title, description, image_url):
+    conn   = create_connection()
+    cursor = conn.cursor()
     try:
-        og = page.locator('meta[property="og:image"]').get_attribute('content')
-        if og:
-            images['image_1'] = og
-    except Exception:
+        cursor.execute("""
+            INSERT INTO original_content (url, title, description, image_url)
+            VALUES (?, ?, ?, ?)
+        """, (url, title, description, image_url))
+        conn.commit()
+        product_id = cursor.lastrowid
+        return product_id
+    except sqlite3.IntegrityError:
+        cursor.execute("SELECT product_id FROM original_content WHERE url = ?", (url,))
+        return cursor.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def insert_category_assignment(product_id, orig_cat_id, orig_cat_name,
+                                enh_cat_id, enh_cat_name, confidence):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO category_assignments
+            (product_id, original_category_id, original_category_name,
+             enhanced_category_id, enhanced_category_name, confidence)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (product_id, orig_cat_id, orig_cat_name,
+              enh_cat_id, enh_cat_name, confidence))
+        conn.commit()
+    except sqlite3.IntegrityError:
         pass
-    return images
+    finally:
+        conn.close()
 
 
-def get_description_from_dom(page) -> str:
-    for selector in [
-        'div.richTextContainer[data-rich-text-render="true"]',
-        'div[id="product-description"]',
-        'div[id="nav-description"]',
-        'div.detailmodule_text',
-    ]:
-        try:
-            el = page.locator(selector).first
-            if el.count() > 0:
-                text = el.inner_text().strip()
-                text = re.sub(r'^.*?Description\s+report\s+', '', text,
-                              flags=re.IGNORECASE | re.DOTALL)
-                if len(text) > 50 and 'Smarter Shopping' not in text:
-                    return text[:2000]
-        except Exception:
-            pass
-    return ''
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_product_info(url: str) -> dict | None:
-    captured_pdp = []
-
+def insert_product(data):
+    conn   = create_connection()
+    cursor = conn.cursor()
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage',
-                      '--disable-blink-features=AutomationControlled']
-            )
-            context = browser.new_context(
-                user_agent=(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/120.0.0.0 Safari/537.36'
-                ),
-                viewport={'width': 1366, 'height': 900},
-                locale='en-US',
-                timezone_id='Asia/Karachi',
-            )
-            page = context.new_page()
+        cursor.execute("""
+        INSERT INTO products (
+            url, title, description, improved_title, improved_description,
+            bullet_points, category_id, category_name, confidence, enhanced_category
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, data)
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
+    finally:
+        conn.close()
 
-            def handle_response(response):
-                url_r = response.url
-                if ('mtop.aliexpress.pdp.pc.query' in url_r or
-                        'mtop.aliexpress.itemdetail.pc' in url_r):
-                    try:
-                        body = response.body()
-                        if len(body) > 1000:
-                            text = body.decode('utf-8', errors='replace')
-                            if ('PRODUCT_PROP_PC' in text or
-                                    'imagePathList' in text or
-                                    'SHOP_CARD_PC' in text):
-                                captured_pdp.append(text)
-                                print(f"[scraper]    📡 Captured PDP: {url_r[:80]}")
-                    except Exception:
-                        pass
 
-            page.on('response', handle_response)
+# ─────────────────────────────────────────
+# TASK 2 INSERT FUNCTIONS
+# ─────────────────────────────────────────
 
-            print(f'\n[scraper] 🌐 Opening: {url}')
-            page.goto(url, timeout=60000, wait_until='domcontentloaded')
-            page.wait_for_timeout(5000)
-            page.mouse.wheel(0, 800)
-            page.wait_for_timeout(1000)
-
-            extracted = {}
-            print(f'[scraper]    📦 Captured {len(captured_pdp)} PDP responses')
-
-            for resp_text in captured_pdp:
-                parsed = parse_pdp_response(resp_text)
-                if parsed:
-                    print(f'[scraper]    ✅ Parsed {len(parsed)} fields from API')
-                    for k, v in parsed.items():
-                        if k not in extracted or not extracted[k]:
-                            extracted[k] = v
-
-            # DOM fallbacks
-            if not extracted.get('title'):
-                extracted['title'] = get_title_from_dom(page)
-            if not extracted.get('image_1'):
-                extracted.update(get_images_from_dom(page))
-            if not extracted.get('description'):
-                d = get_description_from_dom(page)
-                if d:
-                    extracted['description'] = d
-            if not extracted.get('price'):
-                try:
-                    for script in page.locator('script').all():
-                        txt = script.text_content() or ''
-                        m   = re.search(r'"price"\s*:\s*"([^"]+)"', txt)
-                        if m:
-                            extracted['price'] = m.group(1)
-                            break
-                except Exception:
-                    pass
-
-            browser.close()
-
-        if not extracted.get('title'):
-            print('[scraper] ❌ No title — aborting')
-            return None
-
-        # Summary
-        core = ['brand', 'color', 'dimensions', 'weight', 'material',
-                'certifications', 'country_of_origin', 'warranty', 'product_type']
-        seller_fields = ['store_name', 'store_id', 'seller_positive_rate',
-                         'seller_rating', 'seller_country', 'store_open_date']
-
-        print(f'\n[scraper] ✅ Extraction complete')
-        print(f'[scraper]    Title      : {extracted.get("title", "")[:70]}')
-        print(f'[scraper]    Desc       : {len(extracted.get("description", ""))} chars')
-        print(f'[scraper]    Core specs : {[k for k in core if extracted.get(k)]}')
-        print(f'[scraper]    Seller     : {[k for k in seller_fields if extracted.get(k)]}')
-        print(f'[scraper]    Images     : {sum(1 for i in range(1,21) if extracted.get(f"image_{i}"))}')
-
-        # Apply defaults
-        defaults = {
-            'description': '', 'brand': '', 'color': '', 'dimensions': '',
-            'weight': '', 'material': '', 'certifications': '',
-            'country_of_origin': '', 'warranty': '', 'product_type': '',
-            'shipping': '', 'price': '', 'rating': '', 'reviews': '',
-            'bullet_points': [], 'age_from': '', 'age_to': '',
-            'gender': '', 'safety_warning': '',
-            'capacity': '', 'freezer_capacity': '', 'voltage': '',
-            'model_number': '', 'power_source': '', 'installation': '',
-            'battery': '', 'display': '', 'camera': '',
-            'connectivity': '', 'memory': '', 'os': '',
-            # Seller defaults
-            'store_name': '', 'store_id': '', 'store_url': '',
-            'seller_id': '', 'seller_positive_rate': '', 'seller_rating': '',
-            'seller_communication': '', 'seller_shipping_speed': '',
-            'seller_country': '', 'store_open_date': '', 'seller_level': '',
-            'seller_total_reviews': '', 'seller_positive_num': '',
-            'is_top_rated': '',
-        }
-        for key, default in defaults.items():
-            if key not in extracted or not extracted[key]:
-                extracted[key] = default
-
-        for i in range(1, 21):
-            extracted.setdefault(f'image_{i}', '')
-
-        return extracted
-
+def insert_scraped_product(url, attributes):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO scraped_products (
+                url, title, description, brand,
+                image_1, image_2, image_3, image_4, image_5, image_6,
+                color, dimensions, weight, material,
+                age_from, age_to, certifications, country_of_origin,
+                bullet_points, price, shipping, warranty, product_type,
+                store_name, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            url,
+            attributes.get("title", ""),
+            attributes.get("description", ""),
+            attributes.get("brand", ""),
+            attributes.get("image_1", ""),
+            attributes.get("image_2", ""),
+            attributes.get("image_3", ""),
+            attributes.get("image_4", ""),
+            attributes.get("image_5", ""),
+            attributes.get("image_6", ""),
+            attributes.get("color", ""),
+            attributes.get("dimensions", ""),
+            attributes.get("weight", ""),
+            attributes.get("material", ""),
+            attributes.get("age_from", ""),
+            attributes.get("age_to", ""),
+            attributes.get("certifications", ""),
+            attributes.get("country_of_origin", ""),
+            json.dumps(attributes.get("bullet_points", [])),
+            attributes.get("price", ""),
+            attributes.get("shipping", ""),
+            attributes.get("warranty", ""),
+            attributes.get("product_type", ""),
+            attributes.get("store_name", ""),
+            json.dumps(attributes)
+        ))
+        conn.commit()
+        product_id = cursor.lastrowid
+        print(f"✅ Scraped product saved (product_id={product_id})")
+        return product_id
+    except sqlite3.IntegrityError:
+        cursor.execute("SELECT product_id FROM scraped_products WHERE url = ?", (url,))
+        product_id = cursor.fetchone()[0]
+        print(f"⚠  Product already exists (product_id={product_id})")
+        return product_id
     except Exception as e:
-        print(f'[scraper] ❌ ERROR: {e}')
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Error: {e}")
         return None
+    finally:
+        conn.close()
 
 
-if __name__ == '__main__':
-    test_url = 'https://www.aliexpress.com/item/1005010388288135.html'
-    result   = get_product_info(test_url)
-    if result:
-        print('\n' + '='*80)
-        for k, v in result.items():
-            if v and not k.startswith('image_'):
-                print(f'  {k:30s}: {str(v)[:100]}')
-        print(f'  {"images":30s}: {sum(1 for i in range(1,21) if result.get(f"image_{i}"))}')
-    else:
-        print('FAILED')
+def insert_mapped_product(product_id, category_id, mapped_data):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO mapped_products (
+                product_id, titre, description, marque,
+                url_image_1, couleur_principale, dimensions, poids, matiere,
+                age_from, age_to, certifications, pays_origine,
+                fabricant_nom, garantie, notes, additional_fields
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            mapped_data.get("title", ""),
+            mapped_data.get("description", ""),
+            mapped_data.get("brand", ""),
+            mapped_data.get("sellerPictureUrls_1", ""),
+            mapped_data.get("3264", ""),
+            mapped_data.get("24069", ""),
+            mapped_data.get("5403", ""),
+            mapped_data.get("24061", ""),
+            mapped_data.get("11335", ""),
+            mapped_data.get("24947", ""),
+            mapped_data.get("38412", ""),
+            mapped_data.get("37045", ""),
+            mapped_data.get("47456", ""),
+            mapped_data.get("37937", ""),
+            mapped_data.get("6587", ""),
+            json.dumps({k: v for k, v in mapped_data.items()})
+        ))
+        conn.commit()
+        print(f"✅ Mapped product saved (product_id={product_id})")
+        return True
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def insert_template_output(product_id, category_id, output_type,
+                            file_path, file_name, status="success"):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO template_outputs
+            (product_id, category_id, output_type, file_path, file_name, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (product_id, category_id, output_type, file_path, file_name, status))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def log_processing(product_id, url, step, status, message=""):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO processing_logs (product_id, url, step, status, message)
+            VALUES (?, ?, ?, ?, ?)
+        """, (product_id, url, step, status, message))
+        conn.commit()
+    except Exception as e:
+        print(f"❌ Error logging: {e}")
+    finally:
+        conn.close()
+
+
+def get_product_by_id(product_id):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT sp.*, ca.category_name, ca.confidence
+        FROM scraped_products sp
+        LEFT JOIN category_assignments ca ON sp.product_id = ca.product_id
+        WHERE sp.product_id = ?
+    """, (product_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result
+
+
+# ─────────────────────────────────────────
+# SELLER INFO FUNCTIONS (new)
+# ─────────────────────────────────────────
+
+SELLER_FIELDS = [
+    'store_name', 'store_id', 'store_url', 'seller_id',
+    'seller_positive_rate', 'seller_rating', 'seller_communication',
+    'seller_shipping_speed', 'seller_country', 'store_open_date',
+    'seller_level', 'seller_total_reviews', 'seller_positive_num', 'is_top_rated'
+]
+
+
+def insert_seller_info(product_id: int, seller_data: dict) -> bool:
+    """
+    Store original seller info. Never modified by LLM.
+    seller_data: dict with seller/store fields from scraper.
+    """
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO seller_info (
+                product_id, store_name, store_id, store_url, seller_id,
+                seller_positive_rate, seller_rating, seller_communication,
+                seller_shipping_speed, seller_country, store_open_date,
+                seller_level, seller_total_reviews, seller_positive_num, is_top_rated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            seller_data.get('store_name', ''),
+            seller_data.get('store_id', ''),
+            seller_data.get('store_url', ''),
+            seller_data.get('seller_id', ''),
+            seller_data.get('seller_positive_rate', ''),
+            seller_data.get('seller_rating', ''),
+            seller_data.get('seller_communication', ''),
+            seller_data.get('seller_shipping_speed', ''),
+            seller_data.get('seller_country', ''),
+            seller_data.get('store_open_date', ''),
+            seller_data.get('seller_level', ''),
+            seller_data.get('seller_total_reviews', ''),
+            seller_data.get('seller_positive_num', ''),
+            seller_data.get('is_top_rated', ''),
+        ))
+        conn.commit()
+        print(f"✅ Seller info saved (product_id={product_id})")
+        return True
+    except sqlite3.IntegrityError:
+        print(f"⚠  Seller info already exists for product_id={product_id}")
+        return False
+    except Exception as e:
+        print(f"❌ Error saving seller info: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def get_seller_info(product_id: int) -> dict:
+    """Retrieve seller info for a product."""
+    conn   = create_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT * FROM seller_info WHERE product_id = ?", (product_id,)
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# HYBRID AUDIT TRAIL FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════
+
+SPEC_FIELDS = [
+    'brand', 'color', 'dimensions', 'weight', 'material',
+    'certifications', 'country_of_origin', 'warranty',
+    'product_type', 'age_from', 'age_to', 'gender'
+]
+
+
+def insert_enhanced_content(product_id, enhanced_data):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO enhanced_content (
+                product_id, title, description, bullet_points, html_description,
+                brand, color, dimensions, weight, material, certifications,
+                country_of_origin, warranty, product_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            enhanced_data.get('title', ''),
+            enhanced_data.get('description', ''),
+            json.dumps(enhanced_data.get('bullet_points', [])),
+            enhanced_data.get('html_description', ''),
+            enhanced_data.get('brand', ''),
+            enhanced_data.get('color', ''),
+            enhanced_data.get('dimensions', ''),
+            enhanced_data.get('weight', ''),
+            enhanced_data.get('material', ''),
+            enhanced_data.get('certifications', ''),
+            enhanced_data.get('country_of_origin', ''),
+            enhanced_data.get('warranty', ''),
+            enhanced_data.get('product_type', '')
+        ))
+        conn.commit()
+        print(f"✅ Enhanced content saved (product_id={product_id})")
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def insert_original_specifications(product_id, original_specs):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO original_specifications (
+                product_id, brand, color, dimensions, weight, material,
+                certifications, country_of_origin, warranty, product_type,
+                age_from, age_to, gender
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            original_specs.get("brand", ""),
+            original_specs.get("color", ""),
+            original_specs.get("dimensions", ""),
+            original_specs.get("weight", ""),
+            original_specs.get("material", ""),
+            original_specs.get("certifications", ""),
+            original_specs.get("country_of_origin", ""),
+            original_specs.get("warranty", ""),
+            original_specs.get("product_type", ""),
+            original_specs.get("age_from", ""),
+            original_specs.get("age_to", ""),
+            original_specs.get("gender", "")
+        ))
+        conn.commit()
+        print(f"✅ Original specifications saved (product_id={product_id})")
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as e:
+        print(f"⚠  Could not save original specs: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def insert_enhanced_specifications(product_id, enhanced_specs):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO enhanced_specifications (
+                product_id, brand, color, dimensions, weight, material,
+                certifications, country_of_origin, warranty, product_type,
+                age_from, age_to, gender
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            enhanced_specs.get("brand", ""),
+            enhanced_specs.get("color", ""),
+            enhanced_specs.get("dimensions", ""),
+            enhanced_specs.get("weight", ""),
+            enhanced_specs.get("material", ""),
+            enhanced_specs.get("certifications", ""),
+            enhanced_specs.get("country_of_origin", ""),
+            enhanced_specs.get("warranty", ""),
+            enhanced_specs.get("product_type", ""),
+            enhanced_specs.get("age_from", ""),
+            enhanced_specs.get("age_to", ""),
+            enhanced_specs.get("gender", "")
+        ))
+        conn.commit()
+        print(f"✅ Enhanced specifications saved (product_id={product_id})")
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as e:
+        print(f"⚠  Could not save enhanced specs: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def log_specification_audit(product_id, spec_field, original_value,
+                             enhanced_value, template_value, source_used, notes=""):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO specification_audit_log (
+                product_id, spec_field, original_value,
+                enhanced_value, template_value, source_used, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (product_id, spec_field, original_value or "",
+              enhanced_value or "", template_value or "", source_used, notes))
+        conn.commit()
+    except Exception as e:
+        print(f"⚠  Error logging spec audit: {e}")
+    finally:
+        conn.close()
+
+
+def log_all_spec_audits(product_id, scraped_data, specs_enhanced, enriched_data_for_template):
+    audit_fields = [
+        'brand', 'color', 'dimensions', 'weight', 'material',
+        'certifications', 'country_of_origin', 'warranty', 'product_type'
+    ]
+    for field in audit_fields:
+        original_val = scraped_data.get(field, "")
+        enhanced_val = specs_enhanced.get(field, "")
+        template_val = enriched_data_for_template.get(field, "")
+        source       = "enhanced" if template_val else "empty"
+        log_specification_audit(product_id, field, original_val,
+                                enhanced_val, template_val, source)
+    print(f"✅ Specification audit log written for product_id={product_id}")
+
+
+# Backward compatibility
+def create_table():
+    create_all_tables()
+
+def create_categories_table():
+    pass
