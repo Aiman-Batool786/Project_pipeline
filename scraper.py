@@ -1,17 +1,22 @@
 """
 scraper.py
-─────────
-Captures the mtop.aliexpress.pdp.pc.query API response which contains
-ALL product data including specifications.
+──────────
+Captures the mtop.aliexpress.pdp.pc.query API response.
+Extracts: specs, images, title, price, description, AND seller info.
 
-Confirmed from debug output:
-  URL: https://acs.aliexpress.us/h5/mtop.aliexpress.pdp.pc.query/1.0/...
-  Key path: data.result.PRODUCT_PROP_PC.showedProps
-  Format:   [{"attrName": "Brand Name", "attrValue": "XMSJ"}, ...]
+Seller info comes from: result.SHOP_CARD_PC (confirmed from debug output)
+  - store_name          : SHOP_CARD_PC.storeName
+  - store_id            : SHOP_CARD_PC.sellerInfo.storeNum
+  - store_url           : SHOP_CARD_PC.sellerInfo.storeURL
+  - seller_id           : SHOP_CARD_PC.sellerInfo.adminSeq
+  - seller_positive_rate: SHOP_CARD_PC.sellerPositiveRate
+  - seller_rating       : benefitInfoList[title=store rating].value
+  - seller_country      : SHOP_CARD_PC.sellerInfo.countryCompleteName
+  - store_open_date     : SHOP_CARD_PC.sellerInfo.formatOpenTime
+  - seller_level        : SHOP_CARD_PC.sellerLevel
+  - seller_total_reviews: SHOP_CARD_PC.sellerTotalNum
 
-  Images: data.result.IMAGE_MODULE.imagePathList or mediaPathList
-  Title:  data.result.GLOBAL_DATA.globalData.subject
-  Price:  data.result.PRICE_MODULE (various sub-keys)
+RULE: Seller info is NEVER sent to LLM. Always stored as original scraped values.
 """
 
 from playwright.sync_api import sync_playwright
@@ -20,7 +25,7 @@ import json
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SPEC MAPPING — maps attrName (lowercase) → internal field
+# SPEC MAPPING
 # ─────────────────────────────────────────────────────────────────────────────
 
 SPEC_MAPPING = {
@@ -43,9 +48,8 @@ SPEC_MAPPING = {
                           'product type', 'type de produit', 'item type', 'type',
                           'application', 'design', 'operation system', 'use'],
     'age_from':          ['age from', 'recommended age from', 'age (from)', 'minimum age'],
-    'age_to':            ['age to',   'recommended age to',   'age (to)',   'maximum age'],
+    'age_to':            ['age to', 'recommended age to', 'age (to)', 'maximum age'],
     'gender':            ['gender', 'suitable for', 'sexe'],
-    # Extra fields
     'capacity':          ['capacity', 'fridge capacity', 'net capacity', 'total capacity'],
     'freezer_capacity':  ['freezer capacity'],
     'voltage':           ['voltage', 'rated voltage', 'operating voltage'],
@@ -63,11 +67,7 @@ SPEC_MAPPING = {
 }
 
 
-def map_props_to_fields(props: list) -> tuple[dict, dict]:
-    """
-    Map list of {attrName, attrValue} to internal fields.
-    Returns (mapped_fields, raw_dict).
-    """
+def map_props_to_fields(props: list) -> tuple:
     raw = {}
     for item in props:
         name  = str(item.get('attrName',  '') or '').strip()
@@ -83,22 +83,17 @@ def map_props_to_fields(props: list) -> tuple[dict, dict]:
                     mapped[field] = raw_val
                     break
 
-    # Build dimensions from H/W if no direct match
+    # Build dimensions from H/W
     if not mapped.get('dimensions'):
         h = mapped.get('height', raw.get('height', ''))
         w = mapped.get('width',  raw.get('width',  ''))
         if h and w:
             mapped['dimensions'] = f"{h} x {w}"
 
-    # Append capacity to dimensions
     cap = mapped.pop('capacity', '')
     if cap:
-        if mapped.get('dimensions'):
-            mapped['dimensions'] += f" | Capacity: {cap}"
-        else:
-            mapped['dimensions'] = f"Capacity: {cap}"
+        mapped['dimensions'] = (mapped.get('dimensions', '') + f" | Capacity: {cap}").strip(' |')
 
-    # Freezer capacity → append to dimensions
     fcap = mapped.pop('freezer_capacity', '')
     if fcap and mapped.get('dimensions'):
         mapped['dimensions'] += f" | Freezer: {fcap}"
@@ -107,23 +102,115 @@ def map_props_to_fields(props: list) -> tuple[dict, dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SELLER INFO EXTRACTOR
+# Path confirmed from debug: result.SHOP_CARD_PC
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_seller_info(result: dict) -> dict:
+    """
+    Extract seller/store information from SHOP_CARD_PC.
+    Returns original values — never modified by LLM.
+    """
+    seller = {
+        'store_name':           '',
+        'store_id':             '',
+        'store_url':            '',
+        'seller_id':            '',
+        'seller_positive_rate': '',
+        'seller_rating':        '',
+        'seller_communication': '',
+        'seller_shipping_speed':'',
+        'seller_country':       '',
+        'store_open_date':      '',
+        'seller_level':         '',
+        'seller_total_reviews': '',
+        'seller_positive_num':  '',
+        'is_top_rated':         '',
+    }
+
+    try:
+        shop = result.get('SHOP_CARD_PC', {}) or {}
+        if not shop:
+            print("[scraper]    ⚠️  SHOP_CARD_PC not found in API response")
+            return seller
+
+        # Store name
+        seller['store_name'] = str(shop.get('storeName', '') or '')
+
+        # Seller level
+        seller['seller_level'] = str(shop.get('sellerLevel', '') or '')
+
+        # Positive rate & review counts
+        seller['seller_positive_rate'] = str(shop.get('sellerPositiveRate', '') or '')
+        seller['seller_total_reviews'] = str(shop.get('sellerTotalNum', '') or '')
+        seller['seller_positive_num']  = str(shop.get('sellerPositiveNum', '') or '')
+
+        # Detailed ratings from benefitInfoList
+        benefit_list = shop.get('benefitInfoList', []) or []
+        for item in benefit_list:
+            title = str(item.get('title', '') or '').lower().strip()
+            value = str(item.get('value', '') or '').strip()
+            if 'store rating' in title:
+                seller['seller_rating'] = value
+            elif 'communication' in title:
+                seller['seller_communication'] = value
+
+        # sellerInfo sub-object
+        seller_info = shop.get('sellerInfo', {}) or {}
+        if seller_info:
+            seller['seller_id']      = str(seller_info.get('adminSeq', '') or '')
+            seller['store_id']       = str(seller_info.get('storeNum', '') or '')
+            seller['seller_country'] = str(seller_info.get('countryCompleteName', '') or '')
+            seller['store_open_date']= str(seller_info.get('formatOpenTime', '') or '')
+            seller['is_top_rated']   = str(seller_info.get('topRatedSeller', '') or '')
+
+            raw_url = str(seller_info.get('storeURL', '') or '')
+            if raw_url:
+                if raw_url.startswith('//'):
+                    raw_url = 'https:' + raw_url
+                seller['store_url'] = raw_url
+
+        # Also try GLOBAL_DATA for store name fallback
+        if not seller['store_name']:
+            try:
+                seller['store_name'] = str(
+                    result['GLOBAL_DATA']['globalData']['storeName'] or ''
+                )
+            except (KeyError, TypeError):
+                pass
+
+        # Store ID fallback from GLOBAL_DATA
+        if not seller['store_id']:
+            try:
+                seller['store_id'] = str(
+                    result['GLOBAL_DATA']['globalData']['storeId'] or ''
+                )
+            except (KeyError, TypeError):
+                pass
+
+        print(f"[scraper]    ✅ Seller info extracted:")
+        for k, v in seller.items():
+            if v:
+                print(f"[scraper]       {k}: {v}")
+
+    except Exception as e:
+        print(f"[scraper]    ⚠️  Seller info extraction error: {e}")
+
+    return seller
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN API RESPONSE PARSER
-# Parses the mtop.aliexpress.pdp.pc.query JSON
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_pdp_response(text: str) -> dict | None:
-    """
-    Parse the mtop.aliexpress.pdp.pc.query JSONP/JSON response.
-    Returns flat product dict or None.
-    """
     try:
-        # Strip JSONP wrapper: mtopjsonpN({...})
         text = text.strip()
         m = re.match(r'^[a-zA-Z_$][a-zA-Z0-9_$]*\s*\((.*)\)\s*;?\s*$', text, re.DOTALL)
         if m:
             text = m.group(1)
 
-        data = json.loads(text)
+        data   = json.loads(text)
         result = (data.get('data', {}) or {}).get('result', {}) or {}
 
         if not result:
@@ -133,56 +220,42 @@ def parse_pdp_response(text: str) -> dict | None:
         extracted = {}
 
         # ── Title ──────────────────────────────────────────────────────────
-        title = ''
-        # Path 1: GLOBAL_DATA
         try:
-            title = result['GLOBAL_DATA']['globalData']['subject']
+            extracted['title'] = result['GLOBAL_DATA']['globalData']['subject']
         except (KeyError, TypeError):
             pass
-        # Path 2: titleModule
-        if not title:
+        if not extracted.get('title'):
             try:
-                title = result['titleModule']['subject']
+                extracted['title'] = result['titleModule']['subject']
             except (KeyError, TypeError):
                 pass
-        if title:
-            extracted['title'] = str(title).strip()
+        if extracted.get('title'):
+            extracted['title'] = str(extracted['title']).strip()
 
         # ── Specifications ─────────────────────────────────────────────────
-        # Path: result.PRODUCT_PROP_PC.showedProps (confirmed from debug)
         props = []
         try:
             props = result['PRODUCT_PROP_PC']['showedProps'] or []
         except (KeyError, TypeError):
             pass
-
-        # Fallback paths
         if not props:
-            for path in [
-                ['PRODUCT_PROP_PC', 'outerProps'],
-                ['specsModule', 'props'],
-                ['specs', 'props'],
-            ]:
-                try:
-                    node = result
-                    for k in path:
-                        node = node[k]
-                    if node and isinstance(node, list):
-                        props = node
-                        break
-                except (KeyError, TypeError):
-                    pass
+            try:
+                props = result['PRODUCT_PROP_PC']['outerProps'] or []
+            except (KeyError, TypeError):
+                pass
 
         if props:
             print(f"[scraper]    ✅ Found {len(props)} spec props in API JSON")
             mapped, raw = map_props_to_fields(props)
             extracted.update(mapped)
-
-            # Log what was found
             for k, v in raw.items():
                 print(f"[scraper]       {k}: {v[:60]}")
         else:
             print("[scraper]    ⚠️  No specs found in PRODUCT_PROP_PC")
+
+        # ── Seller Info ────────────────────────────────────────────────────
+        seller_info = extract_seller_info(result)
+        extracted.update(seller_info)
 
         # ── Images ─────────────────────────────────────────────────────────
         images = []
@@ -191,12 +264,6 @@ def parse_pdp_response(text: str) -> dict | None:
         except (KeyError, TypeError):
             pass
         if not images:
-            try:
-                images = result['IMAGE_MODULE']['imagePathList'] or []
-            except (KeyError, TypeError):
-                pass
-        if not images:
-            # Deep search for imagePathList
             def find_images(obj, depth=0):
                 if depth > 6 or not isinstance(obj, dict):
                     return []
@@ -205,32 +272,29 @@ def parse_pdp_response(text: str) -> dict | None:
                     if isinstance(v, list) and v:
                         return v
                 for v in obj.values():
-                    result_imgs = find_images(v, depth + 1)
-                    if result_imgs:
-                        return result_imgs
+                    r = find_images(v, depth + 1)
+                    if r:
+                        return r
                 return []
             images = find_images(result)
 
         for idx, img in enumerate(images[:20], 1):
             if img:
-                # Ensure full URL
                 if img.startswith('//'):
                     img = 'https:' + img
                 elif not img.startswith('http'):
                     img = 'https://' + img
-                # Remove size suffix
-                img = re.sub(r'_\d+x\d+', '', img)
-                extracted[f'image_{idx}'] = img
+                extracted[f'image_{idx}'] = re.sub(r'_\d+x\d+', '', img)
 
         if images:
             print(f"[scraper]    ✅ Found {len(images)} images")
 
         # ── Price ──────────────────────────────────────────────────────────
         try:
-            price_module = result.get('priceModule', {}) or result.get('PRICE_MODULE', {}) or {}
-            price = (price_module.get('formatedActivityPrice') or
-                     price_module.get('formatedPrice') or
-                     price_module.get('minActivityAmount', {}).get('formatedAmount', '') or '')
+            pm = result.get('priceModule', {}) or result.get('PRICE_MODULE', {}) or {}
+            price = (pm.get('formatedActivityPrice') or
+                     pm.get('formatedPrice') or
+                     pm.get('minActivityAmount', {}).get('formatedAmount', '') or '')
             if price:
                 extracted['price'] = str(price)
         except Exception:
@@ -238,13 +302,11 @@ def parse_pdp_response(text: str) -> dict | None:
 
         # ── Description ────────────────────────────────────────────────────
         try:
-            desc_module = result.get('descriptionModule', {}) or {}
-            desc = desc_module.get('description', '') or desc_module.get('content', '')
+            dm   = result.get('descriptionModule', {}) or {}
+            desc = dm.get('description', '') or dm.get('content', '')
             if desc and len(desc) > 50:
-                # Strip HTML
                 desc = re.sub(r'<[^>]+>', ' ', desc)
-                desc = ' '.join(desc.split())
-                extracted['description'] = desc[:2000]
+                extracted['description'] = ' '.join(desc.split())[:2000]
         except Exception:
             pass
 
@@ -263,11 +325,7 @@ def parse_pdp_response(text: str) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_title_from_dom(page) -> str:
-    for selector in [
-        'meta[property="og:title"]',
-        'h1[data-pl="product-title"]',
-        'h1.product-title-text',
-    ]:
+    for selector in ['meta[property="og:title"]', 'h1[data-pl="product-title"]']:
         try:
             el = page.locator(selector).first
             if el.count() > 0:
@@ -280,13 +338,12 @@ def get_title_from_dom(page) -> str:
 
 
 def get_images_from_dom(page) -> dict:
-    """Extract images from JS imagePathList variable in page scripts."""
     images = {}
     try:
         for script in page.locator('script').all():
             try:
                 txt = script.text_content() or ''
-                m = re.search(r'"imagePathList"\s*:\s*\[(.*?)\]', txt, re.DOTALL)
+                m   = re.search(r'"imagePathList"\s*:\s*\[(.*?)\]', txt, re.DOTALL)
                 if m:
                     urls = re.findall(r'"(https?://[^"]+\.jpg[^"]*)"', m.group(1))
                     if not urls:
@@ -302,8 +359,6 @@ def get_images_from_dom(page) -> dict:
                 pass
     except Exception:
         pass
-
-    # og:image fallback
     try:
         og = page.locator('meta[property="og:image"]').get_attribute('content')
         if og:
@@ -338,21 +393,14 @@ def get_description_from_dom(page) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_product_info(url: str) -> dict | None:
-    """
-    Scrape AliExpress product by intercepting the PDP API response.
-    The API (mtop.aliexpress.pdp.pc.query) returns all product data as JSON.
-    """
     captured_pdp = []
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
-                ]
+                args=['--no-sandbox', '--disable-dev-shm-usage',
+                      '--disable-blink-features=AutomationControlled']
             )
             context = browser.new_context(
                 user_agent=(
@@ -366,21 +414,17 @@ def get_product_info(url: str) -> dict | None:
             )
             page = context.new_page()
 
-            # ── Intercept PDP API response ──────────────────────────────────
             def handle_response(response):
                 url_r = response.url
-                # Match the confirmed API endpoint
-                if 'mtop.aliexpress.pdp.pc.query' in url_r or \
-                   'mtop.aliexpress.itemdetail.pc' in url_r or \
-                   ('pdp' in url_r.lower() and 'aliexpress' in url_r and
-                    response.status == 200):
+                if ('mtop.aliexpress.pdp.pc.query' in url_r or
+                        'mtop.aliexpress.itemdetail.pc' in url_r):
                     try:
                         body = response.body()
                         if len(body) > 1000:
                             text = body.decode('utf-8', errors='replace')
-                            # Quick check for product data
-                            if 'PRODUCT_PROP_PC' in text or 'imagePathList' in text or \
-                               'subject' in text:
+                            if ('PRODUCT_PROP_PC' in text or
+                                    'imagePathList' in text or
+                                    'SHOP_CARD_PC' in text):
                                 captured_pdp.append(text)
                                 print(f"[scraper]    📡 Captured PDP: {url_r[:80]}")
                     except Exception:
@@ -388,16 +432,12 @@ def get_product_info(url: str) -> dict | None:
 
             page.on('response', handle_response)
 
-            # ── Load page ───────────────────────────────────────────────────
             print(f'\n[scraper] 🌐 Opening: {url}')
             page.goto(url, timeout=60000, wait_until='domcontentloaded')
             page.wait_for_timeout(5000)
-
-            # Scroll a bit to trigger any lazy loads
             page.mouse.wheel(0, 800)
             page.wait_for_timeout(1000)
 
-            # ── Parse API responses ─────────────────────────────────────────
             extracted = {}
             print(f'[scraper]    📦 Captured {len(captured_pdp)} PDP responses')
 
@@ -409,27 +449,20 @@ def get_product_info(url: str) -> dict | None:
                         if k not in extracted or not extracted[k]:
                             extracted[k] = v
 
-            # ── DOM fallbacks ───────────────────────────────────────────────
+            # DOM fallbacks
             if not extracted.get('title'):
-                t = get_title_from_dom(page)
-                if t:
-                    extracted['title'] = t
-
+                extracted['title'] = get_title_from_dom(page)
             if not extracted.get('image_1'):
-                imgs = get_images_from_dom(page)
-                extracted.update(imgs)
-
+                extracted.update(get_images_from_dom(page))
             if not extracted.get('description'):
-                desc = get_description_from_dom(page)
-                if desc:
-                    extracted['description'] = desc
-
-            # Price from JS if not in API
+                d = get_description_from_dom(page)
+                if d:
+                    extracted['description'] = d
             if not extracted.get('price'):
                 try:
                     for script in page.locator('script').all():
                         txt = script.text_content() or ''
-                        m = re.search(r'"price"\s*:\s*"([^"]+)"', txt)
+                        m   = re.search(r'"price"\s*:\s*"([^"]+)"', txt)
                         if m:
                             extracted['price'] = m.group(1)
                             break
@@ -438,24 +471,24 @@ def get_product_info(url: str) -> dict | None:
 
             browser.close()
 
-        # ── Validate ─────────────────────────────────────────────────────────
         if not extracted.get('title'):
             print('[scraper] ❌ No title — aborting')
             return None
 
-        # ── Summary ───────────────────────────────────────────────────────────
+        # Summary
         core = ['brand', 'color', 'dimensions', 'weight', 'material',
                 'certifications', 'country_of_origin', 'warranty', 'product_type']
-        extra = ['capacity', 'freezer_capacity', 'voltage', 'model_number',
-                 'battery', 'display', 'os']
-        print(f'\n[scraper] ✅ Extraction complete')
-        print(f'[scraper]    Title     : {extracted.get("title", "")[:70]}')
-        print(f'[scraper]    Desc      : {len(extracted.get("description", ""))} chars')
-        print(f'[scraper]    Core specs: {[k for k in core if extracted.get(k)]}')
-        print(f'[scraper]    Extra     : {[k for k in extra if extracted.get(k)]}')
-        print(f'[scraper]    Images    : {sum(1 for i in range(1,21) if extracted.get(f"image_{i}"))}')
+        seller_fields = ['store_name', 'store_id', 'seller_positive_rate',
+                         'seller_rating', 'seller_country', 'store_open_date']
 
-        # ── Apply defaults ────────────────────────────────────────────────────
+        print(f'\n[scraper] ✅ Extraction complete')
+        print(f'[scraper]    Title      : {extracted.get("title", "")[:70]}')
+        print(f'[scraper]    Desc       : {len(extracted.get("description", ""))} chars')
+        print(f'[scraper]    Core specs : {[k for k in core if extracted.get(k)]}')
+        print(f'[scraper]    Seller     : {[k for k in seller_fields if extracted.get(k)]}')
+        print(f'[scraper]    Images     : {sum(1 for i in range(1,21) if extracted.get(f"image_{i}"))}')
+
+        # Apply defaults
         defaults = {
             'description': '', 'brand': '', 'color': '', 'dimensions': '',
             'weight': '', 'material': '', 'certifications': '',
@@ -467,6 +500,13 @@ def get_product_info(url: str) -> dict | None:
             'model_number': '', 'power_source': '', 'installation': '',
             'battery': '', 'display': '', 'camera': '',
             'connectivity': '', 'memory': '', 'os': '',
+            # Seller defaults
+            'store_name': '', 'store_id': '', 'store_url': '',
+            'seller_id': '', 'seller_positive_rate': '', 'seller_rating': '',
+            'seller_communication': '', 'seller_shipping_speed': '',
+            'seller_country': '', 'store_open_date': '', 'seller_level': '',
+            'seller_total_reviews': '', 'seller_positive_num': '',
+            'is_top_rated': '',
         }
         for key, default in defaults.items():
             if key not in extracted or not extracted[key]:
@@ -484,20 +524,14 @@ def get_product_info(url: str) -> dict | None:
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STANDALONE TEST
-# ─────────────────────────────────────────────────────────────────────────────
-
 if __name__ == '__main__':
-    test_url = 'https://www.aliexpress.com/item/1005010716013669.html'
-    result = get_product_info(test_url)
+    test_url = 'https://www.aliexpress.com/item/1005010388288135.html'
+    result   = get_product_info(test_url)
     if result:
         print('\n' + '='*80)
-        print('=== RESULT ===')
         for k, v in result.items():
             if v and not k.startswith('image_'):
-                print(f'  {k:25s}: {str(v)[:100]}')
-        imgs = sum(1 for i in range(1, 21) if result.get(f'image_{i}'))
-        print(f'  {"images":25s}: {imgs}')
+                print(f'  {k:30s}: {str(v)[:100]}')
+        print(f'  {"images":30s}: {sum(1 for i in range(1,21) if result.get(f"image_{i}"))}')
     else:
         print('FAILED')
