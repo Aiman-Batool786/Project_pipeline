@@ -3,56 +3,40 @@ scraper.py
 ──────────
 Playwright-based scraper for AliExpress product pages.
 
-Extracts:
-  • title (meta og:title)
-  • price + shipping (JavaScript)
-  • description (multiple fallback selectors)
-  • specifications (nav-specification section) — comprehensive label mapping
-  • images (imagePathList JSON → og:image fallback)
+ROOT CAUSE FIX:
+  The spec section (id="nav-specification") is far down the page and only
+  renders after the viewport reaches it. The old code scrolled to 3000px
+  which was not enough. The fix is to:
+    1. Scroll incrementally to the bottom
+    2. Use page.evaluate() to scroll the spec section into view
+    3. Wait for spec items to be visible before extracting
 
-SPEC_MAPPING_RULES covers real AliExpress label names (lowercase substring match).
-Extra fields (model_number, voltage, capacity, etc.) are also captured and
-stored so data_mapper.py can route them to the correct template columns.
+HTML structure confirmed from real page:
+  <div id="nav-specification">
+    <ul class="specification--list--...">
+      <li class="specification--line--...">
+        <div class="specification--prop--...">         ← each spec item
+          <div class="specification--title--..."><span>Brand Name</span></div>
+          <div class="specification--desc--..." title="XMSJ"><span>XMSJ</span></div>
+        </div>
+        <div class="specification--prop--...">         ← two per line
+          ...
+        </div>
+      </li>
+    </ul>
+  </div>
 """
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 import re
 import json
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SPECIFICATION MAPPING RULES
-# key   = your internal field name
-# value = list of lowercase substrings to match against AliExpress spec labels
-#
-# REAL AliExpress labels seen in the wild (all lowercased):
-#   "brand name", "brand"
-#   "origin", "place of origin", "country of origin", "country"
-#   "dimensions (l x w x h (inches)", "dimensions", "size", "taille"
-#   "material", "matière", "materials"
-#   "energy efficiency rating", "energy consumption grade"
-#   "certification", "certifications", "normes", "standards"
-#   "warranty", "garantie", "guarantee"
-#   "refrigeration type", "product type", "type", "type de produit"
-#   "color", "colour", "main color", "couleur"
-#   "height", "width"                    ← used to build dimensions if no direct match
-#   "weight", "net weight", "poids"
-#   "voltage"
-#   "capacity", "freezer capacity", "fridge capacity"
-#   "model number", "model", "numéro de modèle"
-#   "feature", "features"               ← mapped to bullet_points
-#   "application"                       ← mapped to product_type
-#   "age from", "recommended age from"
-#   "age to",   "recommended age to"
-#   "gender", "suitable for", "sexe"
-#   "defrost type", "cooling method"    ← mapped to product_type (extra detail)
-#   "power source"                      ← stored in product_type extras
-#   "installation"                      ← stored as extra
-#   "packaging types"                   ← ignored (not useful)
 # ─────────────────────────────────────────────────────────────────────────────
 
 SPEC_MAPPING_RULES = {
-    # ── Core spec fields (map to template columns) ────────────────────────────
     'brand': [
         'brand name', 'brand', 'marque', 'manufacturer brand'
     ],
@@ -60,9 +44,7 @@ SPEC_MAPPING_RULES = {
         'main color', 'color', 'colour', 'couleur', 'item color'
     ],
     'dimensions': [
-        'dimensions (l x w x h',    # AliExpress fridge format
-        'dimensions (l x w x h (cm',
-        'dimensions (l x w x h (inches',
+        'dimensions (l x w x h',
         'dimensions (cm)',
         'dimensions',
         'size',
@@ -70,6 +52,7 @@ SPEC_MAPPING_RULES = {
         'product size',
         'item size',
         'package size',
+        'product dimensions',
     ],
     'weight': [
         'net weight',
@@ -93,13 +76,13 @@ SPEC_MAPPING_RULES = {
         'certifications',
         'normes',
         'standards',
-        'energy efficiency rating',  # AliExpress appliance field
-        'energy consumption grade',  # AliExpress appliance field
+        'energy efficiency rating',
+        'energy consumption grade',
         'energy rating',
         'energy class',
     ],
     'country_of_origin': [
-        'place of origin',           # AliExpress common label
+        'place of origin',
         'country of origin',
         'origin',
         'country',
@@ -114,94 +97,46 @@ SPEC_MAPPING_RULES = {
         'warranty period',
     ],
     'product_type': [
-        'refrigeration type',        # AliExpress appliance
-        'cooling method',            # AliExpress appliance
-        'defrost type',              # AliExpress appliance
+        'refrigeration type',
+        'cooling method',
+        'defrost type',
         'product type',
         'type de produit',
         'product category',
         'item type',
         'type',
-        'application',               # AliExpress appliance (Hotel, Household…)
+        'application',
         'use',
+        'design',
+        'operation system',
+        'os',
     ],
+    'age_from': ['age from', 'recommended age from', 'age (from)', 'minimum age'],
+    'age_to':   ['age to',   'recommended age to',   'age (to)',   'maximum age'],
+    'gender':   ['gender', 'suitable for', 'sexe', 'for whom'],
 
-    # ── Extra fields stored for enrichment / mapping ──────────────────────────
-    'age_from': [
-        'age from',
-        'recommended age from',
-        'age (from)',
-        'minimum age',
-    ],
-    'age_to': [
-        'age to',
-        'recommended age to',
-        'age (to)',
-        'maximum age',
-    ],
-    'gender': [
-        'gender',
-        'suitable for',
-        'sexe',
-        'for whom',
-    ],
+    # Extra fields
+    'capacity':         ['capacity', 'fridge capacity', 'net capacity', 'total capacity', 'volume'],
+    'freezer_capacity': ['freezer capacity'],
+    'voltage':          ['voltage', 'rated voltage', 'operating voltage'],
+    'model_number':     ['model number', 'model no', 'model', 'item model', 'numéro de modèle'],
+    'power_source':     ['power source', 'power supply'],
+    'installation':     ['installation', 'mounting type'],
+    'style':            ['style'],
+    'features':         ['feature', 'features', 'key features', 'highlights'],
 
-    # ── Extra appliance / electronics fields (stored, mapper can use them) ────
-    'capacity': [
-        'capacity',
-        'fridge capacity',
-        'net capacity',
-        'total capacity',
-        'volume',
-    ],
-    'freezer_capacity': [
-        'freezer capacity',
-    ],
-    'voltage': [
-        'voltage',
-        'rated voltage',
-        'operating voltage',
-    ],
-    'model_number': [
-        'model number',
-        'model no',
-        'model',
-        'item model',
-        'numéro de modèle',
-    ],
-    'power_source': [
-        'power source',
-        'power supply',
-    ],
-    'installation': [
-        'installation',
-        'mounting type',
-    ],
-    'style': [
-        'style',
-    ],
-    'features': [
-        'feature',
-        'features',
-        'key features',
-        'highlights',
-    ],
+    # Phone-specific
+    'battery':          ['battery capacity', 'battery capacity(mah)', 'battery capacity range'],
+    'display':          ['display size', 'screen size', 'display resolution', 'screen material', 'screen type'],
+    'camera':           ['rear camera pixel', 'front camera pixel', 'camera'],
+    'connectivity':     ['cellular', 'wifi', 'nfc', 'bluetooth'],
+    'memory':           ['storage', 'memory', 'rom', 'ram'],
+    'os':               ['operation system', 'os', 'android version'],
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPER: try to build a combined dimensions string from H/W/D labels
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _build_dimensions_from_hwl(specs: dict) -> str:
-    """
-    If no direct 'dimensions' key was found, try to combine
-    Height + Width + Depth/Length into one string.
-    """
-    height = ""
-    width  = ""
-    depth  = ""
-
+    height = width = depth = ""
     for key, val in specs.items():
         k = key.lower()
         if 'height' in k and not height:
@@ -210,11 +145,57 @@ def _build_dimensions_from_hwl(specs: dict) -> str:
             width = val
         elif ('depth' in k or 'length' in k) and not depth:
             depth = val
-
     parts = [v for v in [height, width, depth] if v]
-    if len(parts) >= 2:
-        return " x ".join(parts)
-    return ""
+    return " x ".join(parts) if len(parts) >= 2 else ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE FIX: scroll spec section into view and wait for it
+# ─────────────────────────────────────────────────────────────────────────────
+
+def scroll_to_specifications(page) -> bool:
+    """
+    Scroll the page so the #nav-specification section enters the viewport
+    and its contents are rendered.
+    Returns True if the section was found and scrolled to.
+    """
+    print("[scraper]    📜 Scrolling to specification section...")
+
+    # Step 1: Incremental scroll to bottom to trigger lazy-load
+    for scroll_y in [1000, 2000, 3000, 4000, 5000, 6000, 8000, 10000]:
+        page.mouse.wheel(0, scroll_y)
+        page.wait_for_timeout(300)
+
+    page.wait_for_timeout(1500)
+
+    # Step 2: Use JS to scroll #nav-specification into view
+    try:
+        page.evaluate("""
+            const el = document.getElementById('nav-specification');
+            if (el) {
+                el.scrollIntoView({ behavior: 'instant', block: 'start' });
+            }
+        """)
+        page.wait_for_timeout(2000)
+        print("[scraper]    ✅ Scrolled to #nav-specification")
+    except Exception as e:
+        print(f"[scraper]    ⚠️  JS scroll failed: {e}")
+
+    # Step 3: Wait for spec items to appear (up to 8 seconds)
+    try:
+        page.wait_for_selector(
+            '#nav-specification [class*="specification--prop"]',
+            timeout=8000,
+            state="visible"
+        )
+        print("[scraper]    ✅ Spec items are visible")
+        return True
+    except PWTimeout:
+        print("[scraper]    ⚠️  Spec items did not appear within timeout")
+        return False
+    except Exception as e:
+        print(f"[scraper]    ⚠️  Waiting for specs failed: {e}")
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,38 +210,42 @@ def extract_specifications(page) -> dict:
     specs = {}
     print("[scraper] 📋 Extracting specifications...")
 
+    # First scroll to the section
+    scroll_to_specifications(page)
+
+    # Primary selector — confirmed from real HTML
     try:
         items = page.locator(
-            '[id*="nav-specification"] [class*="specification--prop"]'
+            '#nav-specification [class*="specification--prop"]'
         ).all()
 
         if not items:
-            # Fallback: try alternate selectors
-            items = page.locator('[class*="specification-item"]').all()
+            # Fallback without id scope
+            items = page.locator('[class*="specification--prop"]').all()
 
-        if items:
-            print(f"[scraper]    Found {len(items)} specification items")
+        print(f"[scraper]    Found {len(items)} specification items")
 
         for item in items:
             try:
-                # Primary selectors
+                # Title: <div class="specification--title--..."><span>Label</span></div>
                 title_el = item.locator('[class*="specification--title"] span').first
-                desc_el  = item.locator('[class*="specification--desc"] span').first
-
                 title = title_el.inner_text().strip() if title_el.count() > 0 else ""
-                desc  = desc_el.inner_text().strip()  if desc_el.count() > 0  else ""
 
-                # Fallback selectors if primary failed
-                if not title:
-                    title_el = item.locator('dt, .title, .key').first
-                    title = title_el.inner_text().strip() if title_el.count() > 0 else ""
-                if not desc:
-                    desc_el = item.locator('dd, .value, .val').first
-                    desc = desc_el.inner_text().strip() if desc_el.count() > 0 else ""
+                # Desc: <div class="specification--desc--..." title="Value"><span>Value</span></div>
+                # Try span text first, fall back to title attribute
+                desc_el = item.locator('[class*="specification--desc"]').first
+                if desc_el.count() > 0:
+                    # Prefer title attribute (more reliable, no formatting)
+                    desc = desc_el.get_attribute('title') or ""
+                    if not desc:
+                        span = desc_el.locator('span').first
+                        desc = span.inner_text().strip() if span.count() > 0 else ""
+                else:
+                    desc = ""
 
                 if title and desc:
-                    specs[title.lower()] = desc
-                    print(f"[scraper]      {title}: {desc[:70]}")
+                    specs[title.lower()] = desc.strip()
+                    print(f"[scraper]      ✓ {title}: {desc[:70]}")
 
             except Exception:
                 pass
@@ -268,7 +253,7 @@ def extract_specifications(page) -> dict:
         if specs:
             print(f"[scraper]    ✅ {len(specs)} raw specifications extracted")
         else:
-            print("[scraper]    ⚠️  No specifications found in nav-specification")
+            print("[scraper]    ⚠️  No specifications found")
 
     except Exception as e:
         print(f"[scraper]    ⚠️  Spec extraction error: {e}")
@@ -277,12 +262,7 @@ def extract_specifications(page) -> dict:
 
 
 def map_specifications_to_fields(specs: dict) -> dict:
-    """
-    Map raw spec dict (lowercase keys) → template field names.
-
-    Uses substring matching so minor label variations are handled.
-    Multiple spec labels can populate the same field (first match wins).
-    """
+    """Map raw spec labels → internal field names."""
     if not specs:
         return {}
 
@@ -293,111 +273,89 @@ def map_specifications_to_fields(specs: dict) -> dict:
             if any(kw in spec_key for kw in keywords):
                 if field_name not in mapped and spec_value.strip():
                     mapped[field_name] = spec_value.strip()
-                    break   # first match wins for this field
+                    break
 
-    # ── Special: build dimensions from H/W if not directly matched ────────────
+    # Build dimensions from H/W if not directly matched
     if not mapped.get('dimensions'):
         combined = _build_dimensions_from_hwl(specs)
         if combined:
             mapped['dimensions'] = combined
-            print(f"[scraper]    📐 Dimensions built from H/W/D: {combined}")
+            print(f"[scraper]    📐 Dimensions built from H/W: {combined}")
 
-    # ── Special: append capacity to dimensions string if dimensions exist ─────
+    # Append capacity to dimensions
     capacity = mapped.get('capacity', '')
-    if capacity and mapped.get('dimensions'):
-        mapped['dimensions'] = f"{mapped['dimensions']} | Capacity: {capacity}"
-    elif capacity:
-        mapped['dimensions'] = f"Capacity: {capacity}"
+    if capacity:
+        if mapped.get('dimensions'):
+            mapped['dimensions'] = f"{mapped['dimensions']} | Capacity: {capacity}"
+        else:
+            mapped['dimensions'] = f"Capacity: {capacity}"
 
-    # ── Special: merge features into bullet_points ────────────────────────────
+    # Merge features into bullet_points
     features = mapped.pop('features', '')
     if features:
-        existing_bullets = mapped.get('bullet_points', [])
-        if isinstance(existing_bullets, list):
-            existing_bullets.append(features)
+        bullets = mapped.get('bullet_points', [])
+        if isinstance(bullets, list):
+            bullets.append(features)
         else:
-            existing_bullets = [existing_bullets, features]
-        mapped['bullet_points'] = existing_bullets
+            bullets = [bullets, features]
+        mapped['bullet_points'] = bullets
 
-    print(f"[scraper]    ✅ {len(mapped)} fields mapped from specifications")
+    print(f"[scraper]    ✅ {len(mapped)} fields mapped from specifications:")
     for k, v in mapped.items():
-        val_preview = str(v)[:60] + "…" if len(str(v)) > 60 else str(v)
-        print(f"[scraper]       {k}: {val_preview}")
+        print(f"[scraper]       {k}: {str(v)[:70]}")
 
     return mapped
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DESCRIPTION EXTRACTION  (multiple fallback selectors)
+# DESCRIPTION EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_description_correct(page) -> str:
     """Try several selectors in order; return the first useful result."""
     print("[scraper] 📝 Extracting description...")
 
-    # 1. richTextContainer
+    # Scroll to description section
     try:
-        el = page.locator('div.richTextContainer[data-rich-text-render="true"]')
-        if el.count() > 0:
-            text = el.first.inner_text().strip()
-            if len(text) > 50:
-                print(f"[scraper]    ✅ richTextContainer ({len(text)} chars)")
-                return text
+        page.evaluate("""
+            const el = document.getElementById('nav-description');
+            if (el) el.scrollIntoView({ behavior: 'instant', block: 'start' });
+        """)
+        page.wait_for_timeout(1500)
     except Exception:
         pass
 
-    # 2. product-description
-    try:
-        el = page.locator('div[id="product-description"]')
-        if el.count() > 0:
-            text = el.first.inner_text().strip()
-            if len(text) > 50:
-                print(f"[scraper]    ✅ product-description ({len(text)} chars)")
-                return text
-    except Exception:
-        pass
+    selectors = [
+        ('richTextContainer',          'div.richTextContainer[data-rich-text-render="true"]'),
+        ('product-description',        'div[id="product-description"]'),
+        ('nav-description',            'div[id="nav-description"]'),
+        ('detailmodule_text',          'div.detailmodule_text'),
+        ('detail-desc-decorate-content','p.detail-desc-decorate-content'),
+    ]
 
-    # 3. nav-description
-    try:
-        el = page.locator('div[id="nav-description"]')
-        if el.count() > 0:
-            text = el.first.inner_text().strip()
-            text = re.sub(r'^.*?Description\s+report\s+', '', text,
-                          flags=re.IGNORECASE | re.DOTALL)
-            if len(text) > 50 and "Smarter Shopping" not in text:
-                print(f"[scraper]    ✅ nav-description ({len(text)} chars)")
-                return text
-    except Exception:
-        pass
-
-    # 4. detailmodule_text
-    try:
-        modules = page.locator('div.detailmodule_text')
-        for i in range(modules.count()):
-            try:
-                text = modules.nth(i).inner_text().strip()
-                if len(text) > 50:
-                    print(f"[scraper]    ✅ detailmodule_text ({len(text)} chars)")
+    for name, selector in selectors:
+        try:
+            el = page.locator(selector)
+            if el.count() > 0:
+                text = el.first.inner_text().strip()
+                # Clean up common noise
+                text = re.sub(r'^.*?Description\s+report\s+', '', text,
+                              flags=re.IGNORECASE | re.DOTALL)
+                if len(text) > 50 and "Smarter Shopping" not in text:
+                    print(f"[scraper]    ✅ Description via {name} ({len(text)} chars)")
                     return text
-            except Exception:
-                pass
-    except Exception:
-        pass
+        except Exception:
+            pass
 
-    # 5. detail-desc-decorate-content paragraphs
+    # Paragraph fallback
     try:
         paras = page.locator('p.detail-desc-decorate-content')
-        parts = []
-        for i in range(paras.count()):
-            try:
-                t = paras.nth(i).inner_text().strip()
-                if t:
-                    parts.append(t)
-            except Exception:
-                pass
+        parts = [paras.nth(i).inner_text().strip()
+                 for i in range(paras.count())
+                 if paras.nth(i).inner_text().strip()]
         if parts:
             text = " | ".join(parts)
-            print(f"[scraper]    ✅ detail-desc-decorate-content ({len(text)} chars)")
+            print(f"[scraper]    ✅ Description via paragraphs ({len(text)} chars)")
             return text
     except Exception:
         pass
@@ -411,11 +369,9 @@ def extract_description_correct(page) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_all_images(page) -> dict:
-    """Extract up to 20 product images from JS or meta fallback."""
     images = {}
     print("[scraper] 🖼️  Extracting images...")
 
-    # Primary: imagePathList in page scripts
     try:
         for script in page.locator("script").all():
             try:
@@ -433,12 +389,11 @@ def extract_all_images(page) -> dict:
     except Exception:
         pass
 
-    # Fallback: og:image meta tag
     try:
         og = page.locator('meta[property="og:image"]').get_attribute('content')
         if og:
             images['image_1'] = og
-            print("[scraper]    ✅ 1 image from og:image meta tag")
+            print("[scraper]    ✅ 1 image from og:image")
     except Exception:
         pass
 
@@ -480,33 +435,15 @@ def extract_from_javascript(page) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DOM EXTRACTION  (scroll + specs + description + images)
+# DOM EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_from_dom(page) -> dict:
     data = {}
 
-    # Scroll down to trigger lazy-loaded specification section
-    page.mouse.wheel(0, 3000)
-    page.wait_for_timeout(2000)
-
-    # Click the "Specifications" tab if present (some AliExpress layouts)
-    try:
-        spec_tab = page.locator('a[href*="nav-specification"], [data-tab="nav-specification"]').first
-        if spec_tab.count() > 0:
-            spec_tab.click()
-            page.wait_for_timeout(1500)
-            print("[scraper]    📌 Clicked Specifications tab")
-    except Exception:
-        pass
-
-    # Extract specifications
+    # Extract specs (includes scroll logic)
     raw_specs = extract_specifications(page)
-    spec_fields = map_specifications_to_fields(raw_specs)
-    data.update(spec_fields)
-
-    # Store raw specs as well for debugging
-    data['_raw_specs'] = raw_specs
+    data.update(map_specifications_to_fields(raw_specs))
 
     # Description
     desc = extract_description_correct(page)
@@ -524,10 +461,6 @@ def extract_from_dom(page) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_product_info(url: str) -> dict | None:
-    """
-    Launch headless Chromium, navigate to url, extract all product data.
-    Returns a flat dict or None on failure.
-    """
     try:
         with sync_playwright() as p:
 
@@ -536,7 +469,8 @@ def get_product_info(url: str) -> dict | None:
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
-                    "--disable-dev-shm-usage"
+                    "--disable-dev-shm-usage",
+                    "--disable-web-security",
                 ]
             )
 
@@ -546,9 +480,10 @@ def get_product_info(url: str) -> dict | None:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/120.0.0.0 Safari/537.36"
                 ),
-                viewport={"width": 1366, "height": 768},
+                viewport={"width": 1366, "height": 900},
                 locale="en-US",
-                timezone_id="Asia/Karachi"
+                timezone_id="Asia/Karachi",
+                java_script_enabled=True,
             )
 
             page = context.new_page()
@@ -556,10 +491,13 @@ def get_product_info(url: str) -> dict | None:
             print(f"\n[scraper] 🌐 Opening: {url}")
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
 
-            page.wait_for_timeout(3000)
-            page.mouse.move(200, 300)
-            page.mouse.wheel(0, 2000)
-            page.wait_for_timeout(2000)
+            # Wait for initial render
+            page.wait_for_timeout(4000)
+
+            # Human-like behaviour
+            page.mouse.move(400, 300)
+            page.mouse.wheel(0, 500)
+            page.wait_for_timeout(1000)
 
             print("[scraper] 🔍 Extracting data...")
 
@@ -569,61 +507,43 @@ def get_product_info(url: str) -> dict | None:
 
             browser.close()
 
-        # ── Validate ──────────────────────────────────────────────────────────
+        # Validate
         if not data.get('title'):
             print("[scraper] ❌ No title extracted — aborting")
             return None
 
-        # ── Summary ───────────────────────────────────────────────────────────
-        print(f"\n[scraper] ✅ Extraction complete")
-        print(f"[scraper]    Title      : {data.get('title', '')[:70]}")
-        print(f"[scraper]    Description: {len(data.get('description', ''))} chars")
-
+        # Summary
         core_spec_fields = [
             'brand', 'color', 'dimensions', 'weight', 'material',
             'certifications', 'country_of_origin', 'warranty', 'product_type'
         ]
         extra_spec_fields = [
             'capacity', 'freezer_capacity', 'voltage', 'model_number',
-            'power_source', 'installation', 'style'
+            'power_source', 'installation', 'battery', 'display',
+            'camera', 'connectivity', 'memory', 'os'
         ]
-
         filled_core  = [k for k in core_spec_fields  if data.get(k)]
         filled_extra = [k for k in extra_spec_fields if data.get(k)]
 
+        print(f"\n[scraper] ✅ Extraction complete")
+        print(f"[scraper]    Title      : {data.get('title', '')[:70]}")
+        print(f"[scraper]    Description: {len(data.get('description', ''))} chars")
         print(f"[scraper]    Core specs : {len(filled_core)} → {filled_core}")
         print(f"[scraper]    Extra specs: {len(filled_extra)} → {filled_extra}")
         print(f"[scraper]    Images     : {sum(1 for i in range(1, 21) if data.get(f'image_{i}'))}")
 
-        # ── Apply defaults ────────────────────────────────────────────────────
+        # Apply defaults
         defaults = {
-            'description': '',
-            'brand': '',
-            'color': '',
-            'dimensions': '',
-            'weight': '',
-            'material': '',
-            'certifications': '',
-            'country_of_origin': '',
-            'warranty': '',
-            'product_type': '',
-            'shipping': '',
-            'price': '',
-            'rating': '',
-            'reviews': '',
-            'bullet_points': [],
-            'age_from': '',
-            'age_to': '',
-            'gender': '',
-            'safety_warning': '',
-            # Extra appliance fields
-            'capacity': '',
-            'freezer_capacity': '',
-            'voltage': '',
-            'model_number': '',
-            'power_source': '',
-            'installation': '',
-            'style': '',
+            'description': '', 'brand': '', 'color': '', 'dimensions': '',
+            'weight': '', 'material': '', 'certifications': '',
+            'country_of_origin': '', 'warranty': '', 'product_type': '',
+            'shipping': '', 'price': '', 'rating': '', 'reviews': '',
+            'bullet_points': [], 'age_from': '', 'age_to': '',
+            'gender': '', 'safety_warning': '',
+            'capacity': '', 'freezer_capacity': '', 'voltage': '',
+            'model_number': '', 'power_source': '', 'installation': '',
+            'battery': '', 'display': '', 'camera': '',
+            'connectivity': '', 'memory': '', 'os': '',
         }
         for key, default in defaults.items():
             if key not in data or not data[key]:
@@ -631,9 +551,6 @@ def get_product_info(url: str) -> dict | None:
 
         for i in range(1, 21):
             data.setdefault(f'image_{i}', "")
-
-        # Remove internal debug key before returning
-        data.pop('_raw_specs', None)
 
         return data
 
