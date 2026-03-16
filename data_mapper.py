@@ -1,195 +1,213 @@
 """
-Data Mapper: Maps scraped product data to 71 Octopia template columns
-UPDATED: Includes all specification fields extracted from nav-specification
+data_mapper.py
+──────────────
+Maps scraped/enriched product data to Octopia template columns.
+
+IMPORTANT: the keys in TEMPLATE_MAPPING must match EXACTLY the cell values
+in ROW 5 of the .xlsm template (as read by TemplateFiller._build_field_map).
+Update these keys if your template uses different column headers.
 """
 
 import re
 import json
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TEMPLATE COLUMN MAPPING
+# Keys  = exact header text from ROW 5 of the .xlsm file
+# Values= key to look up in the enriched product data dict
+#         None  → field intentionally left blank
+# ─────────────────────────────────────────────────────────────────────────────
 TEMPLATE_MAPPING = {
-    # REQUIRED FIELDS
-    "gtin": None,
-    "sellerProductReference": None,
-    "title": "title",                          # Titre* ✅
-    "description": "description",              # Description* ✅
-    "sellerPictureUrls_1": "image_1",         # URL image 1* ✅
-    "gtinReference": None,
-    
-    # BRAND & MARKETING
-    "brand": "brand",                          # Marque ✅
-    "richMarketingDescription": "html_description",
-    
-    # ADDITIONAL IMAGES
-    "sellerPictureUrls_2": "image_2",
-    "sellerPictureUrls_3": "image_3",
-    "sellerPictureUrls_4": "image_4",
-    "sellerPictureUrls_5": "image_5",
-    "sellerPictureUrls_6": "image_6",
-    
-    # COLORS & PHYSICAL ATTRIBUTES (From Specifications)
-    "3264": "color",                           # Couleur principale ✅
-    "3263": "color",                           # Couleur(s) ✅
-    "24069": "dimensions",                     # Dimensions ✅
-    "24072": "weight",                         # Poids ✅
-    "24061": "material",                       # Matières ✅
-    
-    # CERTIFICATIONS & ORIGIN (From Specifications)
-    "6720": "certifications",                  # Certifications et normes ✅
-    "11429": "country_of_origin",             # Pays d'origine ✅
-    
-    # WARRANTY (From Specifications)
-    "37937": "warranty",                       # Garantie ✅
-    
-    # PRODUCT INFO (From Specifications)
-    "23346": "product_type",                   # Type de Produit ✅
-    
-    # BULLET POINTS & FEATURES
-    "24612": "bullet_points",                  # Fonction du produit ✅
-    
-    # PRICE & SHIPPING
-    "6587": "price",                           # Notes ✅
-    
-    # AGE INFORMATION (From Specifications)
-    "11335": "age_from",                       # Age (A partir de) ✅
-    "11338": "age_to",                         # Age (Jusqu'à) ✅
-    
-    # OPTIONAL FIELDS
-    "3485": None,
-    "11347": None,
-    "36517": None,
-    "11384": None,
-    "36519": None,
-    "36516": None,
-    "24097": None,
-    "24947": None,
-    "24077": None,
-    "3487": None,
-    "36520": None,
-    "26158": None,
-    "38412": None,
-    "28003": None,
-    "5403": None,
-    "26127": None,
-    "36497": None,
-    "34025": None,
-    "35581": None,
-    "45244": None,
-    "36522": None,
-    "31210": None,
-    "7426": None,
-    "38414": None,
-    "37045": None,
-    "38413": None,
-    "47288": None,
-    "47443": None,
-    "47444": None,
-    "47456": "brand",
-    "47457": None,
-    "47458": None,
-    "45465": "brand",
-    "26117": "description",
+
+    # ── REQUIRED ─────────────────────────────────────────────────────────────
+    "Titre*":               "title",
+    "Description*":         "description",
+    "URL image 1*":         "image_1",
+
+    # ── IDENTIFIERS ──────────────────────────────────────────────────────────
+    "GTIN":                 None,
+    "Référence vendeur":    None,
+    "Référence GTIN":       None,
+
+    # ── BRAND & RICH CONTENT ─────────────────────────────────────────────────
+    "Marque":               "brand",
+    "Description marketing riche": "html_description",
+
+    # ── ADDITIONAL IMAGES ────────────────────────────────────────────────────
+    "URL image 2":          "image_2",
+    "URL image 3":          "image_3",
+    "URL image 4":          "image_4",
+    "URL image 5":          "image_5",
+    "URL image 6":          "image_6",
+
+    # ── PHYSICAL / COLOUR ────────────────────────────────────────────────────
+    "Couleur principale":   "color",
+    "Couleur(s)":           "color",
+    "Dimensions":           "dimensions",
+    "Poids":                "weight",
+    "Matières":             "material",
+
+    # ── CERTIFICATIONS & ORIGIN ──────────────────────────────────────────────
+    "Certifications et normes": "certifications",
+    "Pays d'origine":           "country_of_origin",
+
+    # ── WARRANTY ─────────────────────────────────────────────────────────────
+    "Garantie (²)":         "warranty",
+
+    # ── PRODUCT TYPE ─────────────────────────────────────────────────────────
+    "Type de Produit":      "product_type",
+
+    # ── BULLET POINTS / FEATURES ─────────────────────────────────────────────
+    "Fonction du produit":  "bullet_points",
+
+    # ── PRICE / NOTES ────────────────────────────────────────────────────────
+    "Notes":                "price",
+
+    # ── AGE ──────────────────────────────────────────────────────────────────
+    "Age (A partir de)":    "age_from",
+    "Age (Jusqu'à)":        "age_to",
+
+    # ── MANUFACTURER ─────────────────────────────────────────────────────────
+    "Fabricant - Nom et raison sociale": "brand",
+
+    # ── OPTIONAL / UNMAPPED ──────────────────────────────────────────────────
+    "Sexe":                 None,
+    "Matière principale":   None,
+    "Composition":          None,
+    "Contenance":           None,
+    "Nombre de pièces":     None,
+    "Langue":               None,
+    "Thème":                None,
+    "Collection":           None,
+    "Sous-thème":           None,
+    "Style":                None,
+    "Format":               None,
+    "Type de fermeture":    None,
+    "Longueur des manches": None,
+    "Type de col":          None,
+    "Coupe":                None,
+    "Motif":                None,
+    "Saison":               None,
 }
 
 
-def strip_html(text):
-    """Remove HTML tags from text"""
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def strip_html(text: str) -> str:
+    """Remove HTML tags and collapse whitespace."""
     if not text:
         return ""
-    clean = re.compile('<.*?>')
-    text = re.sub(clean, '', text)
-    text = ' '.join(text.split())
-    return text
+    text = re.sub(r'<[^>]+>', '', text)
+    return ' '.join(text.split())
 
 
-def map_scraped_data_to_template(scraped_data):
+def _format_bullet_points(raw) -> str:
+    """Convert a list (or pipe-delimited string) of bullets to a single string."""
+    if isinstance(raw, list):
+        return " | ".join(str(b).strip() for b in raw if b)
+    if isinstance(raw, str):
+        return raw.strip()
+    return ""
+
+
+def _format_price_notes(scraped_data: dict) -> str:
+    """Combine price + shipping into a notes string."""
+    price    = scraped_data.get("price", "")
+    shipping = scraped_data.get("shipping", "")
+    parts = []
+    if price:
+        parts.append(f"Price: {price}")
+    if shipping:
+        parts.append(f"Shipping: {shipping}")
+    return " | ".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN MAPPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def map_scraped_data_to_template(scraped_data: dict) -> dict:
     """
-    Maps scraped product data to 71 Octopia template columns
-    
-    Uses ROW 5 technical field names
-    Includes specifications from nav-specification section
+    Maps product data dict → {template_column_header: value}.
+
+    The returned dict is passed directly to TemplateFiller.fill_product_data(),
+    which looks up each key against ROW 5 of the .xlsm file.
     """
-    
+    print("[mapper] 🔄 Mapping product data to template columns...")
     mapped = {}
-    
-    print("[mapper] 🔄 Mapping scraped data to template...")
-    
-    for field_key, mapping_key in TEMPLATE_MAPPING.items():
-        value = ""
-        
-        if mapping_key is None:
+
+    for col_header, data_key in TEMPLATE_MAPPING.items():
+
+        if data_key is None:
             continue
-        
-        elif mapping_key == "bullet_points":
-            bullet_list = scraped_data.get("bullet_points", [])
-            if isinstance(bullet_list, list) and bullet_list:
-                value = " | ".join(str(b).strip() for b in bullet_list if b)
-        
-        elif mapping_key == "price":
-            price = scraped_data.get("price", "")
-            shipping = scraped_data.get("shipping", "")
-            if price or shipping:
-                value = f"Price: {price} | Shipping: {shipping}".strip()
-        
-        elif mapping_key == "html_description":
+
+        # ── Special cases ──────────────────────────────────────────────────
+
+        if data_key == "bullet_points":
+            value = _format_bullet_points(scraped_data.get("bullet_points", []))
+
+        elif data_key == "price":
+            value = _format_price_notes(scraped_data)
+
+        elif data_key == "html_description":
             value = scraped_data.get("html_description", "")
-        
+
         else:
-            raw_value = scraped_data.get(mapping_key, "")
-            if raw_value is None or raw_value == "":
+            raw = scraped_data.get(data_key, "")
+            if raw is None:
                 continue
-            value = raw_value
-        
-        # FIELD-SPECIFIC FORMATTING
-        if mapping_key == "title" and value:
+            value = raw
+
+        # ── Field-level formatting ─────────────────────────────────────────
+
+        if data_key == "title" and value:
             value = str(value)[:132]
-        
-        elif mapping_key == "description" and value and mapping_key != "html_description":
-            value = strip_html(str(value))
-            value = value[:2000]
-        
-        elif mapping_key and "image" in mapping_key:
-            if value and not str(value).startswith(("http://", "https://", "//")):
+
+        elif data_key == "description" and value and data_key != "html_description":
+            value = strip_html(str(value))[:2000]
+
+        elif "image" in data_key and value:
+            # Keep only valid absolute URLs
+            if not str(value).startswith(("http://", "https://", "//")):
                 continue
-        
+
+        # ── Store ─────────────────────────────────────────────────────────
         if value:
-            mapped[field_key] = value
-    
-    print(f"[mapper] ✅ Mapped {len(mapped)} fields to template")
+            mapped[col_header] = str(value) if not isinstance(value, str) else value
+
+    print(f"[mapper] ✅ {len(mapped)} template columns populated")
     return mapped
 
 
-def validate_mapped_data(mapped_data):
-    """Validates that required fields are filled"""
-    
-    required_fields = [
-        "title",
-        "description",
-        "sellerPictureUrls_1",
-    ]
-    
-    missing = []
-    
-    for field in required_fields:
-        value = str(mapped_data.get(field, "")).strip()
-        if not value:
-            missing.append(field)
-    
-    is_valid = len(missing) == 0
-    
-    if is_valid:
-        print("[mapper] ✅ All required fields present")
+# ─────────────────────────────────────────────────────────────────────────────
+# VALIDATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_mapped_data(mapped_data: dict):
+    """Check that required template columns are populated."""
+    required = ["Titre*", "Description*", "URL image 1*"]
+    missing  = [f for f in required if not str(mapped_data.get(f, "")).strip()]
+
+    if missing:
+        print(f"[mapper] ⚠️  Missing required fields: {missing}")
     else:
-        print(f"[mapper] ⚠️  Missing: {missing}")
-    
-    return is_valid, missing
+        print("[mapper] ✅ All required fields present")
+
+    return len(missing) == 0, missing
 
 
-def create_template_row(mapped_data, product_id, category_id, category_name):
-    """Creates a complete row for the template"""
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_template_row(mapped_data: dict, product_id, category_id, category_name) -> dict:
+    """Attach metadata to a mapped row (convenience helper)."""
     row = {
-        "product_id": product_id,
-        "category_id": category_id,
+        "product_id":    product_id,
+        "category_id":   category_id,
         "category_name": category_name,
     }
     row.update(mapped_data)
