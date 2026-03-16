@@ -1,101 +1,72 @@
 name: CI/CD Pipeline
-
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
+        uses: actions/checkout@v4   # Updated to latest
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
       - name: Run tests
         run: |
-          echo "No tests yet"
-
+          echo "No tests yet"   # ← Add real tests later (pytest, etc.)
   deploy:
     runs-on: ubuntu-latest
-    needs: build-and-test
-    if: github.ref == 'refs/heads/main'
-
+    needs: build-and-test   # Only deploy if build succeeds
+    if: github.ref == 'refs/heads/main'   # Only deploy on push to main (not PR)
     steps:
       - name: Deploy to VM via SSH
-        uses: appleboy/ssh-action@v1.0.3
+        uses: appleboy/ssh-action@v1.0.3   # Safe & stable version (or try v1.2.5 if you want newest)
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_KEY }}
           port: 22
           script: |
-            set -e
-
-            # ────────────────────────────────────────────────
+            set -e  # Exit on any error
             # Navigate to project directory
-            # ────────────────────────────────────────────────
             cd /home/aimanbatool114/Project_pipeline || { echo "Project directory not found!"; exit 1; }
-
-            # ────────────────────────────────────────────────
-            # Force sync with GitHub — discard any local changes
-            # This permanently fixes "local changes would be overwritten" errors
-            # ────────────────────────────────────────────────
-            git fetch origin main || { echo "Git fetch failed"; exit 1; }
-            git reset --hard origin/main || { echo "Git reset failed"; exit 1; }
-            git clean -fd
-            echo "✅ Code synced with GitHub"
-
-            # ────────────────────────────────────────────────
+            # Pull latest code
+            git pull origin main || { echo "Git pull failed"; exit 1; }
             # Activate virtual environment
-            # ────────────────────────────────────────────────
             source venv/bin/activate || { echo "Failed to activate virtualenv"; exit 1; }
-
-            # ────────────────────────────────────────────────
-            # Update dependencies
-            # ────────────────────────────────────────────────
+            # Update pip and install dependencies
             pip install --upgrade pip
             pip install -r requirements.txt || { echo "Failed to install dependencies"; exit 1; }
-
-            # ────────────────────────────────────────────────
             # Set secrets as environment variables
-            # ────────────────────────────────────────────────
             export OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}"
             echo "${{ secrets.GCP_SA_KEY }}" > gcp-service-account.json
             export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/gcp-service-account.json"
-
             # ────────────────────────────────────────────────
-            # Stop old uvicorn using PID file
+            # Stop old process using PID file (reliable method)
             # ────────────────────────────────────────────────
             PID_FILE="/home/aimanbatool114/Project_pipeline/uvicorn.pid"
-
             if [ -f "$PID_FILE" ]; then
               OLD_PID=$(cat "$PID_FILE")
               if kill -0 "$OLD_PID" 2>/dev/null; then
-                echo "Stopping old uvicorn (PID $OLD_PID)..."
+                echo "Gracefully stopping old uvicorn (PID $OLD_PID)..."
                 kill "$OLD_PID" || echo "Could not kill old PID (already gone?)"
-                sleep 4
+                sleep 4  # Give more time for clean shutdown
               else
                 echo "Old PID $OLD_PID not running anymore"
               fi
               rm -f "$PID_FILE"
             else
-              echo "No PID file found — first deploy or already stopped"
+              echo "No PID file found — assuming first deploy or already stopped"
             fi
-
             # ────────────────────────────────────────────────
-            # Start FastAPI server
+            # Start the FastAPI server and save new PID
             # ────────────────────────────────────────────────
             nohup /home/aimanbatool114/Project_pipeline/venv/bin/python -m uvicorn main:app \
               --host 0.0.0.0 \
@@ -103,10 +74,8 @@ jobs:
               --log-level info \
               --access-log \
               > uvicorn.log 2>&1 &
-
             NEW_PID=$!
             echo "$NEW_PID" > "$PID_FILE"
             disown
-
-            echo "✅ Deployment complete. PID $NEW_PID"
-            echo "Logs: tail -f /home/aimanbatool114/Project_pipeline/uvicorn.log"
+            echo "Deployment complete. New uvicorn started with PID $NEW_PID"
+            echo "Check all logs (requests + info + errors): tail -f uvicorn.log"
