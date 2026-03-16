@@ -1,11 +1,41 @@
 """
 data_mapper.py
 ──────────────
-Maps scraped/enriched product data to Octopia template columns.
+Maps enriched product data to Octopia template columns.
 
-IMPORTANT: the keys in TEMPLATE_MAPPING must match EXACTLY the cell values
-in ROW 5 of the .xlsm template (as read by TemplateFiller._build_field_map).
-Update these keys if your template uses different column headers.
+IMPORTANT: Keys in TEMPLATE_MAPPING must match EXACTLY the cell values
+in ROW 5 of the .xlsm file (as read by TemplateFiller._build_field_map).
+
+Confirmed from actual template scan:
+  Col 1  → gtin
+  Col 2  → sellerProductReference
+  Col 3  → title
+  Col 4  → description
+  Col 5  → sellerPictureUrls_1
+  Col 7  → gtinReference
+  Col 8  → brand
+  Col 9  → richMarketingDescription
+  Col 10 → sellerPictureUrls_2  ... Col 14 → sellerPictureUrls_6
+  Col 21 → 24612  (bullet points / product function)
+  Col 23 → 11335  (age from)
+  Col 25 → 24077  (gender)
+  Col 26 → 3264   (color)
+  Col 38 → 37938  (warranty duration)
+  Col 39 → 38412  (certifications)
+  Col 40 → 11338  (age to)
+  Col 44 → 24069  (dimensions L x l x H)
+  Col 45 → 5403   (net weight)
+  Col 47 → 24061  (materials)
+  Col 49 → 6720   (certifications 2)
+  Col 50 → 37937  (warranty years)
+  Col 57 → 23346  (product type)
+  Col 58 → 45465  (brand manufacturer)
+  Col 59 → 26117  (secondary description)
+  Col 60 → 24072  (weight kg)
+  Col 62 → 3263   (main color 2)
+  Col 64 → 6587   (notes / price)
+  Col 66 → 37045  (country of origin)
+  Col 72 → 11429  (country of manufacture)
 """
 
 import re
@@ -14,81 +44,117 @@ import json
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TEMPLATE COLUMN MAPPING
-# Keys  = exact header text from ROW 5 of the .xlsm file
-# Values= key to look up in the enriched product data dict
-#         None  → field intentionally left blank
+# Keys   = exact string in ROW 5 of the .xlsm  (confirmed from real template)
+# Values = key to look up in the enriched product data dict
+#          None → skip this column
 # ─────────────────────────────────────────────────────────────────────────────
 TEMPLATE_MAPPING = {
 
-    # ── REQUIRED ─────────────────────────────────────────────────────────────
-    "Titre*":               "title",
-    "Description*":         "description",
-    "URL image 1*":         "image_1",
+    # ── REQUIRED TEXT FIELDS ─────────────────────────────────────────────────
+    "title":                    "title",
+    "description":              "description",
+    "sellerPictureUrls_1":      "image_1",
 
-    # ── IDENTIFIERS ──────────────────────────────────────────────────────────
-    "GTIN":                 None,
-    "Référence vendeur":    None,
-    "Référence GTIN":       None,
+    # ── IDENTIFIERS (leave blank) ─────────────────────────────────────────────
+    "gtin":                     None,
+    "sellerProductReference":   None,
+    "gtinReference":            None,
 
-    # ── BRAND & RICH CONTENT ─────────────────────────────────────────────────
-    "Marque":               "brand",
-    "Description marketing riche": "html_description",
+    # ── BRAND & RICH CONTENT ──────────────────────────────────────────────────
+    "brand":                    "brand",
+    "richMarketingDescription": "html_description",
 
     # ── ADDITIONAL IMAGES ────────────────────────────────────────────────────
-    "URL image 2":          "image_2",
-    "URL image 3":          "image_3",
-    "URL image 4":          "image_4",
-    "URL image 5":          "image_5",
-    "URL image 6":          "image_6",
+    "sellerPictureUrls_2":      "image_2",
+    "sellerPictureUrls_3":      "image_3",
+    "sellerPictureUrls_4":      "image_4",
+    "sellerPictureUrls_5":      "image_5",
+    "sellerPictureUrls_6":      "image_6",
 
-    # ── PHYSICAL / COLOUR ────────────────────────────────────────────────────
-    "Couleur principale":   "color",
-    "Couleur(s)":           "color",
-    "Dimensions":           "dimensions",
-    "Poids":                "weight",
-    "Matières":             "material",
+    # ── COLOUR ───────────────────────────────────────────────────────────────
+    "3264":     "color",        # Couleur(s)
+    "3263":     "color",        # Couleur principale 2
+    "3485":     "color",        # Couleur principale
 
-    # ── CERTIFICATIONS & ORIGIN ──────────────────────────────────────────────
-    "Certifications et normes": "certifications",
-    "Pays d'origine":           "country_of_origin",
+    # ── DIMENSIONS & WEIGHT ──────────────────────────────────────────────────
+    "24069":    "dimensions",   # Dimensions (L x l x H)
+    "24630":    "dimensions",   # Dimensions produit
+    "5403":     "weight",       # Poids net
+    "24072":    "weight",       # Poids (kg)
+    "26127":    "weight",       # Poids brut
+
+    # ── MATERIAL ─────────────────────────────────────────────────────────────
+    "24061":    "material",     # Matières
+    "36517":    "material",     # Matière principale
+
+    # ── CERTIFICATIONS ───────────────────────────────────────────────────────
+    "6720":     "certifications",   # Certifications
+    "38412":    "certifications",   # Certifications et normes
+
+    # ── COUNTRY OF ORIGIN ────────────────────────────────────────────────────
+    "37045":    "country_of_origin",    # Pays d'origine
+    "11429":    "country_of_origin",    # Pays de fabrication
+    "38414":    "country_of_origin",    # Origine géographique
 
     # ── WARRANTY ─────────────────────────────────────────────────────────────
-    "Garantie (²)":         "warranty",
+    "37937":    "warranty",     # Garantie (années)
+    "37938":    "warranty",     # Garantie durée
 
     # ── PRODUCT TYPE ─────────────────────────────────────────────────────────
-    "Type de Produit":      "product_type",
+    "23346":    "product_type", # Type de Produit
 
     # ── BULLET POINTS / FEATURES ─────────────────────────────────────────────
-    "Fonction du produit":  "bullet_points",
+    "24612":    "bullet_points",    # Fonction du produit
 
     # ── PRICE / NOTES ────────────────────────────────────────────────────────
-    "Notes":                "price",
+    "6587":     "price",        # Notes
 
     # ── AGE ──────────────────────────────────────────────────────────────────
-    "Age (A partir de)":    "age_from",
-    "Age (Jusqu'à)":        "age_to",
+    "11335":    "age_from",     # Age (A partir de)
+    "24947":    "age_to",       # Age (Jusqu'à)
+    "11338":    "age_to",       # Age (Jusqu'à) 2
 
-    # ── MANUFACTURER ─────────────────────────────────────────────────────────
-    "Fabricant - Nom et raison sociale": "brand",
+    # ── GENDER ───────────────────────────────────────────────────────────────
+    "24077":    "gender",       # Sexe / Genre
 
-    # ── OPTIONAL / UNMAPPED ──────────────────────────────────────────────────
-    "Sexe":                 None,
-    "Matière principale":   None,
-    "Composition":          None,
-    "Contenance":           None,
-    "Nombre de pièces":     None,
-    "Langue":               None,
-    "Thème":                None,
-    "Collection":           None,
-    "Sous-thème":           None,
-    "Style":                None,
-    "Format":               None,
-    "Type de fermeture":    None,
-    "Longueur des manches": None,
-    "Type de col":          None,
-    "Coupe":                None,
-    "Motif":                None,
-    "Saison":               None,
+    # ── MANUFACTURER (maps to brand) ─────────────────────────────────────────
+    "47456":    "brand",        # Fabricant - Nom
+    "45465":    "brand",        # Marque fabricant
+
+    # ── SECONDARY DESCRIPTION ────────────────────────────────────────────────
+    "26117":    "description",  # Description secondaire
+
+    # ── INTENTIONALLY BLANK ──────────────────────────────────────────────────
+    "11347":    None,   # Couleur secondaire
+    "11384":    None,   # Composition
+    "36519":    None,   # Contenance / Capacité
+    "36516":    None,   # Nombre de pièces
+    "24097":    None,   # Langue
+    "3487":     None,   # Style
+    "36520":    None,   # Format
+    "26158":    None,   # Thème
+    "47457":    None,   # Fabricant - Adresse
+    "47458":    None,   # Fabricant - Contact
+    "999999":   None,
+    "999998":   None,
+    "999997":   None,
+    "999996":   None,
+    "999992":   None,
+    "38410":    None,   # Avertissement sécurité
+    "28003":    None,   # Instructions entretien
+    "36497":    None,   # Classe énergétique
+    "11348":    None,   # Tranche d'âge
+    "36453":    None,   # Niveau de compétence
+    "34025":    None,   # Type de pile
+    "35581":    None,   # Nombre de piles
+    "45244":    None,   # Puissance
+    "36522":    None,   # Collection
+    "31210":    None,   # Volume
+    "7426":     None,   # Sous-thème
+    "38413":    None,   # Numéro de modèle
+    "47288":    None,   # Référence fournisseur
+    "47443":    None,   # EAN
+    "47444":    None,   # ASIN
 }
 
 
@@ -97,7 +163,6 @@ TEMPLATE_MAPPING = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def strip_html(text: str) -> str:
-    """Remove HTML tags and collapse whitespace."""
     if not text:
         return ""
     text = re.sub(r'<[^>]+>', '', text)
@@ -105,7 +170,6 @@ def strip_html(text: str) -> str:
 
 
 def _format_bullet_points(raw) -> str:
-    """Convert a list (or pipe-delimited string) of bullets to a single string."""
     if isinstance(raw, list):
         return " | ".join(str(b).strip() for b in raw if b)
     if isinstance(raw, str):
@@ -114,7 +178,6 @@ def _format_bullet_points(raw) -> str:
 
 
 def _format_price_notes(scraped_data: dict) -> str:
-    """Combine price + shipping into a notes string."""
     price    = scraped_data.get("price", "")
     shipping = scraped_data.get("shipping", "")
     parts = []
@@ -131,21 +194,21 @@ def _format_price_notes(scraped_data: dict) -> str:
 
 def map_scraped_data_to_template(scraped_data: dict) -> dict:
     """
-    Maps product data dict → {template_column_header: value}.
+    Maps product data dict → {template_column_key: value}.
 
-    The returned dict is passed directly to TemplateFiller.fill_product_data(),
-    which looks up each key against ROW 5 of the .xlsm file.
+    The returned dict is passed to TemplateFiller.fill_product_data(),
+    which looks up each key against ROW 5 of the .xlsm file
+    (case-insensitive, whitespace-stripped).
     """
     print("[mapper] 🔄 Mapping product data to template columns...")
     mapped = {}
 
-    for col_header, data_key in TEMPLATE_MAPPING.items():
+    for col_key, data_key in TEMPLATE_MAPPING.items():
 
         if data_key is None:
             continue
 
-        # ── Special cases ──────────────────────────────────────────────────
-
+        # ── Special cases ─────────────────────────────────────────────────
         if data_key == "bullet_points":
             value = _format_bullet_points(scraped_data.get("bullet_points", []))
 
@@ -161,24 +224,26 @@ def map_scraped_data_to_template(scraped_data: dict) -> dict:
                 continue
             value = raw
 
-        # ── Field-level formatting ─────────────────────────────────────────
-
+        # ── Field-level formatting ────────────────────────────────────────
         if data_key == "title" and value:
             value = str(value)[:132]
 
-        elif data_key == "description" and value and data_key != "html_description":
+        elif data_key == "description" and data_key != "html_description" and value:
             value = strip_html(str(value))[:2000]
 
         elif "image" in data_key and value:
-            # Keep only valid absolute URLs
             if not str(value).startswith(("http://", "https://", "//")):
                 continue
 
-        # ── Store ─────────────────────────────────────────────────────────
+        # ── Only store non-empty values ───────────────────────────────────
         if value:
-            mapped[col_header] = str(value) if not isinstance(value, str) else value
+            mapped[col_key] = str(value) if not isinstance(value, str) else value
 
     print(f"[mapper] ✅ {len(mapped)} template columns populated")
+    for k, v in mapped.items():
+        preview = str(v)[:60] + "…" if len(str(v)) > 60 else str(v)
+        print(f"[mapper]    {k:30s} → {preview}")
+
     return mapped
 
 
@@ -187,8 +252,7 @@ def map_scraped_data_to_template(scraped_data: dict) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def validate_mapped_data(mapped_data: dict):
-    """Check that required template columns are populated."""
-    required = ["Titre*", "Description*", "URL image 1*"]
+    required = ["title", "description", "sellerPictureUrls_1"]
     missing  = [f for f in required if not str(mapped_data.get(f, "")).strip()]
 
     if missing:
@@ -204,11 +268,7 @@ def validate_mapped_data(mapped_data: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def create_template_row(mapped_data: dict, product_id, category_id, category_name) -> dict:
-    """Attach metadata to a mapped row (convenience helper)."""
-    row = {
-        "product_id":    product_id,
-        "category_id":   category_id,
-        "category_name": category_name,
-    }
+    row = {"product_id": product_id, "category_id": category_id,
+           "category_name": category_name}
     row.update(mapped_data)
     return row
