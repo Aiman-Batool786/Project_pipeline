@@ -1,6 +1,6 @@
 """
 scraper.py
-──────────
+─────────
 Captures the mtop.aliexpress.pdp.pc.query API response which contains
 ALL product data including specifications.
 
