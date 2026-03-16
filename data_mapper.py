@@ -3,39 +3,28 @@ data_mapper.py
 ──────────────
 Maps enriched product data to Octopia template columns.
 
-IMPORTANT: Keys in TEMPLATE_MAPPING must match EXACTLY the cell values
-in ROW 5 of the .xlsm file (as read by TemplateFiller._build_field_map).
+Keys in TEMPLATE_MAPPING = exact string in ROW 5 of the .xlsm
+(confirmed by scanning the real template file).
 
-Confirmed from actual template scan:
-  Col 1  → gtin
-  Col 2  → sellerProductReference
-  Col 3  → title
-  Col 4  → description
-  Col 5  → sellerPictureUrls_1
-  Col 7  → gtinReference
-  Col 8  → brand
-  Col 9  → richMarketingDescription
-  Col 10 → sellerPictureUrls_2  ... Col 14 → sellerPictureUrls_6
-  Col 21 → 24612  (bullet points / product function)
-  Col 23 → 11335  (age from)
-  Col 25 → 24077  (gender)
-  Col 26 → 3264   (color)
-  Col 38 → 37938  (warranty duration)
-  Col 39 → 38412  (certifications)
-  Col 40 → 11338  (age to)
-  Col 44 → 24069  (dimensions L x l x H)
-  Col 45 → 5403   (net weight)
-  Col 47 → 24061  (materials)
-  Col 49 → 6720   (certifications 2)
-  Col 50 → 37937  (warranty years)
-  Col 57 → 23346  (product type)
-  Col 58 → 45465  (brand manufacturer)
-  Col 59 → 26117  (secondary description)
-  Col 60 → 24072  (weight kg)
-  Col 62 → 3263   (main color 2)
-  Col 64 → 6587   (notes / price)
-  Col 66 → 37045  (country of origin)
-  Col 72 → 11429  (country of manufacture)
+ROW 5 column scan result:
+  Col 1  gtin | Col 2  sellerProductReference | Col 3  title
+  Col 4  description | Col 5  sellerPictureUrls_1 | Col 7  gtinReference
+  Col 8  brand | Col 9  richMarketingDescription
+  Col 10-14  sellerPictureUrls_2 … sellerPictureUrls_6
+  Col 15 3485  | Col 16 11347 | Col 17 36517 | Col 18 11384
+  Col 19 36519 | Col 20 36516 | Col 21 24612 | Col 22 24097
+  Col 23 11335 | Col 24 24947 | Col 25 24077 | Col 26 3264
+  Col 27 3487  | Col 28 36520 | Col 29 26158 | Col 31 47456
+  Col 32 47457 | Col 33 47458 | Col 34-38 999999-37938
+  Col 39 38412 | Col 40 11338 | Col 41 38410 | Col 42 28003
+  Col 43 24630 | Col 44 24069 | Col 45 5403  | Col 46 26127
+  Col 47 24061 | Col 48 36497 | Col 49 6720  | Col 50 37937
+  Col 51 11348 | Col 52 36453 | Col 53 34025 | Col 54 35581
+  Col 55 45244 | Col 56 36522 | Col 57 23346 | Col 58 45465
+  Col 59 26117 | Col 60 24072 | Col 61 31210 | Col 62 3263
+  Col 63 7426  | Col 64 6587  | Col 65 38414 | Col 66 37045
+  Col 67 38413 | Col 68 47288 | Col 69 47443 | Col 70 47444
+  Col 72 11429 | Col 73 999992
 """
 
 import re
@@ -44,23 +33,22 @@ import json
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TEMPLATE COLUMN MAPPING
-# Keys   = exact string in ROW 5 of the .xlsm  (confirmed from real template)
-# Values = key to look up in the enriched product data dict
-#          None → skip this column
+# Keys   = exact ROW 5 cell value (verified from real template)
+# Values = key in enriched product data dict  |  None = skip
 # ─────────────────────────────────────────────────────────────────────────────
 TEMPLATE_MAPPING = {
 
-    # ── REQUIRED TEXT FIELDS ─────────────────────────────────────────────────
+    # ── REQUIRED ─────────────────────────────────────────────────────────────
     "title":                    "title",
     "description":              "description",
     "sellerPictureUrls_1":      "image_1",
 
-    # ── IDENTIFIERS (leave blank) ─────────────────────────────────────────────
+    # ── IDENTIFIERS ──────────────────────────────────────────────────────────
     "gtin":                     None,
     "sellerProductReference":   None,
     "gtinReference":            None,
 
-    # ── BRAND & RICH CONTENT ──────────────────────────────────────────────────
+    # ── BRAND & RICH CONTENT ─────────────────────────────────────────────────
     "brand":                    "brand",
     "richMarketingDescription": "html_description",
 
@@ -72,20 +60,20 @@ TEMPLATE_MAPPING = {
     "sellerPictureUrls_6":      "image_6",
 
     # ── COLOUR ───────────────────────────────────────────────────────────────
-    "3264":     "color",        # Couleur(s)
-    "3263":     "color",        # Couleur principale 2
-    "3485":     "color",        # Couleur principale
+    "3264":     "color",            # Couleur(s)
+    "3263":     "color",            # Couleur principale 2
+    "3485":     "color",            # Couleur principale
 
     # ── DIMENSIONS & WEIGHT ──────────────────────────────────────────────────
-    "24069":    "dimensions",   # Dimensions (L x l x H)
-    "24630":    "dimensions",   # Dimensions produit
-    "5403":     "weight",       # Poids net
-    "24072":    "weight",       # Poids (kg)
-    "26127":    "weight",       # Poids brut
+    "24069":    "dimensions",       # Dimensions (L x l x H)
+    "24630":    "dimensions",       # Dimensions produit
+    "5403":     "weight",           # Poids net
+    "24072":    "weight",           # Poids (kg)
+    "26127":    "weight",           # Poids brut
 
     # ── MATERIAL ─────────────────────────────────────────────────────────────
-    "24061":    "material",     # Matières
-    "36517":    "material",     # Matière principale
+    "24061":    "material",         # Matières
+    "36517":    "material",         # Matière principale
 
     # ── CERTIFICATIONS ───────────────────────────────────────────────────────
     "6720":     "certifications",   # Certifications
@@ -97,40 +85,54 @@ TEMPLATE_MAPPING = {
     "38414":    "country_of_origin",    # Origine géographique
 
     # ── WARRANTY ─────────────────────────────────────────────────────────────
-    "37937":    "warranty",     # Garantie (années)
-    "37938":    "warranty",     # Garantie durée
+    "37937":    "warranty",         # Garantie (années)
+    "37938":    "warranty",         # Garantie durée
 
     # ── PRODUCT TYPE ─────────────────────────────────────────────────────────
-    "23346":    "product_type", # Type de Produit
+    "23346":    "product_type",     # Type de Produit
 
-    # ── BULLET POINTS / FEATURES ─────────────────────────────────────────────
+    # ── BULLET POINTS ────────────────────────────────────────────────────────
     "24612":    "bullet_points",    # Fonction du produit
 
     # ── PRICE / NOTES ────────────────────────────────────────────────────────
-    "6587":     "price",        # Notes
+    "6587":     "price",            # Notes
 
     # ── AGE ──────────────────────────────────────────────────────────────────
-    "11335":    "age_from",     # Age (A partir de)
-    "24947":    "age_to",       # Age (Jusqu'à)
-    "11338":    "age_to",       # Age (Jusqu'à) 2
+    "11335":    "age_from",         # Age (A partir de)
+    "24947":    "age_to",           # Age (Jusqu'à)
+    "11338":    "age_to",           # Age (Jusqu'à) 2
 
     # ── GENDER ───────────────────────────────────────────────────────────────
-    "24077":    "gender",       # Sexe / Genre
+    "24077":    "gender",           # Sexe / Genre
 
-    # ── MANUFACTURER (maps to brand) ─────────────────────────────────────────
-    "47456":    "brand",        # Fabricant - Nom
-    "45465":    "brand",        # Marque fabricant
+    # ── MANUFACTURER ─────────────────────────────────────────────────────────
+    "47456":    "brand",            # Fabricant - Nom
+    "45465":    "brand",            # Marque fabricant
 
     # ── SECONDARY DESCRIPTION ────────────────────────────────────────────────
-    "26117":    "description",  # Description secondaire
+    "26117":    "description",      # Description secondaire
+
+    # ── STYLE ────────────────────────────────────────────────────────────────
+    "3487":     "style",            # Style
+
+    # ── VOLUME / CAPACITY → mapped to col 31210 ──────────────────────────────
+    "31210":    "capacity",         # Volume / Capacité
+
+    # ── MODEL NUMBER → col 38413 ─────────────────────────────────────────────
+    "38413":    "model_number",     # Numéro de modèle
+
+    # ── POWER / VOLTAGE → col 45244 ──────────────────────────────────────────
+    "45244":    "voltage",          # Puissance / Voltage
+
+    # ── INSTALLATION → col 36453 ─────────────────────────────────────────────
+    "36453":    "installation",     # Type d'installation
 
     # ── INTENTIONALLY BLANK ──────────────────────────────────────────────────
     "11347":    None,   # Couleur secondaire
     "11384":    None,   # Composition
-    "36519":    None,   # Contenance / Capacité
+    "36519":    None,   # Contenance / Capacité (different from 31210)
     "36516":    None,   # Nombre de pièces
     "24097":    None,   # Langue
-    "3487":     None,   # Style
     "36520":    None,   # Format
     "26158":    None,   # Thème
     "47457":    None,   # Fabricant - Adresse
@@ -144,14 +146,10 @@ TEMPLATE_MAPPING = {
     "28003":    None,   # Instructions entretien
     "36497":    None,   # Classe énergétique
     "11348":    None,   # Tranche d'âge
-    "36453":    None,   # Niveau de compétence
     "34025":    None,   # Type de pile
     "35581":    None,   # Nombre de piles
-    "45244":    None,   # Puissance
     "36522":    None,   # Collection
-    "31210":    None,   # Volume
     "7426":     None,   # Sous-thème
-    "38413":    None,   # Numéro de modèle
     "47288":    None,   # Référence fournisseur
     "47443":    None,   # EAN
     "47444":    None,   # ASIN
@@ -195,10 +193,8 @@ def _format_price_notes(scraped_data: dict) -> str:
 def map_scraped_data_to_template(scraped_data: dict) -> dict:
     """
     Maps product data dict → {template_column_key: value}.
-
-    The returned dict is passed to TemplateFiller.fill_product_data(),
-    which looks up each key against ROW 5 of the .xlsm file
-    (case-insensitive, whitespace-stripped).
+    Passed to TemplateFiller.fill_product_data() which does a
+    case-insensitive lookup against ROW 5 of the .xlsm.
     """
     print("[mapper] 🔄 Mapping product data to template columns...")
     mapped = {}
@@ -235,13 +231,13 @@ def map_scraped_data_to_template(scraped_data: dict) -> dict:
             if not str(value).startswith(("http://", "https://", "//")):
                 continue
 
-        # ── Only store non-empty values ───────────────────────────────────
+        # ── Store non-empty values only ───────────────────────────────────
         if value:
             mapped[col_key] = str(value) if not isinstance(value, str) else value
 
     print(f"[mapper] ✅ {len(mapped)} template columns populated")
     for k, v in mapped.items():
-        preview = str(v)[:60] + "…" if len(str(v)) > 60 else str(v)
+        preview = str(v)[:70] + "…" if len(str(v)) > 70 else str(v)
         print(f"[mapper]    {k:30s} → {preview}")
 
     return mapped
