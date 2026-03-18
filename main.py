@@ -1,580 +1,739 @@
 """
-FastAPI Server - HYBRID APPROACH v2.3
-─────────────────────────────────────
-Pipeline steps:
-  1. Scrape  → product data + seller info (original, never LLM-enhanced)
-  2. Store   → scraped_products + seller_info tables
-  3. Enhance → OpenAI enhances product content only (NOT seller info)
-  4. Categorize
-  5. Map     → template columns
-  6. Generate Excel
+scraper.py
+──────────
+Captures the mtop.aliexpress.pdp.pc.query API response.
+Extracts: specs, images, title, price, description, AND seller info.
 
-Seller info rule: stored as original, shown in API response,
-                  written to template as-is, never sent to LLM.
+Seller info comes from: result.SHOP_CARD_PC (confirmed from debug output)
+  - store_name          : SHOP_CARD_PC.storeName
+  - store_id            : SHOP_CARD_PC.sellerInfo.storeNum
+  - store_url           : SHOP_CARD_PC.sellerInfo.storeURL
+  - seller_id           : SHOP_CARD_PC.sellerInfo.adminSeq
+  - seller_positive_rate: SHOP_CARD_PC.sellerPositiveRate
+  - seller_rating       : benefitInfoList[title=store rating].value
+  - seller_country      : SHOP_CARD_PC.sellerInfo.countryCompleteName
+  - store_open_date     : SHOP_CARD_PC.sellerInfo.formatOpenTime
+  - seller_level        : SHOP_CARD_PC.sellerLevel
+  - seller_total_reviews: SHOP_CARD_PC.sellerTotalNum
+
+RULE: Seller info is NEVER sent to LLM. Always stored as original scraped values.
 """
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import os
-import sqlite3
-import logging
+from playwright.sync_api import sync_playwright
+import re
 import json
-from typing import List, Dict, Any
-from datetime import datetime
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-app = FastAPI(
-    title="Octopia Template Pipeline - HYBRID Approach",
-    version="2.3.0"
-)
-
-DB_NAME   = "products.db"
-SPEC_FIELDS = [
-    'brand', 'color', 'dimensions', 'weight', 'material',
-    'certifications', 'country_of_origin', 'warranty', 'product_type'
-]
-SELLER_FIELDS = [
-    'store_name', 'store_id', 'store_url', 'seller_id',
-    'seller_positive_rate', 'seller_rating', 'seller_communication',
-    'seller_shipping_speed', 'seller_country', 'store_open_date',
-    'seller_level', 'seller_total_reviews', 'seller_positive_num', 'is_top_rated'
-]
 
 
-@app.on_event("startup")
-def startup_event():
-    try:
-        from db import create_all_tables
-        create_all_tables()
-        logger.info("✅ API Ready")
-    except Exception as e:
-        logger.error(f"Startup error: {e}")
+# ─────────────────────────────────────────────────────────────────────────────
+# SPEC MAPPING
+# ─────────────────────────────────────────────────────────────────────────────
+
+SPEC_MAPPING = {
+    'brand':             ['brand name', 'brand', 'marque'],
+    'color':             ['main color', 'color', 'colour', 'couleur'],
+    'dimensions':        ['dimensions (l x w x h', 'dimensions (cm)', 'dimensions',
+                          'size', 'taille', 'product size', 'item size',
+                          'package size', 'product dimensions'],
+    'weight':            ['net weight', 'weight (kg)', 'weight', 'poids',
+                          'gross weight', 'item weight', 'package weight'],
+    'material':          ['material composition', 'material', 'matière', 'materials',
+                          'body material'],
+    'certifications':    ['certification', 'certifications', 'normes', 'standards',
+                          'energy efficiency rating', 'energy consumption grade',
+                          'energy rating', 'energy class'],
+    'country_of_origin': ['place of origin', 'country of origin', 'origin',
+                          'country', 'pays', 'made in', 'manufactured in'],
+    'warranty':          ['warranty', 'garantie', 'guarantee', 'warranty period'],
+    'product_type':      ['refrigeration type', 'cooling method', 'defrost type',
+                          'product type', 'type de produit', 'item type', 'type',
+                          'application', 'design', 'operation system', 'use'],
+    'age_from':          ['age from', 'recommended age from', 'age (from)', 'minimum age'],
+    'age_to':            ['age to', 'recommended age to', 'age (to)', 'maximum age'],
+    'gender':            ['gender', 'suitable for', 'sexe'],
+    'capacity':          ['capacity', 'fridge capacity', 'net capacity', 'total capacity'],
+    'freezer_capacity':  ['freezer capacity'],
+    'voltage':           ['voltage', 'rated voltage', 'operating voltage'],
+    'model_number':      ['model number', 'model no', 'model', 'item model'],
+    'power_source':      ['power source', 'power supply'],
+    'installation':      ['installation', 'mounting type'],
+    'style':             ['style'],
+    'battery':           ['battery capacity', 'battery capacity(mah)', 'battery capacity range'],
+    'display':           ['display size', 'screen size', 'display resolution', 'screen material'],
+    'camera':            ['rear camera pixel', 'front camera pixel'],
+    'connectivity':      ['cellular', 'wifi', 'nfc', 'bluetooth'],
+    'os':                ['operation system', 'android version'],
+    'height':            ['height'],
+    'width':             ['width'],
+}
 
 
-class ProductURLRequest(BaseModel):
-    url: str
-    class Config:
-        json_schema_extra = {
-            "example": {"url": "https://www.aliexpress.com/item/1005010388288135.html"}
-        }
+def map_props_to_fields(props: list) -> tuple:
+    raw = {}
+    for item in props:
+        name  = str(item.get('attrName',  '') or '').strip()
+        value = str(item.get('attrValue', '') or '').strip()
+        if name and value:
+            raw[name.lower()] = value
+
+    mapped = {}
+    for field, keywords in SPEC_MAPPING.items():
+        for raw_key, raw_val in raw.items():
+            if any(kw in raw_key for kw in keywords):
+                if field not in mapped:
+                    mapped[field] = raw_val
+                    break
+
+    # Build dimensions from H/W
+    if not mapped.get('dimensions'):
+        h = mapped.get('height', raw.get('height', ''))
+        w = mapped.get('width',  raw.get('width',  ''))
+        if h and w:
+            mapped['dimensions'] = f"{h} x {w}"
+
+    cap = mapped.pop('capacity', '')
+    if cap:
+        mapped['dimensions'] = (mapped.get('dimensions', '') + f" | Capacity: {cap}").strip(' |')
+
+    fcap = mapped.pop('freezer_capacity', '')
+    if fcap and mapped.get('dimensions'):
+        mapped['dimensions'] += f" | Freezer: {fcap}"
+
+    return mapped, raw
 
 
-class BulkProductRequest(BaseModel):
-    urls: List[str]
+# ─────────────────────────────────────────────────────────────────────────────
+# SELLER INFO EXTRACTOR
+# Path confirmed from debug: result.SHOP_CARD_PC
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-@app.get("/", tags=["Info"])
-def root():
-    return {
-        "status":  "running",
-        "service": "Octopia Template Pipeline",
-        "version": "2.3.0",
-        "features": [
-            "Network interception scraping (specs from PRODUCT_PROP_PC)",
-            "Seller info from SHOP_CARD_PC (original, not LLM-enhanced)",
-            "Content enhancement via OpenAI (product only)",
-            "Octopia categorization",
-            "Template mapping + Excel generation",
-            "Full audit trail"
-        ]
+def extract_seller_info(result: dict) -> dict:
+    """
+    Extract seller/store information from SHOP_CARD_PC.
+    Returns original values — never modified by LLM.
+    """
+    seller = {
+        'store_name':           '',
+        'store_id':             '',
+        'store_url':            '',
+        'seller_id':            '',
+        'seller_positive_rate': '',
+        'seller_rating':        '',
+        'seller_communication': '',
+        'seller_shipping_speed':'',
+        'seller_country':       '',
+        'store_open_date':      '',
+        'seller_level':         '',
+        'seller_total_reviews': '',
+        'seller_positive_num':  '',
+        'is_top_rated':         '',
     }
 
-
-@app.get("/health", tags=["Info"])
-def health_check():
     try:
-        conn = sqlite3.connect(DB_NAME)
-        conn.close()
-        return {"status": "healthy"}
-    except Exception:
-        return {"status": "error"}
+        shop = result.get('SHOP_CARD_PC', {}) or {}
+        if not shop:
+            print("[scraper]    ⚠️  SHOP_CARD_PC not found in API response")
+            return seller
 
+        # Store name
+        seller['store_name'] = str(shop.get('storeName', '') or '')
 
-# ─────────────────────────────────────────
-# MAIN PROCESSING FUNCTION
-# ─────────────────────────────────────────
+        # Seller level
+        seller['seller_level'] = str(shop.get('sellerLevel', '') or '')
 
-def process_product_complete(url: str) -> Dict[str, Any]:
-    product_id = None
+        # Positive rate & review counts
+        seller['seller_positive_rate'] = str(shop.get('sellerPositiveRate', '') or '')
+        seller['seller_total_reviews'] = str(shop.get('sellerTotalNum', '') or '')
+        seller['seller_positive_num']  = str(shop.get('sellerPositiveNum', '') or '')
 
-    try:
-        logger.info(f"\n🚀 Processing: {url}")
+        # Detailed ratings from benefitInfoList
+        benefit_list = shop.get('benefitInfoList', []) or []
+        for item in benefit_list:
+            title = str(item.get('title', '') or '').lower().strip()
+            value = str(item.get('value', '') or '').strip()
+            if 'store rating' in title:
+                seller['seller_rating'] = value
+            elif 'communication' in title:
+                seller['seller_communication'] = value
 
-        from scraper import get_product_info
-        from category_utils import assign_category
-        from data_mapper import map_scraped_data_to_template, validate_mapped_data
-        from template_filler import fill_template_for_product
-        from openai_client import improve_product_content
-        from db import (
-            create_all_tables,
-            insert_scraped_product,
-            insert_seller_info,
-            insert_category_assignment,
-            insert_mapped_product,
-            insert_template_output,
-            insert_enhanced_content,
-            insert_original_specifications,
-            insert_enhanced_specifications,
-            log_all_spec_audits,
-            log_processing,
-        )
+        # sellerInfo sub-object
+        seller_info = shop.get('sellerInfo', {}) or {}
+        if seller_info:
+            seller['seller_id']      = str(seller_info.get('adminSeq', '') or '')
+            seller['store_id']       = str(seller_info.get('storeNum', '') or '')
+            seller['seller_country'] = str(seller_info.get('countryCompleteName', '') or '')
+            seller['store_open_date']= str(seller_info.get('formatOpenTime', '') or '')
+            seller['is_top_rated']   = str(seller_info.get('topRatedSeller', '') or '')
 
-        create_all_tables()
+            raw_url = str(seller_info.get('storeURL', '') or '')
+            if raw_url:
+                if raw_url.startswith('//'):
+                    raw_url = 'https:' + raw_url
+                seller['store_url'] = raw_url
 
-        TEMPLATE_PATH        = "pdt_template_fr-FR_20260305_090255.xlsm"
-        FILLED_TEMPLATES_DIR = "./filled_templates"
-        os.makedirs(FILLED_TEMPLATES_DIR, exist_ok=True)
-
-        # ── STEP 1: SCRAPE ──────────────────────────────────────────────────
-        logger.info("📥 Scraping...")
-        scraped_data = get_product_info(url)
-
-        if not scraped_data:
-            return {"success": False, "url": url, "error": "Scraping failed",
-                    "timestamp": datetime.now().isoformat()}
-
-        title       = scraped_data.get("title", "")
-        description = scraped_data.get("description", "")
-
-        if not title:
-            return {"success": False, "url": url, "error": "No title extracted",
-                    "timestamp": datetime.now().isoformat()}
-
-        scraped_specs_count = len([k for k in SPEC_FIELDS if scraped_data.get(k)])
-        logger.info(f"✅ Extracted {len(scraped_data)} attributes "
-                    f"({scraped_specs_count} spec fields)")
-
-        # Log seller info found
-        seller_found = [k for k in SELLER_FIELDS if scraped_data.get(k)]
-        logger.info(f"   Seller fields: {seller_found}")
-
-        # ── STEP 2: STORE SCRAPED DATA ──────────────────────────────────────
-        logger.info("💾 Storing scraped data...")
-        product_id = insert_scraped_product(url, scraped_data)
-
-        if not product_id:
-            return {"success": False, "url": url, "error": "Failed to store scraped data",
-                    "timestamp": datetime.now().isoformat()}
-
-        log_processing(product_id, url, "scraping", "success")
-
-        # ── STEP 2B: STORE SELLER INFO (original, no LLM) ───────────────────
-        logger.info("🏪 Storing seller info (original)...")
-        seller_data = {k: scraped_data.get(k, '') for k in SELLER_FIELDS}
-        insert_seller_info(product_id, seller_data)
-        log_processing(product_id, url, "seller_info", "success")
-
-        # ── STEP 2C: SAVE ORIGINAL SPECIFICATIONS ───────────────────────────
-        logger.info("📋 Saving original specifications...")
-        insert_original_specifications(product_id, scraped_data)
-
-        # ── STEP 3: ENHANCE CONTENT (product only, NOT seller) ──────────────
-        logger.info("🤖 Enhancing product content with OpenAI...")
-
-        # Remove seller fields before sending to OpenAI
-        product_data_for_llm = {
-            k: v for k, v in scraped_data.items()
-            if k not in SELLER_FIELDS
-        }
-
-        try:
-            enhanced = improve_product_content(
-                title=title,
-                description=description,
-                specifications=product_data_for_llm,
-                category=None
-            )
-            if not enhanced:
-                raise ValueError("OpenAI returned None")
-        except Exception as e:
-            logger.warning(f"Enhancement skipped: {e}")
-            enhanced = {
-                "title": title,
-                "description": description,
-                "bullet_points": scraped_data.get("bullet_points", []),
-                "html_description": "",
-                "specifications_enhanced": {}
-            }
-
-        specs_enhanced = enhanced.get("specifications_enhanced", {})
-        logger.info(f"✅ Content enhanced — "
-                    f"{len([v for v in specs_enhanced.values() if v])} spec fields")
-
-        # ── STEP 3B: SAVE ENHANCED SPECIFICATIONS ───────────────────────────
-        insert_enhanced_specifications(product_id, specs_enhanced)
-
-        # ── STEP 3C: BUILD enriched_data (API version) ──────────────────────
-        enriched_data = scraped_data.copy()
-        enriched_data['title']            = enhanced.get('title', title)
-        enriched_data['description']      = enhanced.get('description', description)
-        enriched_data['bullet_points']    = enhanced.get('bullet_points', [])
-        enriched_data['html_description'] = enhanced.get('html_description', '')
-
-        for field in SPEC_FIELDS:
-            orig_val = scraped_data.get(field, '')
-            enh_val  = specs_enhanced.get(field, '')
-            if enh_val and enh_val.strip():
-                enriched_data[field] = enh_val
-            elif orig_val and orig_val.strip():
-                enriched_data[field] = orig_val
-            else:
-                enriched_data[field] = ""
-
-        # ── STEP 3D: BUILD enriched_data_for_template (enhanced specs only) ─
-        enriched_data_for_template = scraped_data.copy()
-        enriched_data_for_template['title']            = enhanced.get('title', title)
-        enriched_data_for_template['description']      = enhanced.get('description', description)
-        enriched_data_for_template['bullet_points']    = enhanced.get('bullet_points', [])
-        enriched_data_for_template['html_description'] = enhanced.get('html_description', '')
-
-        for field in SPEC_FIELDS:
-            enh_val = specs_enhanced.get(field, '')
-            enriched_data_for_template[field] = enh_val if (enh_val and enh_val.strip()) else ""
-
-        # Seller fields pass through as original in template data
-        for field in SELLER_FIELDS:
-            enriched_data_for_template[field] = scraped_data.get(field, '')
-
-        # ── STEP 3E: SAVE ENHANCED CONTENT + AUDIT LOG ──────────────────────
-        insert_enhanced_content(product_id, enriched_data_for_template)
-        log_all_spec_audits(product_id, scraped_data, specs_enhanced,
-                            enriched_data_for_template)
-
-        # ── STEP 4: CATEGORIZE ──────────────────────────────────────────────
-        logger.info("\n🏷️  Categorizing...")
-        try:
-            category = assign_category(
-                enhanced.get("title", title),
-                enhanced.get("description", description)
-            )
-        except Exception as e:
-            logger.warning(f"Categorization skipped: {e}")
-            category = {"category_id": "0", "category_name": "Unknown",
-                        "category_leaf": "Unknown", "confidence": 0.0}
-
-        insert_category_assignment(
-            product_id,
-            category.get("category_id", "0"), category.get("category_name", "Unknown"),
-            category.get("category_id", "0"), category.get("category_name", "Unknown"),
-            category.get("confidence", 0.0)
-        )
-        log_processing(product_id, url, "categorization", "success")
-
-        # ── STEP 5: MAP ─────────────────────────────────────────────────────
-        logger.info("\n🗺️  Mapping to template columns...")
-        mapped_data = {}
-        is_valid    = False
-
-        try:
-            mapped_data = map_scraped_data_to_template(enriched_data_for_template)
-            is_valid, missing = validate_mapped_data(mapped_data)
-            insert_mapped_product(product_id, category.get("category_id", "0"), mapped_data)
-            log_processing(product_id, url, "mapping", "success" if is_valid else "warning")
-            logger.info(f"✅ {len(mapped_data)} fields mapped")
-        except Exception as e:
-            logger.warning(f"Mapping error: {e}")
-            log_processing(product_id, url, "mapping", "error", str(e))
-
-        # ── STEP 6: GENERATE TEMPLATE ────────────────────────────────────────
-        logger.info("\n📋 Generating Excel template...")
-        template_file = None
-
-        if os.path.exists(TEMPLATE_PATH):
+        # Also try GLOBAL_DATA for store name fallback
+        if not seller['store_name']:
             try:
-                template_file = fill_template_for_product(
-                    TEMPLATE_PATH, mapped_data, product_id, FILLED_TEMPLATES_DIR,
-                    category_id=category.get("category_id", "0"),
-                    category_name=category.get("category_leaf", "Unknown")
+                seller['store_name'] = str(
+                    result['GLOBAL_DATA']['globalData']['storeName'] or ''
                 )
-                if template_file:
-                    insert_template_output(
-                        product_id, category.get("category_id", "0"),
-                        "xlsm", template_file, os.path.basename(template_file)
-                    )
-                    log_processing(product_id, url, "template_fill", "success")
-                    logger.info(f"✅ Template: {os.path.basename(template_file)}")
-            except Exception as e:
-                logger.warning(f"Template generation failed: {e}")
-                log_processing(product_id, url, "template_fill", "error", str(e))
+            except (KeyError, TypeError):
+                pass
 
-        logger.info("✅ Processing complete\n")
-
-        return {
-            "success":    True,
-            "product_id": product_id,
-            "url":        url,
-
-            "original": {
-                "title":       title,
-                "description": (description[:200] + "..." if len(description) > 200
-                                else description),
-                **{f: scraped_data.get(f, "") for f in SPEC_FIELDS},
-                "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}"))
-            },
-
-            # ── SELLER INFO (original, not enhanced) ──────────────────────
-            "seller": {f: scraped_data.get(f, "") for f in SELLER_FIELDS},
-
-            "enhanced": {
-                "title":                 enhanced.get("title", ""),
-                "description":           (enhanced.get("description", "")[:200] + "..."
-                                          if enhanced.get("description") else ""),
-                "bullet_points":         enhanced.get("bullet_points", [])[:3],
-                "has_html_description":  bool(enhanced.get("html_description", "")),
-                "specifications_enhanced": specs_enhanced
-            },
-
-            "merged":        {f: enriched_data.get(f, "")                for f in SPEC_FIELDS},
-            "template_specs":{f: enriched_data_for_template.get(f, "")  for f in SPEC_FIELDS},
-
-            "category": {
-                "id":         category.get("category_id", ""),
-                "name":       category.get("category_name", ""),
-                "leaf":       category.get("category_leaf", ""),
-                "confidence": round(category.get("confidence", 0.0), 2)
-            },
-
-            "template": {
-                "file":           os.path.basename(template_file) if template_file else None,
-                "columns_mapped": len(mapped_data),
-                "fields_valid":   is_valid,
-            },
-
-            "extracted": {
-                "specifications": sum(1 for k in SPEC_FIELDS
-                                      if enriched_data_for_template.get(k)),
-                "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}")),
-                "seller_fields": len([k for k in SELLER_FIELDS if scraped_data.get(k)])
-            },
-
-            "audit": {
-                "original_specs_saved":        True,
-                "enhanced_specs_saved":        True,
-                "seller_info_saved":           True,
-                "seller_info_llm_enhanced":    False,
-                "audit_log_written":           True,
-                "template_uses_enhanced_only": True
-            },
-
-            "timestamp": datetime.now().isoformat()
-        }
-
-    except Exception as e:
-        logger.error(f"❌ Error: {e}", exc_info=True)
-        return {"success": False, "url": url, "product_id": product_id,
-                "error": str(e), "timestamp": datetime.now().isoformat()}
-
-
-# ─────────────────────────────────────────
-# ENDPOINTS
-# ─────────────────────────────────────────
-
-@app.post("/generate-product", tags=["Product Processing"])
-def generate_product(req: ProductURLRequest):
-    if not req.url:
-        raise HTTPException(status_code=400, detail="URL cannot be empty")
-    return process_product_complete(req.url)
-
-
-@app.post("/generate-products", tags=["Product Processing"])
-def generate_products(req: BulkProductRequest):
-    if not req.urls:
-        raise HTTPException(status_code=400, detail="URLs list cannot be empty")
-    if len(req.urls) > 20:
-        raise HTTPException(status_code=400, detail="Maximum 20 URLs per request")
-
-    results = []
-    successful = failed = 0
-    for url in req.urls:
-        result = process_product_complete(url)
-        results.append(result)
-        if result.get("success"):
-            successful += 1
-        else:
-            failed += 1
-
-    return {"total": len(req.urls), "successful": successful,
-            "failed": failed, "results": results,
-            "timestamp": datetime.now().isoformat()}
-
-
-# ─────────────────────────────────────────
-# DATABASE VIEW ENDPOINTS
-# ─────────────────────────────────────────
-
-def get_db_connection():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-@app.get("/scraped-products", tags=["Database"])
-def view_scraped_products(limit: int = 100):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM scraped_products ORDER BY scraped_at DESC LIMIT {min(limit,1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/seller-info", tags=["Database"])
-def view_seller_info(limit: int = 100):
-    """View original seller info — never LLM-enhanced"""
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM seller_info ORDER BY scraped_at DESC LIMIT {min(limit,1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/seller-info/{product_id}", tags=["Database"])
-def get_seller_info_by_product(product_id: int):
-    """Get seller info for a specific product"""
-    try:
-        conn = get_db_connection()
-        row  = conn.execute(
-            "SELECT * FROM seller_info WHERE product_id = ?", (product_id,)
-        ).fetchone()
-        conn.close()
-        return dict(row) if row else {"message": f"No seller info for product {product_id}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/mapped-products", tags=["Database"])
-def view_mapped_products(limit: int = 100):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM mapped_products ORDER BY mapped_at DESC LIMIT {min(limit,1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/template-outputs", tags=["Database"])
-def view_template_outputs(limit: int = 100):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM template_outputs ORDER BY created_at DESC LIMIT {min(limit,1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/processing-logs", tags=["Database"])
-def view_processing_logs(limit: int = 500):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM processing_logs ORDER BY log_time DESC LIMIT {min(limit,1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/enhanced-products", tags=["Database"])
-def view_enhanced_products(limit: int = 100):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM enhanced_content ORDER BY id DESC LIMIT {min(limit,1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/original-specifications", tags=["Database"])
-def view_original_specifications(limit: int = 100):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM original_specifications ORDER BY extracted_at DESC LIMIT {min(limit,1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/enhanced-specifications", tags=["Database"])
-def view_enhanced_specifications(limit: int = 100):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM enhanced_specifications ORDER BY enhanced_at DESC LIMIT {min(limit,1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/specification-audit", tags=["Database"])
-def view_specification_audit(limit: int = 200):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM specification_audit_log ORDER BY recorded_at DESC LIMIT {min(limit,1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/stats", tags=["Database"])
-def get_stats():
-    try:
-        conn   = get_db_connection()
-        tables = [
-            "scraped_products", "mapped_products", "template_outputs",
-            "processing_logs", "category_assignments", "enhanced_content",
-            "original_specifications", "enhanced_specifications",
-            "specification_audit_log", "seller_info"
-        ]
-        stats = {}
-        for table in tables:
+        # Store ID fallback from GLOBAL_DATA
+        if not seller['store_id']:
             try:
-                stats[table] = conn.execute(
-                    f"SELECT COUNT(*) FROM {table}"
-                ).fetchone()[0]
-            except Exception:
-                stats[table] = 0
-        conn.close()
-        return stats
+                seller['store_id'] = str(
+                    result['GLOBAL_DATA']['globalData']['storeId'] or ''
+                )
+            except (KeyError, TypeError):
+                pass
+
+        print(f"[scraper]    ✅ Seller info extracted:")
+        for k, v in seller.items():
+            if v:
+                print(f"[scraper]       {k}: {v}")
+
     except Exception as e:
-        return {"error": str(e)}
+        print(f"[scraper]    ⚠️  Seller info extraction error: {e}")
+
+    return seller
 
 
-# ─────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN API RESPONSE PARSER
+# ─────────────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v2.3 — with seller info")
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+def parse_pdp_response(text: str) -> dict | None:
+    try:
+        text = text.strip()
+        m = re.match(r'^[a-zA-Z_$][a-zA-Z0-9_$]*\s*\((.*)\)\s*;?\s*$', text, re.DOTALL)
+        if m:
+            text = m.group(1)
+
+        data   = json.loads(text)
+        result = (data.get('data', {}) or {}).get('result', {}) or {}
+
+        if not result:
+            print("[scraper]    ⚠️  Empty result in API response")
+            return None
+
+        extracted = {}
+
+        # ── Title ──────────────────────────────────────────────────────────
+        try:
+            extracted['title'] = result['GLOBAL_DATA']['globalData']['subject']
+        except (KeyError, TypeError):
+            pass
+        if not extracted.get('title'):
+            try:
+                extracted['title'] = result['titleModule']['subject']
+            except (KeyError, TypeError):
+                pass
+        if extracted.get('title'):
+            extracted['title'] = str(extracted['title']).strip()
+
+        # ── Specifications ─────────────────────────────────────────────────
+        props = []
+        try:
+            props = result['PRODUCT_PROP_PC']['showedProps'] or []
+        except (KeyError, TypeError):
+            pass
+        if not props:
+            try:
+                props = result['PRODUCT_PROP_PC']['outerProps'] or []
+            except (KeyError, TypeError):
+                pass
+
+        if props:
+            print(f"[scraper]    ✅ Found {len(props)} spec props in API JSON")
+            mapped, raw = map_props_to_fields(props)
+            extracted.update(mapped)
+            for k, v in raw.items():
+                print(f"[scraper]       {k}: {v[:60]}")
+        else:
+            print("[scraper]    ⚠️  No specs found in PRODUCT_PROP_PC")
+
+        # ── Seller Info ────────────────────────────────────────────────────
+        seller_info = extract_seller_info(result)
+        extracted.update(seller_info)
+
+        # ── Images ─────────────────────────────────────────────────────────
+        images = []
+        try:
+            images = result['imageModule']['imagePathList'] or []
+        except (KeyError, TypeError):
+            pass
+        if not images:
+            def find_images(obj, depth=0):
+                if depth > 6 or not isinstance(obj, dict):
+                    return []
+                if 'imagePathList' in obj:
+                    v = obj['imagePathList']
+                    if isinstance(v, list) and v:
+                        return v
+                for v in obj.values():
+                    r = find_images(v, depth + 1)
+                    if r:
+                        return r
+                return []
+            images = find_images(result)
+
+        for idx, img in enumerate(images[:20], 1):
+            if img:
+                if img.startswith('//'):
+                    img = 'https:' + img
+                elif not img.startswith('http'):
+                    img = 'https://' + img
+                extracted[f'image_{idx}'] = re.sub(r'_\d+x\d+', '', img)
+
+        if images:
+            print(f"[scraper]    ✅ Found {len(images)} images")
+
+        # ── Price ──────────────────────────────────────────────────────────
+        try:
+            pm = result.get('priceModule', {}) or result.get('PRICE_MODULE', {}) or {}
+            price = (pm.get('formatedActivityPrice') or
+                     pm.get('formatedPrice') or
+                     pm.get('minActivityAmount', {}).get('formatedAmount', '') or '')
+            if price:
+                extracted['price'] = str(price)
+        except Exception:
+            pass
+
+        # ── Description from API ───────────────────────────────────────────
+        try:
+            dm   = result.get('descriptionModule', {}) or {}
+            desc = dm.get('description', '') or dm.get('content', '')
+            if desc and len(desc) > 50:
+                desc = re.sub(r'<[^>]+>', ' ', desc)
+                extracted['description'] = ' '.join(desc.split())[:2000]
+        except Exception:
+            pass
+
+        # ── Description fallback: check DESCRIPTION_PC ─────────────────────
+        if not extracted.get('description'):
+            try:
+                desc_pc = result.get('DESCRIPTION_PC', {}) or {}
+                desc_html = (desc_pc.get('descriptionContent', '') or
+                             desc_pc.get('content', '') or
+                             desc_pc.get('description', ''))
+                if desc_html and len(desc_html) > 50:
+                    desc_clean = re.sub(r'<[^>]+>', ' ', desc_html)
+                    extracted['description'] = ' '.join(desc_clean.split())[:2000]
+            except Exception:
+                pass
+
+        return extracted if (extracted.get('title') or extracted.get('image_1')) else None
+
+    except json.JSONDecodeError as e:
+        print(f"[scraper]    ⚠️  JSON parse error: {e}")
+        return None
+    except Exception as e:
+        print(f"[scraper]    ⚠️  Parse error: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOM FALLBACKS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_title_from_dom(page) -> str:
+    for selector in ['meta[property="og:title"]', 'h1[data-pl="product-title"]']:
+        try:
+            el = page.locator(selector).first
+            if el.count() > 0:
+                val = (el.get_attribute('content') or el.inner_text() or '').strip()
+                if val:
+                    return val
+        except Exception:
+            pass
+    return ''
+
+
+def get_images_from_dom(page) -> dict:
+    images = {}
+    try:
+        for script in page.locator('script').all():
+            try:
+                txt = script.text_content() or ''
+                m   = re.search(r'"imagePathList"\s*:\s*\[(.*?)\]', txt, re.DOTALL)
+                if m:
+                    urls = re.findall(r'"(https?://[^"]+\.jpg[^"]*)"', m.group(1))
+                    if not urls:
+                        urls = re.findall(r'"(//[^"]+\.jpg[^"]*)"', m.group(1))
+                    for idx, url in enumerate(urls[:20], 1):
+                        if url.startswith('//'):
+                            url = 'https:' + url
+                        images[f'image_{idx}'] = re.sub(r'_\d+x\d+', '', url)
+                    if images:
+                        print(f"[scraper]    ✅ {len(images)} images from DOM script")
+                        return images
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        og = page.locator('meta[property="og:image"]').get_attribute('content')
+        if og:
+            images['image_1'] = og
+    except Exception:
+        pass
+    return images
+
+
+def get_description_from_dom(page) -> str:
+    """
+    Enhanced description extraction using broad selectors
+    + recursive child traversal until leaf text is found.
+    """
+
+    # ── STRATEGY 1: Broad selectors + recursive leaf text extraction ────
+    desc_selectors = [
+        "#product-description",
+        '[class*="product-description"]',
+        '[class*="detail-content"]',
+        '.product-detail__description',
+        '[class*="productDescription"]',
+        '[class*="desc-content"]',
+        '#nav-description',
+        '[class*="ItemDescription"]',
+        'div[data-pl="product-description"]',
+        '.description-content',
+        'div.richTextContainer[data-rich-text-render="true"]',
+        'div[id="product-description"]',
+        'div[id="nav-description"]',
+        'div.detailmodule_text',
+        '[class*="detail-desc"]',
+        '[class*="product-detail-info"]',
+        '[class*="product_desc"]',
+        '[class*="pdp-description"]',
+        '[class*="module_description"]',
+        '[class*="DescriptionModule"]',
+    ]
+
+    for selector in desc_selectors:
+        try:
+            el = page.locator(selector).first
+            if el.count() == 0:
+                continue
+
+            # Recursive leaf text extraction via JavaScript
+            text = page.evaluate('''(element) => {
+                function getLeafText(node) {
+                    if (!node) return '';
+
+                    var tag = node.tagName ? node.tagName.toLowerCase() : '';
+                    if (['script', 'style', 'noscript', 'svg', 'iframe'].includes(tag)) {
+                        return '';
+                    }
+
+                    // Text node — return its content
+                    if (node.nodeType === Node.TEXT_NODE) {
+                        return (node.textContent || '').trim();
+                    }
+
+                    // Get child elements
+                    var childElements = node.children;
+
+                    // LEAF NODE: no child elements — return all text content
+                    if (!childElements || childElements.length === 0) {
+                        return (node.textContent || '').trim();
+                    }
+
+                    // HAS CHILDREN: recurse into each child node
+                    var texts = [];
+                    for (var i = 0; i < node.childNodes.length; i++) {
+                        var childText = getLeafText(node.childNodes[i]);
+                        if (childText) {
+                            texts.push(childText);
+                        }
+                    }
+                    return texts.join(' ');
+                }
+                return getLeafText(element);
+            }''', el.element_handle())
+
+            if text:
+                # Clean up the extracted text
+                text = re.sub(r'\s+', ' ', text).strip()
+                # Remove common AliExpress boilerplate
+                text = re.sub(
+                    r'^.*?Description\s+report\s+', '', text,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
+                text = re.sub(
+                    r'(Smarter Shopping|Better Living).*$', '', text,
+                    flags=re.IGNORECASE
+                )
+                text = text.strip()
+
+                if len(text) > 50:
+                    print(f"[scraper]    ✅ Description from DOM selector: "
+                          f"{selector} ({len(text)} chars)")
+                    return text[:2000]
+        except Exception:
+            continue
+
+    # ── STRATEGY 2: Description loaded in iframe ────────────────────────
+    try:
+        iframe_selectors = [
+            'iframe[src*="desc"]',
+            'iframe[id*="desc"]',
+            'iframe[class*="desc"]',
+        ]
+        for iframe_sel in iframe_selectors:
+            try:
+                iframe_el = page.locator(iframe_sel).first
+                if iframe_el.count() > 0:
+                    frame = iframe_el.content_frame()
+                    if frame:
+                        body_text = frame.locator('body').inner_text()
+                        if body_text and len(body_text.strip()) > 50:
+                            text = re.sub(r'\s+', ' ', body_text).strip()
+                            print(f"[scraper]    ✅ Description from iframe ({len(text)} chars)")
+                            return text[:2000]
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # ── STRATEGY 3: Grab all text from any large content block ──────────
+    try:
+        large_blocks = page.locator(
+            'div[class*="desc"], div[class*="description"], '
+            'div[class*="Detail"], div[class*="detail"]'
+        ).all()
+        for block in large_blocks:
+            try:
+                text = block.inner_text().strip()
+                text = re.sub(r'\s+', ' ', text)
+                text = re.sub(
+                    r'^.*?Description\s+report\s+', '', text,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
+                text = re.sub(
+                    r'(Smarter Shopping|Better Living).*$', '', text,
+                    flags=re.IGNORECASE
+                )
+                text = text.strip()
+                if len(text) > 100 and 'Smarter Shopping' not in text:
+                    print(f"[scraper]    ✅ Description from large block ({len(text)} chars)")
+                    return text[:2000]
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return ''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_product_info(url: str) -> dict | None:
+    captured_pdp = []
+    captured_descriptions = []
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-dev-shm-usage',
+                      '--disable-blink-features=AutomationControlled']
+            )
+            context = browser.new_context(
+                user_agent=(
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/120.0.0.0 Safari/537.36'
+                ),
+                viewport={'width': 1366, 'height': 900},
+                locale='en-US',
+                timezone_id='Asia/Karachi',
+            )
+            page = context.new_page()
+
+            def handle_response(response):
+                url_r = response.url
+
+                # Capture PDP API
+                if ('mtop.aliexpress.pdp.pc.query' in url_r or
+                        'mtop.aliexpress.itemdetail.pc' in url_r):
+                    try:
+                        body = response.body()
+                        if len(body) > 1000:
+                            text = body.decode('utf-8', errors='replace')
+                            if ('PRODUCT_PROP_PC' in text or
+                                    'imagePathList' in text or
+                                    'SHOP_CARD_PC' in text):
+                                captured_pdp.append(text)
+                                print(f"[scraper]    📡 Captured PDP: {url_r[:80]}")
+                    except Exception:
+                        pass
+
+                # Capture description API (separate endpoint)
+                if ('mtop.aliexpress.pdp.pc.description' in url_r or
+                        'aeglobal/product/description' in url_r or
+                        'pdp/description' in url_r.lower()):
+                    try:
+                        body = response.body()
+                        if len(body) > 100:
+                            text = body.decode('utf-8', errors='replace')
+                            desc_clean = re.sub(r'<[^>]+>', ' ', text)
+                            desc_clean = ' '.join(desc_clean.split()).strip()
+                            if len(desc_clean) > 50:
+                                captured_descriptions.append(desc_clean[:2000])
+                                print(f"[scraper]    📡 Captured description API: "
+                                      f"{url_r[:80]}")
+                    except Exception:
+                        pass
+
+            page.on('response', handle_response)
+
+            print(f'\n[scraper] 🌐 Opening: {url}')
+            page.goto(url, timeout=60000, wait_until='domcontentloaded')
+            page.wait_for_timeout(5000)
+
+            # Initial scroll
+            page.mouse.wheel(0, 800)
+            page.wait_for_timeout(1000)
+
+            extracted = {}
+            print(f'[scraper]    📦 Captured {len(captured_pdp)} PDP responses')
+
+            for resp_text in captured_pdp:
+                parsed = parse_pdp_response(resp_text)
+                if parsed:
+                    print(f'[scraper]    ✅ Parsed {len(parsed)} fields from API')
+                    for k, v in parsed.items():
+                        if k not in extracted or not extracted[k]:
+                            extracted[k] = v
+
+            # Use captured description API if available
+            if not extracted.get('description') and captured_descriptions:
+                best_desc = max(captured_descriptions, key=len)
+                if len(best_desc) > 50:
+                    extracted['description'] = best_desc
+                    print(f"[scraper]    ✅ Description from API interception "
+                          f"({len(best_desc)} chars)")
+
+            # DOM fallbacks
+            if not extracted.get('title'):
+                extracted['title'] = get_title_from_dom(page)
+            if not extracted.get('image_1'):
+                extracted.update(get_images_from_dom(page))
+
+            # ── SCROLL DOWN to trigger lazy-loaded description ──────────
+            if not extracted.get('description'):
+                print("[scraper]    📜 Scrolling to load description...")
+
+                for scroll_y in [800, 1600, 2400, 3200, 4000, 5000]:
+                    page.mouse.wheel(0, 800)
+                    page.wait_for_timeout(500)
+
+                # Wait for description container to appear
+                try:
+                    page.wait_for_selector(
+                        '#product-description, [class*="product-description"], '
+                        '[class*="detail-content"], .product-detail__description, '
+                        '[class*="productDescription"], [class*="desc-content"], '
+                        'div[data-pl="product-description"]',
+                        timeout=5000
+                    )
+                    page.wait_for_timeout(1500)  # Let content fully render
+                except Exception:
+                    pass  # Description might not exist or uses different selector
+
+                # Check if description API was captured during scrolling
+                if captured_descriptions:
+                    best_desc = max(captured_descriptions, key=len)
+                    if len(best_desc) > 50:
+                        extracted['description'] = best_desc
+                        print(f"[scraper]    ✅ Description from API (after scroll) "
+                              f"({len(best_desc)} chars)")
+
+                # Try DOM extraction after scrolling
+                if not extracted.get('description'):
+                    d = get_description_from_dom(page)
+                    if d:
+                        extracted['description'] = d
+
+            # ── Price fallback from DOM scripts ─────────────────────────
+            if not extracted.get('price'):
+                try:
+                    for script in page.locator('script').all():
+                        txt = script.text_content() or ''
+                        m   = re.search(r'"price"\s*:\s*"([^"]+)"', txt)
+                        if m:
+                            extracted['price'] = m.group(1)
+                            break
+                except Exception:
+                    pass
+
+            browser.close()
+
+        if not extracted.get('title'):
+            print('[scraper] ❌ No title — aborting')
+            return None
+
+        # Summary
+        core = ['brand', 'color', 'dimensions', 'weight', 'material',
+                'certifications', 'country_of_origin', 'warranty', 'product_type']
+        seller_fields = ['store_name', 'store_id', 'seller_positive_rate',
+                         'seller_rating', 'seller_country', 'store_open_date']
+
+        print(f'\n[scraper] ✅ Extraction complete')
+        print(f'[scraper]    Title      : {extracted.get("title", "")[:70]}')
+        print(f'[scraper]    Desc       : {len(extracted.get("description", ""))} chars')
+        print(f'[scraper]    Core specs : {[k for k in core if extracted.get(k)]}')
+        print(f'[scraper]    Seller     : {[k for k in seller_fields if extracted.get(k)]}')
+        print(f'[scraper]    Images     : {sum(1 for i in range(1,21) if extracted.get(f"image_{i}"))}')
+
+        # Apply defaults
+        defaults = {
+            'description': '', 'brand': '', 'color': '', 'dimensions': '',
+            'weight': '', 'material': '', 'certifications': '',
+            'country_of_origin': '', 'warranty': '', 'product_type': '',
+            'shipping': '', 'price': '', 'rating': '', 'reviews': '',
+            'bullet_points': [], 'age_from': '', 'age_to': '',
+            'gender': '', 'safety_warning': '',
+            'capacity': '', 'freezer_capacity': '', 'voltage': '',
+            'model_number': '', 'power_source': '', 'installation': '',
+            'battery': '', 'display': '', 'camera': '',
+            'connectivity': '', 'memory': '', 'os': '',
+            # Seller defaults
+            'store_name': '', 'store_id': '', 'store_url': '',
+            'seller_id': '', 'seller_positive_rate': '', 'seller_rating': '',
+            'seller_communication': '', 'seller_shipping_speed': '',
+            'seller_country': '', 'store_open_date': '', 'seller_level': '',
+            'seller_total_reviews': '', 'seller_positive_num': '',
+            'is_top_rated': '',
+        }
+        for key, default in defaults.items():
+            if key not in extracted or not extracted[key]:
+                extracted[key] = default
+
+        for i in range(1, 21):
+            extracted.setdefault(f'image_{i}', '')
+
+        return extracted
+
+    except Exception as e:
+        print(f'[scraper] ❌ ERROR: {e}')
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+if __name__ == '__main__':
+    test_url = 'https://www.aliexpress.com/item/1005010388288135.html'
+    result   = get_product_info(test_url)
+    if result:
+        print('\n' + '='*80)
+        for k, v in result.items():
+            if v and not k.startswith('image_'):
+                print(f'  {k:30s}: {str(v)[:100]}')
+        print(f'  {"images":30s}: {sum(1 for i in range(1,21) if result.get(f"image_{i}"))}')
+    else:
+        print('FAILED')
