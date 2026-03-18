@@ -300,7 +300,7 @@ def parse_pdp_response(text: str) -> dict | None:
         except Exception:
             pass
 
-        # ── Description ────────────────────────────────────────────────────
+        # ── Description from API ───────────────────────────────────────────
         try:
             dm   = result.get('descriptionModule', {}) or {}
             desc = dm.get('description', '') or dm.get('content', '')
@@ -309,6 +309,19 @@ def parse_pdp_response(text: str) -> dict | None:
                 extracted['description'] = ' '.join(desc.split())[:2000]
         except Exception:
             pass
+
+        # ── Description fallback: check DESCRIPTION_PC ─────────────────────
+        if not extracted.get('description'):
+            try:
+                desc_pc = result.get('DESCRIPTION_PC', {}) or {}
+                desc_html = (desc_pc.get('descriptionContent', '') or
+                             desc_pc.get('content', '') or
+                             desc_pc.get('description', ''))
+                if desc_html and len(desc_html) > 50:
+                    desc_clean = re.sub(r'<[^>]+>', ' ', desc_html)
+                    extracted['description'] = ' '.join(desc_clean.split())[:2000]
+            except Exception:
+                pass
 
         return extracted if (extracted.get('title') or extracted.get('image_1')) else None
 
@@ -369,22 +382,148 @@ def get_images_from_dom(page) -> dict:
 
 
 def get_description_from_dom(page) -> str:
-    for selector in [
+    """
+    Enhanced description extraction using broad selectors
+    + recursive child traversal until leaf text is found.
+    """
+
+    # ── STRATEGY 1: Broad selectors + recursive leaf text extraction ────
+    desc_selectors = [
+        "#product-description",
+        '[class*="product-description"]',
+        '[class*="detail-content"]',
+        '.product-detail__description',
+        '[class*="productDescription"]',
+        '[class*="desc-content"]',
+        '#nav-description',
+        '[class*="ItemDescription"]',
+        'div[data-pl="product-description"]',
+        '.description-content',
         'div.richTextContainer[data-rich-text-render="true"]',
         'div[id="product-description"]',
         'div[id="nav-description"]',
         'div.detailmodule_text',
-    ]:
+        '[class*="detail-desc"]',
+        '[class*="product-detail-info"]',
+        '[class*="product_desc"]',
+        '[class*="pdp-description"]',
+        '[class*="module_description"]',
+        '[class*="DescriptionModule"]',
+    ]
+
+    for selector in desc_selectors:
         try:
             el = page.locator(selector).first
-            if el.count() > 0:
-                text = el.inner_text().strip()
-                text = re.sub(r'^.*?Description\s+report\s+', '', text,
-                              flags=re.IGNORECASE | re.DOTALL)
-                if len(text) > 50 and 'Smarter Shopping' not in text:
+            if el.count() == 0:
+                continue
+
+            # Recursive leaf text extraction via JavaScript
+            text = page.evaluate('''(element) => {
+                function getLeafText(node) {
+                    if (!node) return '';
+
+                    var tag = node.tagName ? node.tagName.toLowerCase() : '';
+                    if (['script', 'style', 'noscript', 'svg', 'iframe'].includes(tag)) {
+                        return '';
+                    }
+
+                    // Text node — return its content
+                    if (node.nodeType === Node.TEXT_NODE) {
+                        return (node.textContent || '').trim();
+                    }
+
+                    // Get child elements
+                    var childElements = node.children;
+
+                    // LEAF NODE: no child elements — return all text content
+                    if (!childElements || childElements.length === 0) {
+                        return (node.textContent || '').trim();
+                    }
+
+                    // HAS CHILDREN: recurse into each child node
+                    var texts = [];
+                    for (var i = 0; i < node.childNodes.length; i++) {
+                        var childText = getLeafText(node.childNodes[i]);
+                        if (childText) {
+                            texts.push(childText);
+                        }
+                    }
+                    return texts.join(' ');
+                }
+                return getLeafText(element);
+            }''', el.element_handle())
+
+            if text:
+                # Clean up the extracted text
+                text = re.sub(r'\s+', ' ', text).strip()
+                # Remove common AliExpress boilerplate
+                text = re.sub(
+                    r'^.*?Description\s+report\s+', '', text,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
+                text = re.sub(
+                    r'(Smarter Shopping|Better Living).*$', '', text,
+                    flags=re.IGNORECASE
+                )
+                text = text.strip()
+
+                if len(text) > 50:
+                    print(f"[scraper]    ✅ Description from DOM selector: "
+                          f"{selector} ({len(text)} chars)")
                     return text[:2000]
         except Exception:
-            pass
+            continue
+
+    # ── STRATEGY 2: Description loaded in iframe ────────────────────────
+    try:
+        iframe_selectors = [
+            'iframe[src*="desc"]',
+            'iframe[id*="desc"]',
+            'iframe[class*="desc"]',
+        ]
+        for iframe_sel in iframe_selectors:
+            try:
+                iframe_el = page.locator(iframe_sel).first
+                if iframe_el.count() > 0:
+                    frame = iframe_el.content_frame()
+                    if frame:
+                        body_text = frame.locator('body').inner_text()
+                        if body_text and len(body_text.strip()) > 50:
+                            text = re.sub(r'\s+', ' ', body_text).strip()
+                            print(f"[scraper]    ✅ Description from iframe ({len(text)} chars)")
+                            return text[:2000]
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # ── STRATEGY 3: Grab all text from any large content block ──────────
+    try:
+        large_blocks = page.locator(
+            'div[class*="desc"], div[class*="description"], '
+            'div[class*="Detail"], div[class*="detail"]'
+        ).all()
+        for block in large_blocks:
+            try:
+                text = block.inner_text().strip()
+                text = re.sub(r'\s+', ' ', text)
+                text = re.sub(
+                    r'^.*?Description\s+report\s+', '', text,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
+                text = re.sub(
+                    r'(Smarter Shopping|Better Living).*$', '', text,
+                    flags=re.IGNORECASE
+                )
+                text = text.strip()
+                if len(text) > 100 and 'Smarter Shopping' not in text:
+                    print(f"[scraper]    ✅ Description from large block ({len(text)} chars)")
+                    return text[:2000]
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     return ''
 
 
@@ -394,6 +533,7 @@ def get_description_from_dom(page) -> str:
 
 def get_product_info(url: str) -> dict | None:
     captured_pdp = []
+    captured_descriptions = []
 
     try:
         with sync_playwright() as p:
@@ -416,6 +556,8 @@ def get_product_info(url: str) -> dict | None:
 
             def handle_response(response):
                 url_r = response.url
+
+                # Capture PDP API
                 if ('mtop.aliexpress.pdp.pc.query' in url_r or
                         'mtop.aliexpress.itemdetail.pc' in url_r):
                     try:
@@ -430,11 +572,30 @@ def get_product_info(url: str) -> dict | None:
                     except Exception:
                         pass
 
+                # Capture description API (separate endpoint)
+                if ('mtop.aliexpress.pdp.pc.description' in url_r or
+                        'aeglobal/product/description' in url_r or
+                        'pdp/description' in url_r.lower()):
+                    try:
+                        body = response.body()
+                        if len(body) > 100:
+                            text = body.decode('utf-8', errors='replace')
+                            desc_clean = re.sub(r'<[^>]+>', ' ', text)
+                            desc_clean = ' '.join(desc_clean.split()).strip()
+                            if len(desc_clean) > 50:
+                                captured_descriptions.append(desc_clean[:2000])
+                                print(f"[scraper]    📡 Captured description API: "
+                                      f"{url_r[:80]}")
+                    except Exception:
+                        pass
+
             page.on('response', handle_response)
 
             print(f'\n[scraper] 🌐 Opening: {url}')
             page.goto(url, timeout=60000, wait_until='domcontentloaded')
             page.wait_for_timeout(5000)
+
+            # Initial scroll
             page.mouse.wheel(0, 800)
             page.wait_for_timeout(1000)
 
@@ -449,15 +610,56 @@ def get_product_info(url: str) -> dict | None:
                         if k not in extracted or not extracted[k]:
                             extracted[k] = v
 
+            # Use captured description API if available
+            if not extracted.get('description') and captured_descriptions:
+                best_desc = max(captured_descriptions, key=len)
+                if len(best_desc) > 50:
+                    extracted['description'] = best_desc
+                    print(f"[scraper]    ✅ Description from API interception "
+                          f"({len(best_desc)} chars)")
+
             # DOM fallbacks
             if not extracted.get('title'):
                 extracted['title'] = get_title_from_dom(page)
             if not extracted.get('image_1'):
                 extracted.update(get_images_from_dom(page))
+
+            # ── SCROLL DOWN to trigger lazy-loaded description ──────────
             if not extracted.get('description'):
-                d = get_description_from_dom(page)
-                if d:
-                    extracted['description'] = d
+                print("[scraper]    📜 Scrolling to load description...")
+
+                for scroll_y in [800, 1600, 2400, 3200, 4000, 5000]:
+                    page.mouse.wheel(0, 800)
+                    page.wait_for_timeout(500)
+
+                # Wait for description container to appear
+                try:
+                    page.wait_for_selector(
+                        '#product-description, [class*="product-description"], '
+                        '[class*="detail-content"], .product-detail__description, '
+                        '[class*="productDescription"], [class*="desc-content"], '
+                        'div[data-pl="product-description"]',
+                        timeout=5000
+                    )
+                    page.wait_for_timeout(1500)  # Let content fully render
+                except Exception:
+                    pass  # Description might not exist or uses different selector
+
+                # Check if description API was captured during scrolling
+                if captured_descriptions:
+                    best_desc = max(captured_descriptions, key=len)
+                    if len(best_desc) > 50:
+                        extracted['description'] = best_desc
+                        print(f"[scraper]    ✅ Description from API (after scroll) "
+                              f"({len(best_desc)} chars)")
+
+                # Try DOM extraction after scrolling
+                if not extracted.get('description'):
+                    d = get_description_from_dom(page)
+                    if d:
+                        extracted['description'] = d
+
+            # ── Price fallback from DOM scripts ─────────────────────────
             if not extracted.get('price'):
                 try:
                     for script in page.locator('script').all():
