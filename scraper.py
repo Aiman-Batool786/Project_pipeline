@@ -1,13 +1,20 @@
 """
 scraper.py
 ──────────
-APPROACH: Direct DOM + embedded JSON extraction (no API interception dependency).
+Captures the mtop.aliexpress.pdp.pc.query API response.
+Extracts: specs, images, title, price, description, AND seller info.
 
-Strategy order:
-  1. Load page, scroll fully to trigger all lazy content
-  2. Extract __NEXT_DATA__ / window.__runParams / inline JSON from <script> tags
-  3. DOM fallback with aggressive selectors
-  4. Description: scroll to bottom, wait, extract from rendered DOM / iframe
+Seller info comes from: result.SHOP_CARD_PC (confirmed from debug output)
+  - store_name          : SHOP_CARD_PC.storeName
+  - store_id            : SHOP_CARD_PC.sellerInfo.storeNum
+  - store_url           : SHOP_CARD_PC.sellerInfo.storeURL
+  - seller_id           : SHOP_CARD_PC.sellerInfo.adminSeq
+  - seller_positive_rate: SHOP_CARD_PC.sellerPositiveRate
+  - seller_rating       : benefitInfoList[title=store rating].value
+  - seller_country      : SHOP_CARD_PC.sellerInfo.countryCompleteName
+  - store_open_date     : SHOP_CARD_PC.sellerInfo.formatOpenTime
+  - seller_level        : SHOP_CARD_PC.sellerLevel
+  - seller_total_reviews: SHOP_CARD_PC.sellerTotalNum
 
 RULE: Seller info is NEVER sent to LLM. Always stored as original scraped values.
 """
@@ -15,7 +22,6 @@ RULE: Seller info is NEVER sent to LLM. Always stored as original scraped values
 from playwright.sync_api import sync_playwright
 import re
 import json
-import time
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,15 +70,8 @@ SPEC_MAPPING = {
 def map_props_to_fields(props: list) -> tuple:
     raw = {}
     for item in props:
-        # Handle both dict format and tuple/list format
-        if isinstance(item, dict):
-            name  = str(item.get('attrName', '') or item.get('name', '') or '').strip()
-            value = str(item.get('attrValue', '') or item.get('value', '') or '').strip()
-        elif isinstance(item, (list, tuple)) and len(item) >= 2:
-            name  = str(item[0]).strip()
-            value = str(item[1]).strip()
-        else:
-            continue
+        name  = str(item.get('attrName',  '') or '').strip()
+        value = str(item.get('attrValue', '') or '').strip()
         if name and value:
             raw[name.lower()] = value
 
@@ -104,9 +103,14 @@ def map_props_to_fields(props: list) -> tuple:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SELLER INFO EXTRACTOR
+# Path confirmed from debug: result.SHOP_CARD_PC
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_seller_info(result: dict) -> dict:
+    """
+    Extract seller/store information from SHOP_CARD_PC.
+    Returns original values — never modified by LLM.
+    """
     seller = {
         'store_name':           '',
         'store_id':             '',
@@ -126,27 +130,22 @@ def extract_seller_info(result: dict) -> dict:
 
     try:
         shop = result.get('SHOP_CARD_PC', {}) or {}
-
-        # Try alternate paths
         if not shop:
-            shop = result.get('storeModule', {}) or {}
-        if not shop:
-            shop = result.get('shopCardModule', {}) or {}
-        if not shop:
-            # Deep search
-            shop = _deep_find_key(result, 'storeName', max_depth=5)
-
-        if not shop or not isinstance(shop, dict):
-            print("[scraper]    ⚠️  No shop/seller data found")
+            print("[scraper]    ⚠️  SHOP_CARD_PC not found in API response")
             return seller
 
+        # Store name
         seller['store_name'] = str(shop.get('storeName', '') or '')
+
+        # Seller level
         seller['seller_level'] = str(shop.get('sellerLevel', '') or '')
-        seller['seller_positive_rate'] = str(shop.get('sellerPositiveRate', '') or
-                                              shop.get('positiveRate', '') or '')
+
+        # Positive rate & review counts
+        seller['seller_positive_rate'] = str(shop.get('sellerPositiveRate', '') or '')
         seller['seller_total_reviews'] = str(shop.get('sellerTotalNum', '') or '')
         seller['seller_positive_num']  = str(shop.get('sellerPositiveNum', '') or '')
 
+        # Detailed ratings from benefitInfoList
         benefit_list = shop.get('benefitInfoList', []) or []
         for item in benefit_list:
             title = str(item.get('title', '') or '').lower().strip()
@@ -156,6 +155,7 @@ def extract_seller_info(result: dict) -> dict:
             elif 'communication' in title:
                 seller['seller_communication'] = value
 
+        # sellerInfo sub-object
         seller_info = shop.get('sellerInfo', {}) or {}
         if seller_info:
             seller['seller_id']      = str(seller_info.get('adminSeq', '') or '')
@@ -170,602 +170,286 @@ def extract_seller_info(result: dict) -> dict:
                     raw_url = 'https:' + raw_url
                 seller['store_url'] = raw_url
 
-        # Fallbacks
+        # Also try GLOBAL_DATA for store name fallback
         if not seller['store_name']:
-            seller['store_name'] = str(shop.get('title', '') or
-                                       shop.get('name', '') or '')
+            try:
+                seller['store_name'] = str(
+                    result['GLOBAL_DATA']['globalData']['storeName'] or ''
+                )
+            except (KeyError, TypeError):
+                pass
+
+        # Store ID fallback from GLOBAL_DATA
         if not seller['store_id']:
-            seller['store_id'] = str(shop.get('storeId', '') or
-                                     shop.get('storeNum', '') or '')
-        if not seller['store_url'] and seller.get('store_id'):
-            seller['store_url'] = f"https://www.aliexpress.com/store/{seller['store_id']}"
+            try:
+                seller['store_id'] = str(
+                    result['GLOBAL_DATA']['globalData']['storeId'] or ''
+                )
+            except (KeyError, TypeError):
+                pass
 
-        # GLOBAL_DATA fallbacks
-        try:
-            gd = result.get('GLOBAL_DATA', {}).get('globalData', {}) or {}
-            if not seller['store_name']:
-                seller['store_name'] = str(gd.get('storeName', '') or '')
-            if not seller['store_id']:
-                seller['store_id'] = str(gd.get('storeId', '') or '')
-        except (KeyError, TypeError):
-            pass
-
-        found = {k: v for k, v in seller.items() if v}
-        if found:
-            print(f"[scraper]    ✅ Seller info: {list(found.keys())}")
+        print(f"[scraper]    ✅ Seller info extracted:")
+        for k, v in seller.items():
+            if v:
+                print(f"[scraper]       {k}: {v}")
 
     except Exception as e:
-        print(f"[scraper]    ⚠️  Seller info error: {e}")
+        print(f"[scraper]    ⚠️  Seller info extraction error: {e}")
 
     return seller
 
 
-def _deep_find_key(obj, key, max_depth=5, _depth=0):
-    """Recursively find a dict containing a specific key."""
-    if _depth > max_depth or not isinstance(obj, dict):
-        return None
-    if key in obj:
-        return obj
-    for v in obj.values():
-        if isinstance(v, dict):
-            result = _deep_find_key(v, key, max_depth, _depth + 1)
-            if result:
-                return result
-        elif isinstance(v, list):
-            for item in v:
-                if isinstance(item, dict):
-                    result = _deep_find_key(item, key, max_depth, _depth + 1)
-                    if result:
-                        return result
-    return None
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# EXTRACT ALL DATA FROM EMBEDDED SCRIPT TAGS
-# This is the PRIMARY extraction method — works even when API interception fails
+# MAIN API RESPONSE PARSER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_from_page_scripts(page) -> dict:
-    """
-    Extract product data from ALL script tags on the page.
-    AliExpress embeds JSON in multiple formats:
-      - window.runParams = {...}
-      - window.__INIT_DATA__ = {...}
-      - __NEXT_DATA__ script tag
-      - Inline JSON blobs with known keys
-    """
-    extracted = {}
-
-    print("[scraper]    🔍 Scanning all script tags for embedded data...")
-
+def parse_pdp_response(text: str) -> dict | None:
     try:
-        all_script_content = page.evaluate('''() => {
-            var scripts = document.querySelectorAll('script');
-            var contents = [];
-            for (var i = 0; i < scripts.length; i++) {
-                var text = scripts[i].textContent || '';
-                if (text.length > 200) {
-                    contents.push(text);
-                }
-            }
-            return contents;
-        }''')
-
-        print(f"[scraper]    📜 Found {len(all_script_content)} script blocks to scan")
-
-        for idx, script_text in enumerate(all_script_content):
-            try:
-                _extract_from_script_text(script_text, extracted)
-            except Exception:
-                continue
-
-    except Exception as e:
-        print(f"[scraper]    ⚠️  Script scan error: {e}")
-
-    return extracted
-
-
-def _extract_from_script_text(text: str, extracted: dict):
-    """Parse a single script block and extract known data patterns."""
-
-    # ── Pattern 1: window.runParams / window.__runParams ────────────────
-    for pattern in [
-        r'window\.runParams\s*=\s*(\{.+?\})\s*;',
-        r'window\.__runParams\s*=\s*(\{.+?\})\s*;',
-        r'runParams\s*=\s*(\{.+?\})\s*;',
-    ]:
-        m = re.search(pattern, text, re.DOTALL)
+        text = text.strip()
+        m = re.match(r'^[a-zA-Z_$][a-zA-Z0-9_$]*\s*\((.*)\)\s*;?\s*$', text, re.DOTALL)
         if m:
+            text = m.group(1)
+
+        data   = json.loads(text)
+        result = (data.get('data', {}) or {}).get('result', {}) or {}
+
+        if not result:
+            print("[scraper]    ⚠️  Empty result in API response")
+            return None
+
+        extracted = {}
+
+        # ── Title ──────────────────────────────────────────────────────────
+        try:
+            extracted['title'] = result['GLOBAL_DATA']['globalData']['subject']
+        except (KeyError, TypeError):
+            pass
+        if not extracted.get('title'):
             try:
-                data = json.loads(m.group(1))
-                _parse_run_params(data, extracted)
-                print(f"[scraper]       ✅ Extracted from runParams")
-            except json.JSONDecodeError:
+                extracted['title'] = result['titleModule']['subject']
+            except (KeyError, TypeError):
+                pass
+        if extracted.get('title'):
+            extracted['title'] = str(extracted['title']).strip()
+
+        # ── Specifications ─────────────────────────────────────────────────
+        props = []
+        try:
+            props = result['PRODUCT_PROP_PC']['showedProps'] or []
+        except (KeyError, TypeError):
+            pass
+        if not props:
+            try:
+                props = result['PRODUCT_PROP_PC']['outerProps'] or []
+            except (KeyError, TypeError):
                 pass
 
-    # ── Pattern 2: window.__INIT_DATA__ ─────────────────────────────────
-    m = re.search(r'window\.__INIT_DATA__\s*=\s*(\{.+?\})\s*;?\s*$', text, re.DOTALL | re.MULTILINE)
-    if m:
+        if props:
+            print(f"[scraper]    ✅ Found {len(props)} spec props in API JSON")
+            mapped, raw = map_props_to_fields(props)
+            extracted.update(mapped)
+            for k, v in raw.items():
+                print(f"[scraper]       {k}: {v[:60]}")
+        else:
+            print("[scraper]    ⚠️  No specs found in PRODUCT_PROP_PC")
+
+        # ── Seller Info ────────────────────────────────────────────────────
+        seller_info = extract_seller_info(result)
+        extracted.update(seller_info)
+
+        # ── Images ─────────────────────────────────────────────────────────
+        images = []
         try:
-            data = json.loads(m.group(1))
-            _parse_init_data(data, extracted)
-            print(f"[scraper]       ✅ Extracted from __INIT_DATA__")
-        except json.JSONDecodeError:
+            images = result['imageModule']['imagePathList'] or []
+        except (KeyError, TypeError):
+            pass
+        if not images:
+            def find_images(obj, depth=0):
+                if depth > 6 or not isinstance(obj, dict):
+                    return []
+                if 'imagePathList' in obj:
+                    v = obj['imagePathList']
+                    if isinstance(v, list) and v:
+                        return v
+                for v in obj.values():
+                    r = find_images(v, depth + 1)
+                    if r:
+                        return r
+                return []
+            images = find_images(result)
+
+        for idx, img in enumerate(images[:20], 1):
+            if img:
+                if img.startswith('//'):
+                    img = 'https:' + img
+                elif not img.startswith('http'):
+                    img = 'https://' + img
+                extracted[f'image_{idx}'] = re.sub(r'_\d+x\d+', '', img)
+
+        if images:
+            print(f"[scraper]    ✅ Found {len(images)} images")
+
+        # ── Price ──────────────────────────────────────────────────────────
+        try:
+            pm = result.get('priceModule', {}) or result.get('PRICE_MODULE', {}) or {}
+            price = (pm.get('formatedActivityPrice') or
+                     pm.get('formatedPrice') or
+                     pm.get('minActivityAmount', {}).get('formatedAmount', '') or '')
+            if price:
+                extracted['price'] = str(price)
+        except Exception:
             pass
 
-    # ── Pattern 3: Large JSON blobs with known keys ─────────────────────
-    if '"imagePathList"' in text or '"productPropList"' in text or '"PRODUCT_PROP_PC"' in text:
-        # Try to find any JSON object in the script
-        for json_pattern in [
-            r'(\{"data"\s*:\s*\{.+\})\s*;?\s*$',
-            r'(\{"result"\s*:\s*\{.+\})\s*;?\s*$',
-            r'JSON\.parse\s*\(\s*[\'"](.+?)[\'"]\s*\)',
-        ]:
-            m = re.search(json_pattern, text, re.DOTALL | re.MULTILINE)
-            if m:
-                try:
-                    raw = m.group(1)
-                    # Unescape if from JSON.parse
-                    if '\\' in raw and '"data"' not in raw:
-                        raw = raw.encode().decode('unicode_escape')
-                    data = json.loads(raw)
-                    _parse_generic_json(data, extracted)
-                    print(f"[scraper]       ✅ Extracted from inline JSON blob")
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    pass
+        # ── Description (from API JSON) ────────────────────────────────────
+        try:
+            dm   = result.get('descriptionModule', {}) or {}
+            desc = dm.get('description', '') or dm.get('content', '')
+            if desc and len(desc) > 50:
+                desc = re.sub(r'<[^>]+>', ' ', desc)
+                extracted['description'] = ' '.join(desc.split())[:2000]
+        except Exception:
+            pass
 
-    # ── Pattern 4: Direct key extraction via regex (last resort) ────────
-    if not extracted.get('title'):
-        for p in [
-            r'"subject"\s*:\s*"([^"]{10,200})"',
-            r'"title"\s*:\s*"([^"]{10,200})"',
-            r'"productTitle"\s*:\s*"([^"]{10,200})"',
-        ]:
-            m = re.search(p, text)
-            if m:
-                extracted.setdefault('title', m.group(1))
-                break
+        # ── Description fallback: DESCRIPTION_PC in API JSON ───────────────
+        if not extracted.get('description'):
+            try:
+                desc_pc = result.get('DESCRIPTION_PC', {}) or {}
+                desc_html = (desc_pc.get('descriptionContent', '') or
+                             desc_pc.get('content', '') or
+                             desc_pc.get('description', '') or
+                             desc_pc.get('html', ''))
+                if desc_html and len(desc_html) > 50:
+                    desc_clean = re.sub(r'<[^>]+>', ' ', desc_html)
+                    extracted['description'] = ' '.join(desc_clean.split())[:2000]
+                    print(f"[scraper]    ✅ Description from DESCRIPTION_PC in API")
+            except Exception:
+                pass
 
-    # Extract image list via regex
-    if not extracted.get('image_1'):
-        m = re.search(r'"imagePathList"\s*:\s*\[([^\]]+)\]', text)
-        if m:
-            urls = re.findall(r'"((?:https?://|//)[^"]+)"', m.group(1))
-            for i, url in enumerate(urls[:20], 1):
-                if url.startswith('//'):
-                    url = 'https:' + url
-                extracted.setdefault(f'image_{i}', re.sub(r'_\d+x\d+', '', url))
-
-    # Extract price via regex
-    if not extracted.get('price'):
-        for p in [
-            r'"formatedActivityPrice"\s*:\s*"([^"]+)"',
-            r'"formatedPrice"\s*:\s*"([^"]+)"',
-            r'"minPrice"\s*:\s*"([^"]+)"',
-            r'"discountPrice"\s*:\s*"([^"]+)"',
-        ]:
-            m = re.search(p, text)
-            if m:
-                extracted.setdefault('price', m.group(1))
-                break
-
-    # Extract specs via regex
-    spec_patterns = [
-        r'"showedProps"\s*:\s*(\[[^\]]*\])',
-        r'"outerProps"\s*:\s*(\[[^\]]*\])',
-        r'"productPropList"\s*:\s*(\[[^\]]*\])',
-        r'"props"\s*:\s*(\[[^\]]*\])',
-    ]
-    if not extracted.get('_specs_found'):
-        for p in spec_patterns:
-            m = re.search(p, text, re.DOTALL)
-            if m:
-                try:
-                    props = json.loads(m.group(1))
-                    if props and len(props) > 0:
-                        mapped, raw = map_props_to_fields(props)
-                        if mapped:
-                            for k, v in mapped.items():
-                                extracted.setdefault(k, v)
-                            extracted['_specs_found'] = True
-                            extracted['_raw_specs'] = raw
-                            print(f"[scraper]       ✅ Found {len(mapped)} specs via regex")
-                            break
-                except json.JSONDecodeError:
-                    pass
-
-    # Extract description HTML via regex
-    if not extracted.get('description'):
-        for p in [
-            r'"description"\s*:\s*"((?:[^"\\]|\\.){50,})"',
-            r'"descriptionContent"\s*:\s*"((?:[^"\\]|\\.){50,})"',
-            r'"content"\s*:\s*"((?:[^"\\]|\\.){50,})"',
-        ]:
-            m = re.search(p, text)
-            if m:
-                try:
-                    desc = m.group(1).encode().decode('unicode_escape')
-                    desc = re.sub(r'<[^>]+>', ' ', desc)
-                    desc = ' '.join(desc.split()).strip()
-                    if len(desc) > 50:
-                        extracted['description'] = desc[:2000]
-                        print(f"[scraper]       ✅ Description from script regex ({len(desc)} chars)")
-                        break
-                except Exception:
-                    pass
-
-    # Extract seller/store info via regex
-    if not extracted.get('store_name'):
-        m = re.search(r'"storeName"\s*:\s*"([^"]+)"', text)
-        if m:
-            extracted.setdefault('store_name', m.group(1))
-
-
-def _parse_run_params(data: dict, extracted: dict):
-    """Parse window.runParams format."""
-    # Navigate to actual data
-    result = data
-    if 'data' in result:
-        result = result['data']
-    if 'result' in result:
-        result = result['result']
-
-    _parse_generic_json(result, extracted)
-
-
-def _parse_init_data(data: dict, extracted: dict):
-    """Parse __INIT_DATA__ format."""
-    # This format often wraps data differently
-    for key in ['data', 'pageData', 'productData', 'result']:
-        if key in data and isinstance(data[key], dict):
-            _parse_generic_json(data[key], extracted)
-            return
-
-    # Try all top-level values
-    for v in data.values():
-        if isinstance(v, dict) and len(v) > 5:
-            _parse_generic_json(v, extracted)
-
-
-def _parse_generic_json(data: dict, extracted: dict):
-    """Extract known fields from any JSON structure."""
-    if not isinstance(data, dict):
-        return
-
-    # Title
-    if not extracted.get('title'):
-        for path in [
-            ['GLOBAL_DATA', 'globalData', 'subject'],
-            ['titleModule', 'subject'],
-            ['pageModule', 'title'],
-        ]:
-            val = _get_nested(data, path)
-            if val and isinstance(val, str) and len(val) > 5:
-                extracted['title'] = val.strip()
-                break
-
-        # Deep search for subject/title
-        if not extracted.get('title'):
-            val = _deep_find_value(data, 'subject', max_depth=4)
-            if val and isinstance(val, str) and len(val) > 5:
-                extracted['title'] = val.strip()
-
-    # Specs
-    if not extracted.get('_specs_found'):
-        for path in [
-            ['PRODUCT_PROP_PC', 'showedProps'],
-            ['PRODUCT_PROP_PC', 'outerProps'],
-            ['productPropModule', 'props'],
-            ['specsModule', 'props'],
-        ]:
-            props = _get_nested(data, path)
-            if props and isinstance(props, list) and len(props) > 0:
-                mapped, raw = map_props_to_fields(props)
-                if mapped:
-                    for k, v in mapped.items():
-                        extracted.setdefault(k, v)
-                    extracted['_specs_found'] = True
-                    extracted['_raw_specs'] = raw
-                    print(f"[scraper]       ✅ Specs from JSON path: {'.'.join(path)}")
-                    break
-
-    # Images
-    if not extracted.get('image_1'):
-        images = _get_nested(data, ['imageModule', 'imagePathList'])
-        if not images:
-            images = _deep_find_value(data, 'imagePathList', max_depth=4)
-        if images and isinstance(images, list):
-            for i, img in enumerate(images[:20], 1):
-                if img:
-                    if isinstance(img, str):
-                        url = img
-                    elif isinstance(img, dict):
-                        url = img.get('url', '') or img.get('src', '')
-                    else:
-                        continue
-                    if url:
-                        if url.startswith('//'):
-                            url = 'https:' + url
-                        elif not url.startswith('http'):
-                            url = 'https://' + url
-                        extracted[f'image_{i}'] = re.sub(r'_\d+x\d+', '', url)
-
-    # Price
-    if not extracted.get('price'):
-        for path in [
-            ['priceModule', 'formatedActivityPrice'],
-            ['priceModule', 'formatedPrice'],
-            ['PRICE_MODULE', 'formatedActivityPrice'],
-            ['PRICE_MODULE', 'formatedPrice'],
-        ]:
-            val = _get_nested(data, path)
-            if val:
-                extracted['price'] = str(val)
-                break
-
-        if not extracted.get('price'):
-            val = _deep_find_value(data, 'formatedActivityPrice', max_depth=4)
-            if not val:
-                val = _deep_find_value(data, 'formatedPrice', max_depth=4)
-            if val:
-                extracted['price'] = str(val)
-
-    # Description from JSON
-    if not extracted.get('description'):
-        for path in [
-            ['descriptionModule', 'description'],
-            ['descriptionModule', 'content'],
-            ['DESCRIPTION_PC', 'descriptionContent'],
-            ['DESCRIPTION_PC', 'content'],
-        ]:
-            val = _get_nested(data, path)
-            if val and isinstance(val, str) and len(val) > 50:
-                desc = re.sub(r'<[^>]+>', ' ', val)
-                desc = ' '.join(desc.split()).strip()
-                if len(desc) > 50:
+        # ── Description fallback: deep search in API JSON ──────────────────
+        if not extracted.get('description'):
+            try:
+                desc = _deep_find_description(result)
+                if desc and len(desc) > 50:
                     extracted['description'] = desc[:2000]
-                    break
+                    print(f"[scraper]    ✅ Description from deep search in API JSON")
+            except Exception:
+                pass
 
-    # Seller info
-    seller = extract_seller_info(data)
-    for k, v in seller.items():
-        if v and not extracted.get(k):
-            extracted[k] = v
+        return extracted if (extracted.get('title') or extracted.get('image_1')) else None
 
-
-def _get_nested(data: dict, keys: list):
-    """Safely get a nested value."""
-    current = data
-    for key in keys:
-        if isinstance(current, dict):
-            current = current.get(key)
-        else:
-            return None
-        if current is None:
-            return None
-    return current
+    except json.JSONDecodeError as e:
+        print(f"[scraper]    ⚠️  JSON parse error: {e}")
+        return None
+    except Exception as e:
+        print(f"[scraper]    ⚠️  Parse error: {e}")
+        return None
 
 
-def _deep_find_value(obj, key, max_depth=5, _depth=0):
-    """Recursively find the value for a specific key."""
-    if _depth > max_depth:
+def _deep_find_description(obj, depth=0):
+    """Recursively search for description content in nested JSON."""
+    if depth > 6:
         return None
     if isinstance(obj, dict):
-        if key in obj:
-            return obj[key]
+        # Check known description keys
+        for key in ['description', 'descriptionContent', 'content', 'detailDesc',
+                     'productDescription', 'descContent', 'richTextDesc']:
+            val = obj.get(key)
+            if isinstance(val, str) and len(val) > 50:
+                cleaned = re.sub(r'<[^>]+>', ' ', val)
+                cleaned = ' '.join(cleaned.split()).strip()
+                if len(cleaned) > 50:
+                    return cleaned
         for v in obj.values():
-            result = _deep_find_value(v, key, max_depth, _depth + 1)
-            if result is not None:
+            result = _deep_find_description(v, depth + 1)
+            if result:
                 return result
     elif isinstance(obj, list):
         for item in obj:
-            result = _deep_find_value(item, key, max_depth, _depth + 1)
-            if result is not None:
+            result = _deep_find_description(item, depth + 1)
+            if result:
                 return result
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DOM-BASED EXTRACTION (runs AFTER script extraction)
+# DOM FALLBACKS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_title_from_dom(page) -> str:
-    """Extract title from DOM elements."""
-    try:
-        title = page.evaluate('''() => {
-            // Method 1: og:title
-            var og = document.querySelector('meta[property="og:title"]');
-            if (og && og.content && og.content.length > 5) return og.content.trim();
-
-            // Method 2: h1 tags
-            var h1s = document.querySelectorAll('h1');
-            for (var i = 0; i < h1s.length; i++) {
-                var text = h1s[i].textContent.trim();
-                if (text.length > 10 && text.length < 500) return text;
-            }
-
-            // Method 3: title tag
-            var titleTag = document.querySelector('title');
-            if (titleTag) {
-                var t = titleTag.textContent.trim();
-                // Remove "| AliExpress" suffix
-                t = t.replace(/\\s*[-|]\\s*AliExpress.*$/i, '').trim();
-                if (t.length > 5) return t;
-            }
-
-            return '';
-        }''')
-        return title or ''
-    except Exception:
-        return ''
+    for selector in ['meta[property="og:title"]', 'h1[data-pl="product-title"]']:
+        try:
+            el = page.locator(selector).first
+            if el.count() > 0:
+                val = (el.get_attribute('content') or el.inner_text() or '').strip()
+                if val:
+                    return val
+        except Exception:
+            pass
+    return ''
 
 
 def get_images_from_dom(page) -> dict:
-    """Extract images from DOM."""
     images = {}
     try:
-        urls = page.evaluate('''() => {
-            var results = [];
-
-            // Method 1: Image carousel / gallery
-            var imgs = document.querySelectorAll(
-                'img[src*="alicdn"], img[src*="ae01.alicdn"], ' +
-                'img[data-src*="alicdn"], img[src*="cbu01.alicdn"]'
-            );
-            for (var i = 0; i < imgs.length; i++) {
-                var src = imgs[i].src || imgs[i].getAttribute('data-src') || '';
-                if (src && src.includes('alicdn') && !src.includes('avatar') &&
-                    !src.includes('icon') && !src.includes('logo') &&
-                    (src.includes('.jpg') || src.includes('.png') || src.includes('.webp'))) {
-                    if (results.indexOf(src) === -1) results.push(src);
-                }
-            }
-
-            // Method 2: og:image
-            if (results.length === 0) {
-                var og = document.querySelector('meta[property="og:image"]');
-                if (og && og.content) results.push(og.content);
-            }
-
-            return results.slice(0, 20);
-        }''')
-
-        for i, url in enumerate(urls or [], 1):
-            if url:
-                if url.startswith('//'):
-                    url = 'https:' + url
-                images[f'image_{i}'] = re.sub(r'_\d+x\d+', '', url)
-
-        if images:
-            print(f"[scraper]    ✅ {len(images)} images from DOM")
-
-    except Exception as e:
-        print(f"[scraper]    ⚠️  DOM image error: {e}")
-
+        for script in page.locator('script').all():
+            try:
+                txt = script.text_content() or ''
+                m   = re.search(r'"imagePathList"\s*:\s*\[(.*?)\]', txt, re.DOTALL)
+                if m:
+                    urls = re.findall(r'"(https?://[^"]+\.jpg[^"]*)"', m.group(1))
+                    if not urls:
+                        urls = re.findall(r'"(//[^"]+\.jpg[^"]*)"', m.group(1))
+                    for idx, url in enumerate(urls[:20], 1):
+                        if url.startswith('//'):
+                            url = 'https:' + url
+                        images[f'image_{idx}'] = re.sub(r'_\d+x\d+', '', url)
+                    if images:
+                        print(f"[scraper]    ✅ {len(images)} images from DOM script")
+                        return images
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        og = page.locator('meta[property="og:image"]').get_attribute('content')
+        if og:
+            images['image_1'] = og
+    except Exception:
+        pass
     return images
 
 
-def get_specs_from_dom(page) -> tuple:
-    """Extract specifications from rendered DOM table/list."""
-    try:
-        specs = page.evaluate('''() => {
-            var results = [];
+# ─────────────────────────────────────────────────────────────────────────────
+# DESCRIPTION EXTRACTION — MULTI-STRATEGY
+# ─────────────────────────────────────────────────────────────────────────────
 
-            // Method 1: Spec list items (key-value pairs)
-            var specItems = document.querySelectorAll(
-                '[class*="spec"] li, [class*="prop"] li, ' +
-                '[class*="attribute"] li, [class*="Specification"] li, ' +
-                '[class*="product-prop"] li, [class*="ProductProp"] li, ' +
-                'div[class*="spec-item"], div[class*="prop-item"], ' +
-                'ul[class*="spec"] li, ul[class*="prop"] li'
-            );
-            for (var i = 0; i < specItems.length; i++) {
-                var el = specItems[i];
-                var text = el.textContent.trim();
-
-                // Try to find key-value via child elements
-                var spans = el.querySelectorAll('span, div, dt, dd, th, td');
-                if (spans.length >= 2) {
-                    var key = spans[0].textContent.trim().replace(/:$/, '');
-                    var val = spans[1].textContent.trim();
-                    if (key && val && key !== val) {
-                        results.push({attrName: key, attrValue: val});
-                        continue;
-                    }
-                }
-
-                // Try colon-separated
-                if (text.includes(':')) {
-                    var parts = text.split(':');
-                    var key = parts[0].trim();
-                    var val = parts.slice(1).join(':').trim();
-                    if (key && val) {
-                        results.push({attrName: key, attrValue: val});
-                    }
-                }
-            }
-
-            // Method 2: Table rows
-            if (results.length === 0) {
-                var rows = document.querySelectorAll(
-                    '[class*="spec"] tr, [class*="prop"] tr, ' +
-                    '[class*="detail"] table tr, table[class*="spec"] tr'
-                );
-                for (var i = 0; i < rows.length; i++) {
-                    var cells = rows[i].querySelectorAll('td, th');
-                    if (cells.length >= 2) {
-                        var key = cells[0].textContent.trim().replace(/:$/, '');
-                        var val = cells[1].textContent.trim();
-                        if (key && val && key !== val) {
-                            results.push({attrName: key, attrValue: val});
-                        }
-                    }
-                }
-            }
-
-            // Method 3: Definition lists
-            if (results.length === 0) {
-                var dts = document.querySelectorAll('dt');
-                for (var i = 0; i < dts.length; i++) {
-                    var dd = dts[i].nextElementSibling;
-                    if (dd && dd.tagName === 'DD') {
-                        var key = dts[i].textContent.trim().replace(/:$/, '');
-                        var val = dd.textContent.trim();
-                        if (key && val) {
-                            results.push({attrName: key, attrValue: val});
-                        }
-                    }
-                }
-            }
-
-            // Method 4: Any key-value looking pairs in spec-like containers
-            if (results.length === 0) {
-                var containers = document.querySelectorAll(
-                    '[class*="specification"], [class*="Specification"], ' +
-                    '[class*="product-prop"], [class*="ProductProp"], ' +
-                    '[class*="attr"], [class*="Attr"]'
-                );
-                for (var c = 0; c < containers.length; c++) {
-                    var divs = containers[c].querySelectorAll('div, span, p');
-                    for (var i = 0; i < divs.length; i++) {
-                        var text = divs[i].textContent.trim();
-                        if (text.includes(':') && text.length < 200) {
-                            var parts = text.split(':');
-                            var key = parts[0].trim();
-                            var val = parts.slice(1).join(':').trim();
-                            if (key && val && key.length < 50 && val.length < 150) {
-                                results.push({attrName: key, attrValue: val});
-                            }
-                        }
-                    }
-                }
-            }
-
-            return results;
-        }''')
-
-        if specs and len(specs) > 0:
-            print(f"[scraper]    ✅ {len(specs)} specs from DOM")
-            return map_props_to_fields(specs)
-
-    except Exception as e:
-        print(f"[scraper]    ⚠️  DOM spec error: {e}")
-
-    return {}, {}
+def _clean_description(text: str) -> str:
+    """Clean extracted description text."""
+    if not text:
+        return ''
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'^.*?Description\s+report\s+', '', text,
+                  flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'(Smarter Shopping|Better Living).*$', '', text,
+                  flags=re.IGNORECASE)
+    text = text.strip()
+    return text
 
 
 def get_description_from_dom(page) -> str:
     """
-    Extract description using multiple strategies:
-    1. Recursive leaf-text extraction from known containers
-    2. Iframe content
-    3. Large text blocks
+    5-strategy description extraction:
+      1. Broad CSS selectors + recursive leaf-text via JS
+      2. Iframe content (AliExpress loads desc in iframes)
+      3. All sub-frames regardless of URL
+      4. Script tag regex for description HTML strings
+      5. Largest desc/detail block on page
     """
 
-    # ── STRATEGY 1: JavaScript-based recursive extraction ───────────────
+    # ── STRATEGY 1: CSS selectors + recursive leaf-text extraction ──────
+    print("[scraper]    🔍 Desc Strategy 1: CSS selectors + leaf-text...")
     try:
         desc = page.evaluate('''() => {
-            // All possible description selectors
             var selectors = [
                 "#product-description",
                 '[class*="product-description"]',
@@ -780,7 +464,6 @@ def get_description_from_dom(page) -> str:
                 'div.richTextContainer[data-rich-text-render="true"]',
                 'div.detailmodule_text',
                 '[class*="detail-desc"]',
-                '[class*="product-detail-info"]',
                 '[class*="product_desc"]',
                 '[class*="pdp-description"]',
                 '[class*="module_description"]',
@@ -789,202 +472,196 @@ def get_description_from_dom(page) -> str:
                 '[class*="Description"]',
                 '[data-role="description"]',
                 '[data-widget="description"]',
+                '[class*="product-detail-info"]',
             ];
 
             function getLeafText(node) {
                 if (!node) return '';
                 var tag = node.tagName ? node.tagName.toLowerCase() : '';
-                if (['script', 'style', 'noscript', 'svg', 'iframe', 'button', 'input'].includes(tag)) {
+                if (['script','style','noscript','svg','iframe','button','input','select','textarea'].indexOf(tag) !== -1) {
                     return '';
                 }
-                if (node.nodeType === Node.TEXT_NODE) {
+                if (node.nodeType === 3) {
                     return (node.textContent || '').trim();
                 }
-                var childElements = node.children;
-                if (!childElements || childElements.length === 0) {
+                if (!node.children || node.children.length === 0) {
                     return (node.textContent || '').trim();
                 }
                 var texts = [];
                 for (var i = 0; i < node.childNodes.length; i++) {
-                    var childText = getLeafText(node.childNodes[i]);
-                    if (childText) {
-                        texts.push(childText);
-                    }
+                    var t = getLeafText(node.childNodes[i]);
+                    if (t) texts.push(t);
                 }
                 return texts.join(' ');
             }
 
             for (var s = 0; s < selectors.length; s++) {
                 try {
-                    var el = document.querySelector(selectors[s]);
-                    if (!el) continue;
-                    var text = getLeafText(el);
-                    text = text.replace(/\\s+/g, ' ').trim();
-                    // Remove boilerplate
-                    text = text.replace(/^.*?Description\\s+report\\s+/i, '');
-                    text = text.replace(/(Smarter Shopping|Better Living).*/i, '');
-                    text = text.trim();
-                    if (text.length > 50) {
-                        return text.substring(0, 2000);
+                    var els = document.querySelectorAll(selectors[s]);
+                    for (var e = 0; e < els.length; e++) {
+                        var text = getLeafText(els[e]);
+                        if (text && text.length > 50) {
+                            return JSON.stringify({text: text.substring(0, 2500), selector: selectors[s]});
+                        }
                     }
-                } catch(e) {}
+                } catch(err) {}
             }
-
             return '';
         }''')
 
-        if desc and len(desc) > 50:
-            print(f"[scraper]    ✅ Description from DOM selectors ({len(desc)} chars)")
-            return desc
+        if desc:
+            try:
+                parsed = json.loads(desc)
+                cleaned = _clean_description(parsed.get('text', ''))
+                if len(cleaned) > 50 and 'Smarter Shopping' not in cleaned:
+                    print(f"[scraper]    ✅ Description via selector: {parsed.get('selector','')} ({len(cleaned)} chars)")
+                    return cleaned[:2000]
+            except json.JSONDecodeError:
+                cleaned = _clean_description(desc)
+                if len(cleaned) > 50:
+                    return cleaned[:2000]
     except Exception as e:
-        print(f"[scraper]    ⚠️  DOM desc strategy 1 error: {e}")
+        print(f"[scraper]       Strategy 1 error: {e}")
 
-    # ── STRATEGY 2: Iframe content ──────────────────────────────────────
+    # ── STRATEGY 2: Iframe with desc-related URL ────────────────────────
+    print("[scraper]    🔍 Desc Strategy 2: Iframes (desc URL)...")
     try:
-        frames = page.frames
-        for frame in frames:
+        for frame in page.frames:
             if frame == page.main_frame:
                 continue
             try:
                 frame_url = frame.url or ''
-                if ('desc' in frame_url.lower() or
-                    'description' in frame_url.lower() or
-                    'detail' in frame_url.lower()):
+                if any(kw in frame_url.lower() for kw in ['desc', 'description', 'detail']):
                     body_text = frame.evaluate('''() => {
-                        return document.body ? document.body.innerText : '';
+                        if (!document.body) return '';
+                        var text = document.body.innerText || '';
+                        return text.substring(0, 2500);
                     }''')
-                    if body_text and len(body_text.strip()) > 50:
-                        text = re.sub(r'\s+', ' ', body_text).strip()
-                        print(f"[scraper]    ✅ Description from iframe ({len(text)} chars)")
-                        return text[:2000]
+                    cleaned = _clean_description(body_text)
+                    if len(cleaned) > 50:
+                        print(f"[scraper]    ✅ Description from iframe: {frame_url[:60]} ({len(cleaned)} chars)")
+                        return cleaned[:2000]
             except Exception:
                 continue
+    except Exception as e:
+        print(f"[scraper]       Strategy 2 error: {e}")
 
-        # Also try all frames regardless of URL
-        for frame in frames:
+    # ── STRATEGY 3: ALL sub-frames (some iframes have no desc in URL) ───
+    print("[scraper]    🔍 Desc Strategy 3: All sub-frames...")
+    try:
+        for frame in page.frames:
             if frame == page.main_frame:
                 continue
             try:
                 body_text = frame.evaluate('''() => {
-                    var text = document.body ? document.body.innerText : '';
-                    return text;
+                    if (!document.body) return '';
+                    var text = document.body.innerText || '';
+                    return text.substring(0, 2500);
                 }''')
-                if body_text and len(body_text.strip()) > 100:
-                    text = re.sub(r'\s+', ' ', body_text).strip()
-                    # Filter out tiny frames / navigation frames
-                    if len(text) > 100 and 'sign in' not in text.lower()[:50]:
-                        print(f"[scraper]    ✅ Description from sub-frame ({len(text)} chars)")
-                        return text[:2000]
+                cleaned = _clean_description(body_text)
+                if (len(cleaned) > 100 and
+                    'sign in' not in cleaned.lower()[:50] and
+                    'Smarter Shopping' not in cleaned and
+                    'cookie' not in cleaned.lower()[:50]):
+                    print(f"[scraper]    ✅ Description from sub-frame ({len(cleaned)} chars)")
+                    return cleaned[:2000]
             except Exception:
                 continue
     except Exception as e:
-        print(f"[scraper]    ⚠️  Iframe strategy error: {e}")
+        print(f"[scraper]       Strategy 3 error: {e}")
 
-    # ── STRATEGY 3: Find the largest text block on the page ─────────────
+    # ── STRATEGY 4: Regex description from script tags ──────────────────
+    print("[scraper]    🔍 Desc Strategy 4: Script tag regex...")
+    try:
+        desc_from_script = page.evaluate('''() => {
+            var scripts = document.querySelectorAll('script');
+            var patterns = [
+                /"description"\s*:\s*"((?:[^"\\\\]|\\\\.){50,})"/,
+                /"descriptionContent"\s*:\s*"((?:[^"\\\\]|\\\\.){50,})"/,
+                /"content"\s*:\s*"((?:[^"\\\\]|\\\\.){50,})"/,
+                /"detailDesc"\s*:\s*"((?:[^"\\\\]|\\\\.){50,})"/,
+                /"richTextDesc"\s*:\s*"((?:[^"\\\\]|\\\\.){50,})"/,
+            ];
+            for (var i = 0; i < scripts.length; i++) {
+                var text = scripts[i].textContent || '';
+                if (text.length < 200) continue;
+                for (var p = 0; p < patterns.length; p++) {
+                    var match = text.match(patterns[p]);
+                    if (match && match[1]) {
+                        try {
+                            var decoded = JSON.parse('"' + match[1] + '"');
+                            // Strip HTML tags
+                            var div = document.createElement('div');
+                            div.innerHTML = decoded;
+                            var clean = div.innerText || div.textContent || '';
+                            if (clean.length > 50) {
+                                return clean.substring(0, 2500);
+                            }
+                        } catch(e) {
+                            // Try direct HTML strip
+                            var stripped = match[1].replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim();
+                            if (stripped.length > 50) {
+                                return stripped.substring(0, 2500);
+                            }
+                        }
+                    }
+                }
+            }
+            return '';
+        }''')
+
+        cleaned = _clean_description(desc_from_script)
+        if len(cleaned) > 50:
+            print(f"[scraper]    ✅ Description from script regex ({len(cleaned)} chars)")
+            return cleaned[:2000]
+    except Exception as e:
+        print(f"[scraper]       Strategy 4 error: {e}")
+
+    # ── STRATEGY 5: Largest text block with desc/detail class/id ────────
+    print("[scraper]    🔍 Desc Strategy 5: Largest desc/detail block...")
     try:
         desc = page.evaluate('''() => {
-            var allDivs = document.querySelectorAll('div');
+            var allDivs = document.querySelectorAll('div, section, article');
             var best = '';
             var bestLen = 0;
 
             for (var i = 0; i < allDivs.length; i++) {
-                var div = allDivs[i];
-                var cl = (div.className || '').toLowerCase();
-                var id = (div.id || '').toLowerCase();
+                var el = allDivs[i];
+                var cl = (el.className || '').toString().toLowerCase();
+                var id = (el.id || '').toLowerCase();
 
-                // Must be related to description/detail
-                if (cl.includes('desc') || cl.includes('detail') ||
-                    cl.includes('content') || id.includes('desc') ||
-                    id.includes('detail')) {
+                var isDescRelated = (
+                    cl.indexOf('desc') !== -1 || cl.indexOf('detail') !== -1 ||
+                    cl.indexOf('content') !== -1 || cl.indexOf('product-info') !== -1 ||
+                    id.indexOf('desc') !== -1 || id.indexOf('detail') !== -1 ||
+                    id.indexOf('product-description') !== -1
+                );
 
-                    // Get direct text (not from deeply nested children that are other sections)
-                    var text = div.innerText || '';
-                    text = text.replace(/\\s+/g, ' ').trim();
+                if (!isDescRelated) continue;
 
-                    // Skip if too short or contains navigation text
-                    if (text.length > 100 && text.length > bestLen &&
-                        !text.includes('Add to Cart') &&
-                        !text.includes('Buy Now') &&
-                        text.indexOf('Sign in') !== 0) {
-                        best = text;
-                        bestLen = text.length;
-                    }
+                var text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+
+                if (text.length > 100 && text.length > bestLen &&
+                    text.indexOf('Add to Cart') === -1 &&
+                    text.indexOf('Buy Now') === -1 &&
+                    text.indexOf('Smarter Shopping') === -1 &&
+                    text.indexOf('Sign in') !== 0) {
+                    best = text;
+                    bestLen = text.length;
                 }
             }
-
-            return best ? best.substring(0, 2000) : '';
+            return best ? best.substring(0, 2500) : '';
         }''')
 
-        if desc and len(desc) > 100:
-            desc = re.sub(r'^.*?Description\s+report\s+', '', desc,
-                          flags=re.IGNORECASE | re.DOTALL)
-            desc = re.sub(r'(Smarter Shopping|Better Living).*$', '', desc,
-                          flags=re.IGNORECASE)
-            desc = desc.strip()
-            if len(desc) > 50:
-                print(f"[scraper]    ✅ Description from largest block ({len(desc)} chars)")
-                return desc[:2000]
+        cleaned = _clean_description(desc)
+        if len(cleaned) > 50:
+            print(f"[scraper]    ✅ Description from largest block ({len(cleaned)} chars)")
+            return cleaned[:2000]
     except Exception as e:
-        print(f"[scraper]    ⚠️  Large block strategy error: {e}")
+        print(f"[scraper]       Strategy 5 error: {e}")
 
+    print("[scraper]    ⚠️  All 5 description strategies failed")
     return ''
-
-
-def get_price_from_dom(page) -> str:
-    """Extract price from DOM."""
-    try:
-        price = page.evaluate('''() => {
-            // Method 1: Price-specific elements
-            var priceEls = document.querySelectorAll(
-                '[class*="price"] span, [class*="Price"] span, ' +
-                '[data-pl="product-price"], [class*="uniform-banner-box-price"]'
-            );
-            for (var i = 0; i < priceEls.length; i++) {
-                var text = priceEls[i].textContent.trim();
-                if (/[\\d.,]+/.test(text) && (text.includes('$') || text.includes('€') ||
-                    text.includes('£') || text.includes('US') || /^\\d/.test(text))) {
-                    return text;
-                }
-            }
-
-            // Method 2: Meta tag
-            var meta = document.querySelector('meta[property="product:price:amount"]');
-            if (meta && meta.content) {
-                var currency = document.querySelector('meta[property="product:price:currency"]');
-                var curr = currency ? currency.content : 'USD';
-                return meta.content + ' ' + curr;
-            }
-
-            return '';
-        }''')
-        return price or ''
-    except Exception:
-        return ''
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NETWORK INTERCEPTION (kept as supplementary, not primary)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_pdp_response(text: str) -> dict | None:
-    try:
-        text = text.strip()
-        m = re.match(r'^[a-zA-Z_$][a-zA-Z0-9_$]*\s*\((.*)\)\s*;?\s*$', text, re.DOTALL)
-        if m:
-            text = m.group(1)
-
-        data   = json.loads(text)
-        result = (data.get('data', {}) or {}).get('result', {}) or {}
-
-        if not result:
-            return None
-
-        extracted = {}
-        _parse_generic_json(result, extracted)
-        return extracted if (extracted.get('title') or extracted.get('image_1')) else None
-
-    except (json.JSONDecodeError, Exception):
-        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -993,62 +670,65 @@ def parse_pdp_response(text: str) -> dict | None:
 
 def get_product_info(url: str) -> dict | None:
     captured_pdp = []
+    captured_desc_api = []
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-web-security',
-                ]
+                args=['--no-sandbox', '--disable-dev-shm-usage',
+                      '--disable-blink-features=AutomationControlled']
             )
             context = browser.new_context(
                 user_agent=(
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                     'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/125.0.0.0 Safari/537.36'
+                    'Chrome/120.0.0.0 Safari/537.36'
                 ),
-                viewport={'width': 1920, 'height': 1080},
+                viewport={'width': 1366, 'height': 900},
                 locale='en-US',
                 timezone_id='Asia/Karachi',
             )
-
-            # Block unnecessary resources for speed
-            def route_handler(route):
-                resource_type = route.request.resource_type
-                url_r = route.request.url
-                if resource_type in ['font', 'media']:
-                    route.abort()
-                elif resource_type == 'image' and 'alicdn' not in url_r:
-                    route.abort()
-                else:
-                    route.continue_()
-
-            context.route("**/*", route_handler)
-
             page = context.new_page()
-
-            # Stealth: remove webdriver flag
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
-                window.chrome = { runtime: {} };
-            """)
 
             def handle_response(response):
                 url_r = response.url
+
+                # Existing PDP interception (unchanged)
                 if ('mtop.aliexpress.pdp.pc.query' in url_r or
                         'mtop.aliexpress.itemdetail.pc' in url_r):
                     try:
                         body = response.body()
                         if len(body) > 1000:
                             text = body.decode('utf-8', errors='replace')
-                            captured_pdp.append(text)
-                            print(f"[scraper]    📡 Captured PDP API: {url_r[:80]}")
+                            if ('PRODUCT_PROP_PC' in text or
+                                    'imagePathList' in text or
+                                    'SHOP_CARD_PC' in text):
+                                captured_pdp.append(text)
+                                print(f"[scraper]    📡 Captured PDP: {url_r[:80]}")
+                    except Exception:
+                        pass
+
+                # NEW: Intercept description API calls
+                if any(kw in url_r.lower() for kw in [
+                    'description', 'desc', 'detail.html',
+                    'pdp/description', 'product/description',
+                    'aeglobal/product', 'descriptionmodule',
+                ]):
+                    try:
+                        ct = ''
+                        try:
+                            ct = response.headers.get('content-type', '')
+                        except Exception:
+                            pass
+
+                        body = response.body()
+                        if len(body) > 100:
+                            text = body.decode('utf-8', errors='replace')
+                            # Only keep if it looks like HTML content or JSON with desc
+                            if ('<' in text and len(text) > 200) or '"desc' in text.lower():
+                                captured_desc_api.append(text)
+                                print(f"[scraper]    📡 Captured desc API: {url_r[:80]}")
                     except Exception:
                         pass
 
@@ -1056,28 +736,13 @@ def get_product_info(url: str) -> dict | None:
 
             print(f'\n[scraper] 🌐 Opening: {url}')
             page.goto(url, timeout=60000, wait_until='domcontentloaded')
-            page.wait_for_timeout(4000)
-
-            # ── SCROLL THE ENTIRE PAGE to trigger all lazy loading ──────
-            print("[scraper]    📜 Scrolling page to load all content...")
-            for i in range(8):
-                page.mouse.wheel(0, 600)
-                page.wait_for_timeout(600)
-
-            # Scroll back up and down once more
-            page.evaluate('window.scrollTo(0, 0)')
-            page.wait_for_timeout(500)
-            for i in range(10):
-                page.mouse.wheel(0, 500)
-                page.wait_for_timeout(400)
-
-            # Wait for content to settle
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(5000)
+            page.mouse.wheel(0, 800)
+            page.wait_for_timeout(1000)
 
             extracted = {}
+            print(f'[scraper]    📦 Captured {len(captured_pdp)} PDP responses')
 
-            # ── SOURCE 1: Network-intercepted API responses ─────────────
-            print(f'[scraper]    📦 Captured {len(captured_pdp)} API responses')
             for resp_text in captured_pdp:
                 parsed = parse_pdp_response(resp_text)
                 if parsed:
@@ -1086,79 +751,142 @@ def get_product_info(url: str) -> dict | None:
                         if k not in extracted or not extracted[k]:
                             extracted[k] = v
 
-            # ── SOURCE 2: Embedded script tag JSON ──────────────────────
-            print("[scraper]    🔍 Extracting from embedded scripts...")
-            script_data = extract_from_page_scripts(page)
-            for k, v in script_data.items():
-                if k.startswith('_'):
-                    continue
-                if k not in extracted or not extracted[k]:
-                    extracted[k] = v
-
-            # ── SOURCE 3: DOM fallbacks ─────────────────────────────────
+            # DOM fallbacks for title, images, price (unchanged)
             if not extracted.get('title'):
-                print("[scraper]    🔍 Title from DOM...")
                 extracted['title'] = get_title_from_dom(page)
-
             if not extracted.get('image_1'):
-                print("[scraper]    🔍 Images from DOM...")
                 extracted.update(get_images_from_dom(page))
-
-            if not extracted.get('_specs_found'):
-                print("[scraper]    🔍 Specs from DOM...")
-                mapped, raw = get_specs_from_dom(page)
-                if mapped:
-                    for k, v in mapped.items():
-                        if k not in extracted or not extracted[k]:
-                            extracted[k] = v
-                    extracted['_raw_specs'] = raw
-
-            if not extracted.get('description'):
-                print("[scraper]    🔍 Description from DOM...")
-                desc = get_description_from_dom(page)
-                if desc:
-                    extracted['description'] = desc
-
             if not extracted.get('price'):
-                print("[scraper]    🔍 Price from DOM...")
-                price = get_price_from_dom(page)
-                if price:
-                    extracted['price'] = price
-
-            # ── LAST RESORT: Scroll more and try description again ──────
-            if not extracted.get('description'):
-                print("[scraper]    📜 Extra scroll for description...")
-                page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                page.wait_for_timeout(3000)
-
-                # Try clicking "View More" / "See full description" buttons
                 try:
-                    for btn_text in ['View More', 'See More', 'Show More',
-                                     'View Full', 'Read More', 'Description']:
-                        btns = page.locator(f'button:has-text("{btn_text}"), '
-                                            f'a:has-text("{btn_text}"), '
-                                            f'span:has-text("{btn_text}"), '
-                                            f'div:has-text("{btn_text}")')
-                        if btns.count() > 0:
-                            try:
-                                btns.first.click(timeout=2000)
-                                page.wait_for_timeout(2000)
-                                print(f"[scraper]       Clicked '{btn_text}' button")
-                                break
-                            except Exception:
-                                continue
+                    for script in page.locator('script').all():
+                        txt = script.text_content() or ''
+                        m   = re.search(r'"price"\s*:\s*"([^"]+)"', txt)
+                        if m:
+                            extracted['price'] = m.group(1)
+                            break
                 except Exception:
                     pass
 
-                desc = get_description_from_dom(page)
-                if desc:
-                    extracted['description'] = desc
+            # ─────────────────────────────────────────────────────────────
+            # DESCRIPTION — MULTI-STRATEGY PIPELINE
+            # ─────────────────────────────────────────────────────────────
+
+            if not extracted.get('description'):
+                print("\n[scraper]    📝 Starting description extraction pipeline...")
+
+                # Step A: Try captured description API responses
+                if captured_desc_api:
+                    print(f"[scraper]    📡 Processing {len(captured_desc_api)} desc API responses...")
+                    for desc_text in captured_desc_api:
+                        cleaned = re.sub(r'<[^>]+>', ' ', desc_text)
+                        cleaned = ' '.join(cleaned.split()).strip()
+                        cleaned = _clean_description(cleaned)
+                        if len(cleaned) > 50:
+                            extracted['description'] = cleaned[:2000]
+                            print(f"[scraper]    ✅ Description from desc API interception ({len(cleaned)} chars)")
+                            break
+
+                # Step B: Try DOM extraction (first attempt, before extra scroll)
+                if not extracted.get('description'):
+                    d = get_description_from_dom(page)
+                    if d:
+                        extracted['description'] = d
+
+                # Step C: Scroll to bottom to trigger lazy-loaded description
+                if not extracted.get('description'):
+                    print("[scraper]    📜 Scrolling page to trigger lazy description...")
+                    for _ in range(8):
+                        page.mouse.wheel(0, 700)
+                        page.wait_for_timeout(500)
+
+                    # Wait for any description container to appear
+                    try:
+                        page.wait_for_selector(
+                            '#product-description, [class*="product-description"], '
+                            '[class*="detail-content"], [class*="productDescription"], '
+                            '[class*="desc-content"], [class*="Description"], '
+                            'iframe[src*="desc"]',
+                            timeout=5000
+                        )
+                        page.wait_for_timeout(2000)
+                    except Exception:
+                        page.wait_for_timeout(2000)
+
+                    # Check if new desc API responses came in during scrolling
+                    if captured_desc_api:
+                        for desc_text in captured_desc_api:
+                            cleaned = re.sub(r'<[^>]+>', ' ', desc_text)
+                            cleaned = ' '.join(cleaned.split()).strip()
+                            cleaned = _clean_description(cleaned)
+                            if len(cleaned) > 50 and not extracted.get('description'):
+                                extracted['description'] = cleaned[:2000]
+                                print(f"[scraper]    ✅ Description from desc API (after scroll) ({len(cleaned)} chars)")
+                                break
+
+                    # Try DOM again after scrolling
+                    if not extracted.get('description'):
+                        d = get_description_from_dom(page)
+                        if d:
+                            extracted['description'] = d
+
+                # Step D: Click "View More" / expand buttons and try again
+                if not extracted.get('description'):
+                    print("[scraper]    🖱️  Trying to click expand/view-more buttons...")
+                    try:
+                        clicked = page.evaluate('''() => {
+                            var keywords = ['view more', 'see more', 'show more', 'read more',
+                                            'view full', 'description', 'expand', 'show all'];
+                            var elements = document.querySelectorAll('button, a, span, div');
+                            for (var i = 0; i < elements.length; i++) {
+                                var text = (elements[i].textContent || '').toLowerCase().trim();
+                                if (text.length > 2 && text.length < 30) {
+                                    for (var k = 0; k < keywords.length; k++) {
+                                        if (text.indexOf(keywords[k]) !== -1) {
+                                            elements[i].click();
+                                            return text;
+                                        }
+                                    }
+                                }
+                            }
+                            return '';
+                        }''')
+                        if clicked:
+                            print(f"[scraper]       Clicked: '{clicked}'")
+                            page.wait_for_timeout(2000)
+                            d = get_description_from_dom(page)
+                            if d:
+                                extracted['description'] = d
+                    except Exception:
+                        pass
+
+                # Step E: Scroll to absolute bottom + wait + try one last time
+                if not extracted.get('description'):
+                    print("[scraper]    📜 Final scroll to absolute bottom...")
+                    page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                    page.wait_for_timeout(3000)
+
+                    # Final check on any new API captures
+                    if captured_desc_api:
+                        best = max(captured_desc_api, key=len)
+                        cleaned = re.sub(r'<[^>]+>', ' ', best)
+                        cleaned = ' '.join(cleaned.split()).strip()
+                        cleaned = _clean_description(cleaned)
+                        if len(cleaned) > 50:
+                            extracted['description'] = cleaned[:2000]
+                            print(f"[scraper]    ✅ Description from desc API (final) ({len(cleaned)} chars)")
+
+                    # Final DOM attempt
+                    if not extracted.get('description'):
+                        d = get_description_from_dom(page)
+                        if d:
+                            extracted['description'] = d
+
+                if extracted.get('description'):
+                    print(f"[scraper]    ✅ Description pipeline succeeded: {len(extracted['description'])} chars")
+                else:
+                    print("[scraper]    ⚠️  Description pipeline: no description found")
 
             browser.close()
-
-        # Clean up internal keys
-        extracted.pop('_specs_found', None)
-        extracted.pop('_raw_specs', None)
 
         if not extracted.get('title'):
             print('[scraper] ❌ No title — aborting')
