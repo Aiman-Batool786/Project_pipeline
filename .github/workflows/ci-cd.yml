@@ -88,6 +88,7 @@ jobs:
             # Set secrets as environment variables
             # ────────────────────────────────────────────────
             export OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}"
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" > .env
             echo "${{ secrets.GCP_SA_KEY }}" > gcp-service-account.json
             export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/gcp-service-account.json"
 
