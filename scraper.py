@@ -880,7 +880,7 @@ def get_product_info(url: str) -> dict | None:
                     except Exception:
                         pass
 
-            # page.on('response', handle_response)
+            page.on('response', handle_response)
             page.goto(url, timeout=60000, wait_until='domcontentloaded')
             page.wait_for_timeout(8000)
             page.mouse.wheel(0, 300)
