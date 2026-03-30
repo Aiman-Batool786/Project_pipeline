@@ -831,8 +831,9 @@ def get_product_info(url: str) -> dict | None:
                     'Chrome/124.0.0.0 Safari/537.36'
                 ),
                 viewport={'width': 1366, 'height': 900},
-                locale='en-US',
-                timezone_id='Asia/Karachi',
+                locale='en-GB',
+                timezone_id='Europe/London',
+                extra_http_headers={'Accept-Language': 'en-GB,en;q=0.9'},
             )
 
             # Mask automation signals
