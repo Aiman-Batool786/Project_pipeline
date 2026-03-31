@@ -1,8 +1,8 @@
 """
-FastAPI Server - HYBRID APPROACH v2.3
+FastAPI Server - HYBRID APPROACH v2.4
 ─────────────────────────────────────
 Pipeline steps:
-  1. Scrape  → product data + seller info (original, never LLM-enhanced)
+  1. Scrape  → product data + seller info (via ScraperAPI, original never LLM-enhanced)
   2. Store   → scraped_products + seller_info tables
   3. Enhance → OpenAI enhances product content only (NOT seller info)
   4. Categorize
@@ -11,6 +11,11 @@ Pipeline steps:
 
 Seller info rule: stored as original, shown in API response,
                   written to template as-is, never sent to LLM.
+
+Changes from v2.3:
+  - Removed 'merged' and 'template_specs' from API response
+  - Fixed template file not being generated (path + error surfacing)
+  - scraper now uses ScraperAPI to bypass GCP IP block
 """
 
 from fastapi import FastAPI, HTTPException
@@ -30,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Octopia Template Pipeline - HYBRID Approach",
-    version="2.3.0"
+    version="2.4.0"
 )
 
 DB_NAME   = "products.db"
@@ -73,9 +78,9 @@ def root():
     return {
         "status":  "running",
         "service": "Octopia Template Pipeline",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "features": [
-            "Network interception scraping (specs from PRODUCT_PROP_PC)",
+            "ScraperAPI-based scraping (bypasses GCP IP block)",
             "Seller info from SHOP_CARD_PC (original, not LLM-enhanced)",
             "Content enhancement via OpenAI (product only)",
             "Octopia categorization",
@@ -126,9 +131,23 @@ def process_product_complete(url: str) -> Dict[str, Any]:
 
         create_all_tables()
 
-        TEMPLATE_PATH        = "pdt_template_fr-FR_20260305_090255.xlsm"
+        # Look for template in current directory and common locations
+        TEMPLATE_PATH        = None
         FILLED_TEMPLATES_DIR = "./filled_templates"
         os.makedirs(FILLED_TEMPLATES_DIR, exist_ok=True)
+
+        for candidate in [
+            "pdt_template_fr-FR_20260305_090255.xlsm",
+            "./pdt_template_fr-FR_20260305_090255.xlsm",
+            os.path.join(os.path.dirname(__file__), "pdt_template_fr-FR_20260305_090255.xlsm"),
+        ]:
+            if os.path.exists(candidate):
+                TEMPLATE_PATH = candidate
+                logger.info(f"📄 Template found: {candidate}")
+                break
+
+        if not TEMPLATE_PATH:
+            logger.warning("⚠️  Template file not found — Excel will be skipped")
 
         # ── STEP 1: SCRAPE ──────────────────────────────────────────────────
         logger.info("📥 Scraping...")
@@ -149,7 +168,6 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         logger.info(f"✅ Extracted {len(scraped_data)} attributes "
                     f"({scraped_specs_count} spec fields)")
 
-        # Log seller info found
         seller_found = [k for k in SELLER_FIELDS if scraped_data.get(k)]
         logger.info(f"   Seller fields: {seller_found}")
 
@@ -163,20 +181,19 @@ def process_product_complete(url: str) -> Dict[str, Any]:
 
         log_processing(product_id, url, "scraping", "success")
 
-        # ── STEP 2B: STORE SELLER INFO (original, no LLM) ───────────────────
+        # ── STEP 2B: STORE SELLER INFO ───────────────────────────────────────
         logger.info("🏪 Storing seller info (original)...")
         seller_data = {k: scraped_data.get(k, '') for k in SELLER_FIELDS}
         insert_seller_info(product_id, seller_data)
         log_processing(product_id, url, "seller_info", "success")
 
-        # ── STEP 2C: SAVE ORIGINAL SPECIFICATIONS ───────────────────────────
+        # ── STEP 2C: SAVE ORIGINAL SPECIFICATIONS ────────────────────────────
         logger.info("📋 Saving original specifications...")
         insert_original_specifications(product_id, scraped_data)
 
         # ── STEP 3: ENHANCE CONTENT (product only, NOT seller) ──────────────
         logger.info("🤖 Enhancing product content with OpenAI...")
 
-        # Remove seller fields before sending to OpenAI
         product_data_for_llm = {
             k: v for k, v in scraped_data.items()
             if k not in SELLER_FIELDS
@@ -205,27 +222,10 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         logger.info(f"✅ Content enhanced — "
                     f"{len([v for v in specs_enhanced.values() if v])} spec fields")
 
-        # ── STEP 3B: SAVE ENHANCED SPECIFICATIONS ───────────────────────────
+        # ── STEP 3B: SAVE ENHANCED SPECIFICATIONS ────────────────────────────
         insert_enhanced_specifications(product_id, specs_enhanced)
 
-        # ── STEP 3C: BUILD enriched_data (API version) ──────────────────────
-        enriched_data = scraped_data.copy()
-        enriched_data['title']            = enhanced.get('title', title)
-        enriched_data['description']      = enhanced.get('description', description)
-        enriched_data['bullet_points']    = enhanced.get('bullet_points', [])
-        enriched_data['html_description'] = enhanced.get('html_description', '')
-
-        for field in SPEC_FIELDS:
-            orig_val = scraped_data.get(field, '')
-            enh_val  = specs_enhanced.get(field, '')
-            if enh_val and enh_val.strip():
-                enriched_data[field] = enh_val
-            elif orig_val and orig_val.strip():
-                enriched_data[field] = orig_val
-            else:
-                enriched_data[field] = ""
-
-        # ── STEP 3D: BUILD enriched_data_for_template (enhanced specs only) ─
+        # ── STEP 3C: BUILD enriched_data_for_template ────────────────────────
         enriched_data_for_template = scraped_data.copy()
         enriched_data_for_template['title']            = enhanced.get('title', title)
         enriched_data_for_template['description']      = enhanced.get('description', description)
@@ -236,16 +236,16 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             enh_val = specs_enhanced.get(field, '')
             enriched_data_for_template[field] = enh_val if (enh_val and enh_val.strip()) else ""
 
-        # Seller fields pass through as original in template data
+        # Seller fields pass through as original
         for field in SELLER_FIELDS:
             enriched_data_for_template[field] = scraped_data.get(field, '')
 
-        # ── STEP 3E: SAVE ENHANCED CONTENT + AUDIT LOG ──────────────────────
+        # ── STEP 3D: SAVE ENHANCED CONTENT + AUDIT LOG ───────────────────────
         insert_enhanced_content(product_id, enriched_data_for_template)
         log_all_spec_audits(product_id, scraped_data, specs_enhanced,
                             enriched_data_for_template)
 
-        # ── STEP 4: CATEGORIZE ──────────────────────────────────────────────
+        # ── STEP 4: CATEGORIZE ───────────────────────────────────────────────
         logger.info("\n🏷️  Categorizing...")
         try:
             category = assign_category(
@@ -265,7 +265,7 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         )
         log_processing(product_id, url, "categorization", "success")
 
-        # ── STEP 5: MAP ─────────────────────────────────────────────────────
+        # ── STEP 5: MAP ──────────────────────────────────────────────────────
         logger.info("\n🗺️  Mapping to template columns...")
         mapped_data = {}
         is_valid    = False
@@ -280,27 +280,31 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             logger.warning(f"Mapping error: {e}")
             log_processing(product_id, url, "mapping", "error", str(e))
 
-        # ── STEP 6: GENERATE TEMPLATE ────────────────────────────────────────
+        # ── STEP 6: GENERATE TEMPLATE ─────────────────────────────────────────
         logger.info("\n📋 Generating Excel template...")
         template_file = None
 
-        if os.path.exists(TEMPLATE_PATH):
+        if TEMPLATE_PATH:
             try:
                 template_file = fill_template_for_product(
                     TEMPLATE_PATH, mapped_data, product_id, FILLED_TEMPLATES_DIR,
                     category_id=category.get("category_id", "0"),
                     category_name=category.get("category_leaf", "Unknown")
                 )
-                if template_file:
+                if template_file and os.path.exists(template_file):
                     insert_template_output(
                         product_id, category.get("category_id", "0"),
                         "xlsm", template_file, os.path.basename(template_file)
                     )
                     log_processing(product_id, url, "template_fill", "success")
                     logger.info(f"✅ Template: {os.path.basename(template_file)}")
+                else:
+                    logger.warning(f"⚠️  Template filler returned no file path")
             except Exception as e:
-                logger.warning(f"Template generation failed: {e}")
+                logger.error(f"❌ Template generation failed: {e}", exc_info=True)
                 log_processing(product_id, url, "template_fill", "error", str(e))
+        else:
+            logger.warning("⚠️  Skipping template — .xlsm file not found in project directory")
 
         logger.info("✅ Processing complete\n")
 
@@ -317,7 +321,7 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                 "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}"))
             },
 
-            # ── SELLER INFO (original, not enhanced) ──────────────────────
+            # Seller info — original, never LLM-enhanced
             "seller": {f: scraped_data.get(f, "") for f in SELLER_FIELDS},
 
             "enhanced": {
@@ -328,9 +332,6 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                 "has_html_description":  bool(enhanced.get("html_description", "")),
                 "specifications_enhanced": specs_enhanced
             },
-
-            "merged":        {f: enriched_data.get(f, "")                for f in SPEC_FIELDS},
-            "template_specs":{f: enriched_data_for_template.get(f, "")  for f in SPEC_FIELDS},
 
             "category": {
                 "id":         category.get("category_id", ""),
@@ -428,7 +429,6 @@ def view_scraped_products(limit: int = 100):
 
 @app.get("/seller-info", tags=["Database"])
 def view_seller_info(limit: int = 100):
-    """View original seller info — never LLM-enhanced"""
     try:
         conn = get_db_connection()
         rows = conn.execute(
@@ -442,7 +442,6 @@ def view_seller_info(limit: int = 100):
 
 @app.get("/seller-info/{product_id}", tags=["Database"])
 def get_seller_info_by_product(product_id: int):
-    """Get seller info for a specific product"""
     try:
         conn = get_db_connection()
         row  = conn.execute(
@@ -576,5 +575,5 @@ def get_stats():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v2.3 — with seller info")
+    logger.info("🚀 Octopia Template Pipeline v2.4 — ScraperAPI edition")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
