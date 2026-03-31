@@ -11,6 +11,8 @@ from playwright.sync_api import sync_playwright
 # ─────────────────────────────────────────────────────────────────────────────
 
 ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY", "")
+if not ZENROWS_API_KEY:
+    raise Exception("ZENROWS_API_KEY is missing!")
 
 def fetch_rendered_html(url: str, retries: int = 3) -> str:
     """
