@@ -139,20 +139,13 @@ def extract_seller_info(result: dict) -> dict:
             print("[scraper]    ⚠️  SHOP_CARD_PC not found in API response")
             return seller
 
-        # Store name
-        seller['store_name'] = str(shop.get('storeName', '') or '')
-
-        # Seller level
-        seller['seller_level'] = str(shop.get('sellerLevel', '') or '')
-
-        # Positive rate & review counts
+        seller['store_name']           = str(shop.get('storeName', '') or '')
+        seller['seller_level']         = str(shop.get('sellerLevel', '') or '')
         seller['seller_positive_rate'] = str(shop.get('sellerPositiveRate', '') or '')
         seller['seller_total_reviews'] = str(shop.get('sellerTotalNum', '') or '')
         seller['seller_positive_num']  = str(shop.get('sellerPositiveNum', '') or '')
 
-        # Detailed ratings from benefitInfoList
-        benefit_list = shop.get('benefitInfoList', []) or []
-        for item in benefit_list:
+        for item in (shop.get('benefitInfoList', []) or []):
             title = str(item.get('title', '') or '').lower().strip()
             value = str(item.get('value', '') or '').strip()
             if 'store rating' in title:
@@ -160,26 +153,22 @@ def extract_seller_info(result: dict) -> dict:
             elif 'communication' in title:
                 seller['seller_communication'] = value
             elif 'positive' in title:
-                # Catch variants like "positive feedback rate"
                 if not seller['seller_positive_rate']:
                     seller['seller_positive_rate'] = value
 
-        # sellerInfo sub-object
         seller_info = shop.get('sellerInfo', {}) or {}
         if seller_info:
-            seller['seller_id']      = str(seller_info.get('adminSeq', '') or '')
-            seller['store_id']       = str(seller_info.get('storeNum', '') or '')
-            seller['seller_country'] = str(seller_info.get('countryCompleteName', '') or '')
-            seller['store_open_date']= str(seller_info.get('formatOpenTime', '') or '')
-            seller['is_top_rated']   = str(seller_info.get('topRatedSeller', '') or '')
-
+            seller['seller_id']       = str(seller_info.get('adminSeq', '') or '')
+            seller['store_id']        = str(seller_info.get('storeNum', '') or '')
+            seller['seller_country']  = str(seller_info.get('countryCompleteName', '') or '')
+            seller['store_open_date'] = str(seller_info.get('formatOpenTime', '') or '')
+            seller['is_top_rated']    = str(seller_info.get('topRatedSeller', '') or '')
             raw_url = str(seller_info.get('storeURL', '') or '')
             if raw_url:
                 if raw_url.startswith('//'):
                     raw_url = 'https:' + raw_url
                 seller['store_url'] = raw_url
 
-        # Also try GLOBAL_DATA for store name fallback
         if not seller['store_name']:
             try:
                 seller['store_name'] = str(
@@ -188,7 +177,6 @@ def extract_seller_info(result: dict) -> dict:
             except (KeyError, TypeError):
                 pass
 
-        # Store ID fallback from GLOBAL_DATA
         if not seller['store_id']:
             try:
                 seller['store_id'] = str(
@@ -210,19 +198,11 @@ def extract_seller_info(result: dict) -> dict:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PRICE EXTRACTOR
-# Primary path: result['PRICE'] with SKU map logic
-# Fallback: result['priceModule'] / result['PRICE_MODULE']
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_price(result: dict) -> str:
-    """
-    Extract price using the PRICE.skuIdStrPriceInfoMap first (v2 API),
-    then fall back to legacy priceModule fields.
-    """
     try:
         price_module = result.get('PRICE', {}) or {}
-
-        # Try skuIdStrPriceInfoMap for actual price (confirmed path from aliexpress.us)
         sku_map = price_module.get('skuIdStrPriceInfoMap', {})
         if sku_map:
             first_sku = next(iter(sku_map.values()), {})
@@ -231,11 +211,9 @@ def extract_price(result: dict) -> str:
             price = act or reg
             if price:
                 return f"${price}"
-
     except Exception as e:
         print(f"[scraper]    ⚠️  PRICE SKU map extraction error: {e}")
 
-    # Fallback: legacy priceModule / PRICE_MODULE
     try:
         pm = result.get('priceModule', {}) or result.get('PRICE_MODULE', {}) or {}
         price = (pm.get('formatedActivityPrice') or
@@ -251,15 +229,9 @@ def extract_price(result: dict) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DESCRIPTION FETCHER
-# Primary: DESC['nativeDescUrl'] / DESC['pcDescUrl'] — fetch the URL directly
-# Fallback: descriptionModule / DESCRIPTION_PC in API JSON, then DOM strategies
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_description(result: dict) -> str:
-    """
-    Fetch description by requesting the URL found in DESC.nativeDescUrl or
-    DESC.pcDescUrl. Falls back to inline JSON fields if the URL is absent.
-    """
     try:
         desc_module = result.get('DESC', {}) or {}
         desc_url = (desc_module.get('nativeDescUrl') or
@@ -269,30 +241,22 @@ def fetch_description(result: dict) -> str:
             return ''
 
         print(f"[scraper]    📥 Fetching description from: {desc_url[:80]}")
+        req = urllib.request.Request(desc_url, headers={'User-Agent': 'Mozilla/5.0'})
 
-        req = urllib.request.Request(
-            desc_url,
-            headers={'User-Agent': 'Mozilla/5.0'}
-        )
-
-        # nativeDescUrl → JSON payload
         if 'desc.json' in desc_url:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 raw = resp.read().decode('utf-8', errors='replace')
-                data = json.loads(raw)
-                desc_text = _parse_desc_json(data)
+                desc_text = _parse_desc_json(json.loads(raw))
                 if desc_text:
-                    print(f"[scraper]    ✅ Description fetched from JSON URL: {len(desc_text)} chars")
+                    print(f"[scraper]    ✅ Description from JSON URL: {len(desc_text)} chars")
                     return desc_text[:2000]
 
-        # pcDescUrl → HTML
         elif 'desc.htm' in desc_url:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                raw = resp.read().decode('utf-8', errors='replace')
-                clean = re.sub(r'<[^>]+>', ' ', raw)
-                clean = ' '.join(clean.split()).strip()
+                raw   = resp.read().decode('utf-8', errors='replace')
+                clean = ' '.join(re.sub(r'<[^>]+>', ' ', raw).split()).strip()
                 if len(clean) > 50:
-                    print(f"[scraper]    ✅ Description fetched from HTML URL: {len(clean)} chars")
+                    print(f"[scraper]    ✅ Description from HTML URL: {len(clean)} chars")
                     return clean[:2000]
 
     except Exception as e:
@@ -302,35 +266,21 @@ def fetch_description(result: dict) -> str:
 
 
 def _parse_desc_json(data) -> str:
-    """Recursively extract text from AliExpress description JSON."""
     if isinstance(data, str):
-        clean = re.sub(r'<[^>]+>', ' ', data)
-        clean = ' '.join(clean.split()).strip()
+        clean = ' '.join(re.sub(r'<[^>]+>', ' ', data).split()).strip()
         return clean if len(clean) > 10 else ''
-
     if isinstance(data, dict):
         for key in ['text', 'content', 'value', 'description', 'html']:
             val = data.get(key)
             if isinstance(val, str) and len(val) > 10:
-                clean = re.sub(r'<[^>]+>', ' ', val)
-                clean = ' '.join(clean.split()).strip()
+                clean = ' '.join(re.sub(r'<[^>]+>', ' ', val).split()).strip()
                 if len(clean) > 10:
                     return clean
-        texts = []
-        for v in data.values():
-            t = _parse_desc_json(v)
-            if t:
-                texts.append(t)
+        texts = [t for t in (_parse_desc_json(v) for v in data.values()) if t]
         return ' '.join(texts)[:2000] if texts else ''
-
     if isinstance(data, list):
-        texts = []
-        for item in data:
-            t = _parse_desc_json(item)
-            if t:
-                texts.append(t)
+        texts = [t for t in (_parse_desc_json(i) for i in data) if t]
         return ' '.join(texts)[:2000] if texts else ''
-
     return ''
 
 
@@ -351,6 +301,9 @@ def parse_pdp_response(text: str) -> dict | None:
         if not result:
             print("[scraper]    ⚠️  Empty result in API response")
             return None
+
+        # Always log top-level keys — essential for spotting structure changes
+        print(f"[scraper]    🔑 Top-level result keys: {list(result.keys())}")
 
         extracted = {}
 
@@ -390,11 +343,9 @@ def parse_pdp_response(text: str) -> dict | None:
             print("[scraper]    ⚠️  No specs found in PRODUCT_PROP_PC")
 
         # ── Seller Info ────────────────────────────────────────────────────
-        seller_info = extract_seller_info(result)
-        extracted.update(seller_info)
+        extracted.update(extract_seller_info(result))
 
         # ── Images ─────────────────────────────────────────────────────────
-        # Primary: HEADER_IMAGE_PC (confirmed path, v2 API)
         images = []
         try:
             images = result['HEADER_IMAGE_PC']['imagePathList'] or []
@@ -402,8 +353,6 @@ def parse_pdp_response(text: str) -> dict | None:
                 print(f"[scraper]    ✅ Images from HEADER_IMAGE_PC: {len(images)}")
         except (KeyError, TypeError):
             pass
-
-        # Fallback: imageModule (legacy path)
         if not images:
             try:
                 images = result['imageModule']['imagePathList'] or []
@@ -411,8 +360,6 @@ def parse_pdp_response(text: str) -> dict | None:
                     print(f"[scraper]    ✅ Images from imageModule: {len(images)}")
             except (KeyError, TypeError):
                 pass
-
-        # Deep search fallback
         if not images:
             def find_images(obj, depth=0):
                 if depth > 6 or not isinstance(obj, dict):
@@ -442,44 +389,41 @@ def parse_pdp_response(text: str) -> dict | None:
             extracted['price'] = price
             print(f"[scraper]    ✅ Price: {price}")
 
-        # ── Description — try DESC URL first, then inline JSON fields ──────
+        # ── Description ────────────────────────────────────────────────────
         desc = fetch_description(result)
         if desc:
             extracted['description'] = desc
         else:
-            # Fallback A: descriptionModule in API JSON
             try:
-                dm   = result.get('descriptionModule', {}) or {}
-                desc = dm.get('description', '') or dm.get('content', '')
-                if desc and len(desc) > 50:
-                    desc = re.sub(r'<[^>]+>', ' ', desc)
-                    extracted['description'] = ' '.join(desc.split())[:2000]
-                    print(f"[scraper]    ✅ Description from descriptionModule")
+                dm = result.get('descriptionModule', {}) or {}
+                d  = dm.get('description', '') or dm.get('content', '')
+                if d and len(d) > 50:
+                    extracted['description'] = ' '.join(re.sub(r'<[^>]+>', ' ', d).split())[:2000]
+                    print("[scraper]    ✅ Description from descriptionModule")
             except Exception:
                 pass
 
-            # Fallback B: DESCRIPTION_PC in API JSON
             if not extracted.get('description'):
                 try:
-                    desc_pc = result.get('DESCRIPTION_PC', {}) or {}
+                    desc_pc   = result.get('DESCRIPTION_PC', {}) or {}
                     desc_html = (desc_pc.get('descriptionContent', '') or
                                  desc_pc.get('content', '') or
                                  desc_pc.get('description', '') or
                                  desc_pc.get('html', ''))
                     if desc_html and len(desc_html) > 50:
-                        desc_clean = re.sub(r'<[^>]+>', ' ', desc_html)
-                        extracted['description'] = ' '.join(desc_clean.split())[:2000]
-                        print(f"[scraper]    ✅ Description from DESCRIPTION_PC in API")
+                        extracted['description'] = ' '.join(
+                            re.sub(r'<[^>]+>', ' ', desc_html).split()
+                        )[:2000]
+                        print("[scraper]    ✅ Description from DESCRIPTION_PC in API")
                 except Exception:
                     pass
 
-            # Fallback C: deep search in API JSON
             if not extracted.get('description'):
                 try:
-                    desc = _deep_find_description(result)
-                    if desc and len(desc) > 50:
-                        extracted['description'] = desc[:2000]
-                        print(f"[scraper]    ✅ Description from deep search in API JSON")
+                    d = _deep_find_description(result)
+                    if d and len(d) > 50:
+                        extracted['description'] = d[:2000]
+                        print("[scraper]    ✅ Description from deep search in API JSON")
                 except Exception:
                     pass
 
@@ -494,7 +438,6 @@ def parse_pdp_response(text: str) -> dict | None:
 
 
 def _deep_find_description(obj, depth=0):
-    """Recursively search for description content in nested JSON."""
     if depth > 6:
         return None
     if isinstance(obj, dict):
@@ -502,19 +445,18 @@ def _deep_find_description(obj, depth=0):
                     'productDescription', 'descContent', 'richTextDesc']:
             val = obj.get(key)
             if isinstance(val, str) and len(val) > 50:
-                cleaned = re.sub(r'<[^>]+>', ' ', val)
-                cleaned = ' '.join(cleaned.split()).strip()
+                cleaned = ' '.join(re.sub(r'<[^>]+>', ' ', val).split()).strip()
                 if len(cleaned) > 50:
                     return cleaned
         for v in obj.values():
-            result = _deep_find_description(v, depth + 1)
-            if result:
-                return result
+            r = _deep_find_description(v, depth + 1)
+            if r:
+                return r
     elif isinstance(obj, list):
         for item in obj:
-            result = _deep_find_description(item, depth + 1)
-            if result:
-                return result
+            r = _deep_find_description(item, depth + 1)
+            if r:
+                return r
     return None
 
 
@@ -566,21 +508,13 @@ def get_images_from_dom(page) -> dict:
     return images
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DESCRIPTION EXTRACTION — MULTI-STRATEGY DOM FALLBACK
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _clean_description(text: str) -> str:
-    """Clean extracted description text."""
     if not text:
         return ''
     text = re.sub(r'\s+', ' ', text).strip()
-    text = re.sub(r'^.*?Description\s+report\s+', '', text,
-                  flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r'(Smarter Shopping|Better Living).*$', '', text,
-                  flags=re.IGNORECASE)
-    text = text.strip()
-    return text
+    text = re.sub(r'^.*?Description\s+report\s+', '', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'(Smarter Shopping|Better Living).*$', '', text, flags=re.IGNORECASE)
+    return text.strip()
 
 
 def get_description_from_dom(page) -> str:
@@ -593,7 +527,6 @@ def get_description_from_dom(page) -> str:
       5. Largest desc/detail block on page
     """
 
-    # ── STRATEGY 1: CSS selectors + recursive leaf-text extraction ──────
     print("[scraper]    🔍 Desc Strategy 1: CSS selectors + leaf-text...")
     try:
         desc = page.evaluate('''() => {
@@ -621,19 +554,12 @@ def get_description_from_dom(page) -> str:
                 '[data-widget="description"]',
                 '[class*="product-detail-info"]',
             ];
-
             function getLeafText(node) {
                 if (!node) return '';
                 var tag = node.tagName ? node.tagName.toLowerCase() : '';
-                if (['script','style','noscript','svg','iframe','button','input','select','textarea'].indexOf(tag) !== -1) {
-                    return '';
-                }
-                if (node.nodeType === 3) {
-                    return (node.textContent || '').trim();
-                }
-                if (!node.children || node.children.length === 0) {
-                    return (node.textContent || '').trim();
-                }
+                if (['script','style','noscript','svg','iframe','button','input','select','textarea'].indexOf(tag) !== -1) return '';
+                if (node.nodeType === 3) return (node.textContent || '').trim();
+                if (!node.children || node.children.length === 0) return (node.textContent || '').trim();
                 var texts = [];
                 for (var i = 0; i < node.childNodes.length; i++) {
                     var t = getLeafText(node.childNodes[i]);
@@ -641,7 +567,6 @@ def get_description_from_dom(page) -> str:
                 }
                 return texts.join(' ');
             }
-
             for (var s = 0; s < selectors.length; s++) {
                 try {
                     var els = document.querySelectorAll(selectors[s]);
@@ -655,10 +580,9 @@ def get_description_from_dom(page) -> str:
             }
             return '';
         }''')
-
         if desc:
             try:
-                parsed = json.loads(desc)
+                parsed  = json.loads(desc)
                 cleaned = _clean_description(parsed.get('text', ''))
                 if len(cleaned) > 50 and 'Smarter Shopping' not in cleaned:
                     print(f"[scraper]    ✅ Description via selector: {parsed.get('selector','')} ({len(cleaned)} chars)")
@@ -670,7 +594,6 @@ def get_description_from_dom(page) -> str:
     except Exception as e:
         print(f"[scraper]       Strategy 1 error: {e}")
 
-    # ── STRATEGY 2: Iframe with desc-related URL ────────────────────────
     print("[scraper]    🔍 Desc Strategy 2: Iframes (desc URL)...")
     try:
         for frame in page.frames:
@@ -681,8 +604,7 @@ def get_description_from_dom(page) -> str:
                 if any(kw in frame_url.lower() for kw in ['desc', 'description', 'detail']):
                     body_text = frame.evaluate('''() => {
                         if (!document.body) return '';
-                        var text = document.body.innerText || '';
-                        return text.substring(0, 2500);
+                        return (document.body.innerText || '').substring(0, 2500);
                     }''')
                     cleaned = _clean_description(body_text)
                     if len(cleaned) > 50:
@@ -693,7 +615,6 @@ def get_description_from_dom(page) -> str:
     except Exception as e:
         print(f"[scraper]       Strategy 2 error: {e}")
 
-    # ── STRATEGY 3: ALL sub-frames (some iframes have no desc in URL) ───
     print("[scraper]    🔍 Desc Strategy 3: All sub-frames...")
     try:
         for frame in page.frames:
@@ -702,14 +623,13 @@ def get_description_from_dom(page) -> str:
             try:
                 body_text = frame.evaluate('''() => {
                     if (!document.body) return '';
-                    var text = document.body.innerText || '';
-                    return text.substring(0, 2500);
+                    return (document.body.innerText || '').substring(0, 2500);
                 }''')
                 cleaned = _clean_description(body_text)
                 if (len(cleaned) > 100 and
-                    'sign in' not in cleaned.lower()[:50] and
-                    'Smarter Shopping' not in cleaned and
-                    'cookie' not in cleaned.lower()[:50]):
+                        'sign in' not in cleaned.lower()[:50] and
+                        'Smarter Shopping' not in cleaned and
+                        'cookie' not in cleaned.lower()[:50]):
                     print(f"[scraper]    ✅ Description from sub-frame ({len(cleaned)} chars)")
                     return cleaned[:2000]
             except Exception:
@@ -717,7 +637,6 @@ def get_description_from_dom(page) -> str:
     except Exception as e:
         print(f"[scraper]       Strategy 3 error: {e}")
 
-    # ── STRATEGY 4: Regex description from script tags ──────────────────
     print("[scraper]    🔍 Desc Strategy 4: Script tag regex...")
     try:
         desc_from_script = page.evaluate('''() => {
@@ -740,21 +659,16 @@ def get_description_from_dom(page) -> str:
                             var div = document.createElement('div');
                             div.innerHTML = decoded;
                             var clean = div.innerText || div.textContent || '';
-                            if (clean.length > 50) {
-                                return clean.substring(0, 2500);
-                            }
+                            if (clean.length > 50) return clean.substring(0, 2500);
                         } catch(e) {
                             var stripped = match[1].replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim();
-                            if (stripped.length > 50) {
-                                return stripped.substring(0, 2500);
-                            }
+                            if (stripped.length > 50) return stripped.substring(0, 2500);
                         }
                     }
                 }
             }
             return '';
         }''')
-
         cleaned = _clean_description(desc_from_script)
         if len(cleaned) > 50:
             print(f"[scraper]    ✅ Description from script regex ({len(cleaned)} chars)")
@@ -762,42 +676,33 @@ def get_description_from_dom(page) -> str:
     except Exception as e:
         print(f"[scraper]       Strategy 4 error: {e}")
 
-    # ── STRATEGY 5: Largest text block with desc/detail class/id ────────
     print("[scraper]    🔍 Desc Strategy 5: Largest desc/detail block...")
     try:
         desc = page.evaluate('''() => {
             var allDivs = document.querySelectorAll('div, section, article');
-            var best = '';
-            var bestLen = 0;
-
+            var best = '', bestLen = 0;
             for (var i = 0; i < allDivs.length; i++) {
                 var el = allDivs[i];
                 var cl = (el.className || '').toString().toLowerCase();
                 var id = (el.id || '').toLowerCase();
-
                 var isDescRelated = (
                     cl.indexOf('desc') !== -1 || cl.indexOf('detail') !== -1 ||
                     cl.indexOf('content') !== -1 || cl.indexOf('product-info') !== -1 ||
                     id.indexOf('desc') !== -1 || id.indexOf('detail') !== -1 ||
                     id.indexOf('product-description') !== -1
                 );
-
                 if (!isDescRelated) continue;
-
                 var text = (el.innerText || '').replace(/\\s+/g, ' ').trim();
-
                 if (text.length > 100 && text.length > bestLen &&
-                    text.indexOf('Add to Cart') === -1 &&
-                    text.indexOf('Buy Now') === -1 &&
-                    text.indexOf('Smarter Shopping') === -1 &&
-                    text.indexOf('Sign in') !== 0) {
-                    best = text;
-                    bestLen = text.length;
+                        text.indexOf('Add to Cart') === -1 &&
+                        text.indexOf('Buy Now') === -1 &&
+                        text.indexOf('Smarter Shopping') === -1 &&
+                        text.indexOf('Sign in') !== 0) {
+                    best = text; bestLen = text.length;
                 }
             }
             return best ? best.substring(0, 2500) : '';
         }''')
-
         cleaned = _clean_description(desc)
         if len(cleaned) > 50:
             print(f"[scraper]    ✅ Description from largest block ({len(cleaned)} chars)")
@@ -814,7 +719,7 @@ def get_description_from_dom(page) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_product_info(url: str) -> dict | None:
-    captured_pdp = []
+    captured_pdp      = []
     captured_desc_api = []
 
     try:
@@ -836,35 +741,42 @@ def get_product_info(url: str) -> dict | None:
                 extra_http_headers={'Accept-Language': 'en-GB,en;q=0.9'},
             )
 
-            # Mask automation signals
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-GB', 'en'] });
             """)
 
             page = context.new_page()
 
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # FIX 1: define handler
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             def handle_response(response):
                 url_r = response.url
 
-                # PDP API interception — only keep real data responses
-                if ('mtop.aliexpress.pdp.pc.query' in url_r or
-                        'mtop.aliexpress.itemdetail.pc' in url_r):
+                # PDP API — broad match covers all regional mtop variants
+                if 'mtop.aliexpress' in url_r and (
+                    'pdp' in url_r or 'itemdetail' in url_r or 'item' in url_r
+                ):
                     try:
                         body = response.body()
                         if len(body) > 1000:
                             text = body.decode('utf-8', errors='replace')
-                            # Guard: skip token-error / empty responses
-                            if ('GLOBAL_DATA' in text or
-                                    'HEADER_IMAGE_PC' in text or
-                                    'PRODUCT_PROP_PC' in text or
-                                    'SHOP_CARD_PC' in text):
+                            # Log every candidate so you can see what's arriving
+                            print(f"[scraper]    📡 PDP candidate ({len(body)}B): {url_r[:100]}")
+                            if any(k in text for k in [
+                                'GLOBAL_DATA', 'HEADER_IMAGE_PC', 'PRODUCT_PROP_PC',
+                                'SHOP_CARD_PC', 'imagePathList', 'titleModule',
+                            ]):
                                 captured_pdp.append(text)
-                                print(f"[scraper]    📡 Captured PDP: {url_r[:80]}")
-                    except Exception:
-                        pass
+                                print(f"[scraper]    ✅ Accepted")
+                            else:
+                                # Show first 200 chars so you can diagnose
+                                print(f"[scraper]    ⏭  Skipped — preview: {text[:200]}")
+                    except Exception as ex:
+                        print(f"[scraper]    ⚠️  PDP capture error: {ex}")
 
-                # Description API interception (lazy-loaded iframe content)
+                # Description API
                 if any(kw in url_r.lower() for kw in [
                     'description', 'desc', 'detail.html',
                     'pdp/description', 'product/description',
@@ -880,7 +792,12 @@ def get_product_info(url: str) -> dict | None:
                     except Exception:
                         pass
 
-            page.on('response', handle_response)
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # FIX 2: register BEFORE goto so early responses aren't missed
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            page.on('response', handle_response)   # ← was commented out and after goto
+
+            print(f'\n[scraper] 🌐 Opening: {url}')
             page.goto(url, timeout=60000, wait_until='domcontentloaded')
             page.wait_for_timeout(8000)
             page.mouse.wheel(0, 300)
@@ -919,38 +836,31 @@ def get_product_info(url: str) -> dict | None:
                 except Exception:
                     pass
 
-            # ─────────────────────────────────────────────────────────────
-            # DESCRIPTION — MULTI-STRATEGY PIPELINE
-            # ─────────────────────────────────────────────────────────────
-
+            # ── Description pipeline ───────────────────────────────────────
             if not extracted.get('description'):
                 print("\n[scraper]    📝 Starting description extraction pipeline...")
 
-                # Step A: Try captured description API responses
                 if captured_desc_api:
                     print(f"[scraper]    📡 Processing {len(captured_desc_api)} desc API responses...")
                     for desc_text in captured_desc_api:
-                        cleaned = re.sub(r'<[^>]+>', ' ', desc_text)
-                        cleaned = ' '.join(cleaned.split()).strip()
-                        cleaned = _clean_description(cleaned)
+                        cleaned = _clean_description(
+                            ' '.join(re.sub(r'<[^>]+>', ' ', desc_text).split())
+                        )
                         if len(cleaned) > 50:
                             extracted['description'] = cleaned[:2000]
-                            print(f"[scraper]    ✅ Description from desc API interception ({len(cleaned)} chars)")
+                            print(f"[scraper]    ✅ Description from desc API ({len(cleaned)} chars)")
                             break
 
-                # Step B: Try DOM extraction (first attempt, before extra scroll)
                 if not extracted.get('description'):
                     d = get_description_from_dom(page)
                     if d:
                         extracted['description'] = d
 
-                # Step C: Scroll to bottom to trigger lazy-loaded description
                 if not extracted.get('description'):
-                    print("[scraper]    📜 Scrolling page to trigger lazy description...")
+                    print("[scraper]    📜 Scrolling to trigger lazy description...")
                     for _ in range(8):
                         page.mouse.wheel(0, 700)
                         page.wait_for_timeout(500)
-
                     try:
                         page.wait_for_selector(
                             '#product-description, [class*="product-description"], '
@@ -963,12 +873,11 @@ def get_product_info(url: str) -> dict | None:
                     except Exception:
                         page.wait_for_timeout(2000)
 
-                    # Check for new desc API captures after scrolling
                     if captured_desc_api:
                         for desc_text in captured_desc_api:
-                            cleaned = re.sub(r'<[^>]+>', ' ', desc_text)
-                            cleaned = ' '.join(cleaned.split()).strip()
-                            cleaned = _clean_description(cleaned)
+                            cleaned = _clean_description(
+                                ' '.join(re.sub(r'<[^>]+>', ' ', desc_text).split())
+                            )
                             if len(cleaned) > 50 and not extracted.get('description'):
                                 extracted['description'] = cleaned[:2000]
                                 print(f"[scraper]    ✅ Description from desc API (after scroll) ({len(cleaned)} chars)")
@@ -979,13 +888,12 @@ def get_product_info(url: str) -> dict | None:
                         if d:
                             extracted['description'] = d
 
-                # Step D: Click "View More" / expand buttons and try again
                 if not extracted.get('description'):
-                    print("[scraper]    🖱️  Trying to click expand/view-more buttons...")
+                    print("[scraper]    🖱️  Trying expand/view-more buttons...")
                     try:
                         clicked = page.evaluate('''() => {
-                            var keywords = ['view more', 'see more', 'show more', 'read more',
-                                            'view full', 'description', 'expand', 'show all'];
+                            var keywords = ['view more','see more','show more','read more',
+                                            'view full','description','expand','show all'];
                             var elements = document.querySelectorAll('button, a, span, div');
                             for (var i = 0; i < elements.length; i++) {
                                 var text = (elements[i].textContent || '').toLowerCase().trim();
@@ -1009,21 +917,18 @@ def get_product_info(url: str) -> dict | None:
                     except Exception:
                         pass
 
-                # Step E: Scroll to absolute bottom + wait + final attempt
                 if not extracted.get('description'):
                     print("[scraper]    📜 Final scroll to absolute bottom...")
                     page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
                     page.wait_for_timeout(3000)
-
                     if captured_desc_api:
-                        best = max(captured_desc_api, key=len)
-                        cleaned = re.sub(r'<[^>]+>', ' ', best)
-                        cleaned = ' '.join(cleaned.split()).strip()
-                        cleaned = _clean_description(cleaned)
+                        best    = max(captured_desc_api, key=len)
+                        cleaned = _clean_description(
+                            ' '.join(re.sub(r'<[^>]+>', ' ', best).split())
+                        )
                         if len(cleaned) > 50:
                             extracted['description'] = cleaned[:2000]
                             print(f"[scraper]    ✅ Description from desc API (final) ({len(cleaned)} chars)")
-
                     if not extracted.get('description'):
                         d = get_description_from_dom(page)
                         if d:
@@ -1040,9 +945,8 @@ def get_product_info(url: str) -> dict | None:
             print('[scraper] ❌ No title — aborting')
             return None
 
-        # Summary
-        core = ['brand', 'color', 'dimensions', 'weight', 'material',
-                'certifications', 'country_of_origin', 'warranty', 'product_type']
+        core          = ['brand', 'color', 'dimensions', 'weight', 'material',
+                         'certifications', 'country_of_origin', 'warranty', 'product_type']
         seller_fields = ['store_name', 'store_id', 'seller_positive_rate',
                          'seller_rating', 'seller_country', 'store_open_date']
 
@@ -1052,9 +956,8 @@ def get_product_info(url: str) -> dict | None:
         print(f'[scraper]    Desc       : {len(extracted.get("description", ""))} chars')
         print(f'[scraper]    Core specs : {[k for k in core if extracted.get(k)]}')
         print(f'[scraper]    Seller     : {[k for k in seller_fields if extracted.get(k)]}')
-        print(f'[scraper]    Images     : {sum(1 for i in range(1,21) if extracted.get(f"image_{i}"))}')
+        print(f'[scraper]    Images     : {sum(1 for i in range(1, 21) if extracted.get(f"image_{i}"))}')
 
-        # Apply defaults
         defaults = {
             'description': '', 'brand': '', 'color': '', 'dimensions': '',
             'weight': '', 'material': '', 'certifications': '',
@@ -1067,7 +970,6 @@ def get_product_info(url: str) -> dict | None:
             'battery': '', 'display': '', 'camera': '',
             'connectivity': '', 'memory': '', 'os': '',
             'style': '', 'season': '', 'fit': '',
-            # Seller defaults
             'store_name': '', 'store_id': '', 'store_url': '',
             'seller_id': '', 'seller_positive_rate': '', 'seller_rating': '',
             'seller_communication': '', 'seller_shipping_speed': '',
@@ -1099,6 +1001,6 @@ if __name__ == '__main__':
         for k, v in result.items():
             if v and not k.startswith('image_'):
                 print(f'  {k:30s}: {str(v)[:100]}')
-        print(f'  {"images":30s}: {sum(1 for i in range(1,21) if result.get(f"image_{i}"))}')
+        print(f'  {"images":30s}: {sum(1 for i in range(1, 21) if result.get(f"image_{i}"))}')
     else:
         print('FAILED')
