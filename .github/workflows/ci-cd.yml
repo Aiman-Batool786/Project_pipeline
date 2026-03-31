@@ -49,8 +49,7 @@ jobs:
             cd /home/aimanbatool114/Project_pipeline || { echo "Project directory not found!"; exit 1; }
 
             # ────────────────────────────────────────────────
-            # Force sync with GitHub — discard local code changes
-            # but KEEP: venv, database, logs, pid, credentials
+            # Force sync with GitHub
             # ────────────────────────────────────────────────
             git fetch origin main || { echo "Git fetch failed"; exit 1; }
             git reset --hard origin/main || { echo "Git reset failed"; exit 1; }
@@ -85,12 +84,18 @@ jobs:
             pip install -r requirements.txt || { echo "Failed to install dependencies"; exit 1; }
 
             # ────────────────────────────────────────────────
-            # Set secrets as environment variables
+            # Write all secrets to .env (one file, fresh each deploy)
             # ────────────────────────────────────────────────
-            export OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}"
-            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" > .env
-            echo "${{ secrets.GCP_SA_KEY }}" > gcp-service-account.json
+            cat > .env << 'ENVEOF'
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            ZENROWS_API_KEY=${{ secrets.ZENROWS_API_KEY }}
+            ENVEOF
+            echo "✅ .env written"
+
+            # Write GCP service account key
+            echo '${{ secrets.GCP_SA_KEY }}' > gcp-service-account.json
             export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/gcp-service-account.json"
+            echo "✅ GCP credentials written"
 
             # ────────────────────────────────────────────────
             # Stop old uvicorn using PID file
@@ -112,8 +117,10 @@ jobs:
             fi
 
             # ────────────────────────────────────────────────
-            # Start FastAPI server
+            # Start FastAPI server with env vars loaded
             # ────────────────────────────────────────────────
+            export $(grep -v '^#' .env | xargs)
+
             nohup /home/aimanbatool114/Project_pipeline/venv/bin/python -m uvicorn main:app \
               --host 0.0.0.0 \
               --port 8686 \
