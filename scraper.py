@@ -31,7 +31,7 @@ from playwright.sync_api import sync_playwright
 # SCRAPERAPI CONFIG — paste your key here
 # ─────────────────────────────────────────────────────────────────────────────
 
-SCRAPER_API_KEY = "YOUR_SCRAPERAPI_KEY_HERE"   # ← replace with your real key
+SCRAPER_API_KEY = "bfb3989af13615b35a0b7e908acebe66"   # ← replace with your real key
 
 
 def fetch_rendered_html(url: str, retries: int = 3) -> str:
