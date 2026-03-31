@@ -10,59 +10,82 @@ from playwright.sync_api import sync_playwright
 # ZENROWS CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY", "")
-if not ZENROWS_API_KEY:
-    raise Exception("ZENROWS_API_KEY is missing!")
+# ONLY THIS FUNCTION UPDATED (rest of your code SAME)
 
-def fetch_rendered_html(url: str, retries: int = 3) -> str:
+def fetch_rendered_html(url: str, retries: int = 4) -> str:
     """
-    Fetch fully rendered page HTML via ZenRows residential proxy.
-    Uses JS rendering + wait_for selector to ensure async product data is loaded.
+    Fetch fully rendered page HTML via ZenRows.
+    Improved reliability for AliExpress.
     """
+
     for attempt in range(1, retries + 1):
         try:
-            print(f"[scraper]    🌐 ZenRows fetch (attempt {attempt})...")
+            wait_time = 8 + (attempt * 3)   # dynamic wait
+            print(f"[scraper] 🌐 ZenRows fetch (attempt {attempt}) | wait={wait_time}s")
+
             resp = requests.get(
                 "https://api.zenrows.com/v1/",
                 params={
-                    "apikey":          ZENROWS_API_KEY,
-                    "url":             url,
-                    "js_render":       "true",
-                    "premium_proxy":   "true",
-                    "proxy_country":   "gb",
-                    # "wait_for":        "[data-pl='product-title'],h1.product-title-text",
-                    "wait":            "8",
-                    "response_type":   "html",
+                    "apikey": ZENROWS_API_KEY,
+                    "url": url,
+                    "js_render": "true",
+                    "premium_proxy": "true",
+                    "proxy_country": "gb",
+
+                    # ✅ IMPORTANT FIX
+                    "wait": str(wait_time),
+                    "wait_for": "h1, title, [data-pl='product-title']",
+
+                    "response_type": "html",
                     "original_status": "true",
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
                 },
                 timeout=300,
             )
-            if resp.status_code == 200 and len(resp.text) > 5000:
-                print(f"[scraper]    ✅ ZenRows returned {len(resp.text)} chars")
-                # Check if product data is actually present
-                has_specs  = "PRODUCT_PROP_PC" in resp.text
-                has_seller = "SHOP_CARD_PC"     in resp.text
-                print(f"[scraper]    📦 Has specs: {has_specs} | Has seller: {has_seller}")
-                if not has_specs and attempt < retries:
-                    print(f"[scraper]    ⚠️  Product data missing, retrying with longer wait...")
+
+            html = resp.text or ""
+
+            print(f"[scraper] Status: {resp.status_code} | Length: {len(html)}")
+
+            # ✅ SUCCESS CHECK
+            if resp.status_code == 200 and len(html) > 5000:
+
+                # Detect CAPTCHA / block
+                if "punish" in html or "captcha" in html.lower():
+                    print("[scraper] ⚠️ CAPTCHA detected")
+                else:
+                    print("[scraper] ✅ HTML fetched successfully")
+
+                has_specs = "PRODUCT_PROP_PC" in html
+                has_seller = "SHOP_CARD_PC" in html
+
+                print(f"[scraper] 📦 Has specs: {has_specs} | Has seller: {has_seller}")
+
+                # ✅ If real data present → return
+                if has_specs or has_seller:
+                    return html
+
+                # Retry if missing data
+                if attempt < retries:
+                    print("[scraper] ⚠️ Missing product data, retrying...")
                     time.sleep(5 * attempt)
                     continue
-                return resp.text
+
+                return html
+
             else:
-                print(f"[scraper]    ⚠️  ZenRows attempt {attempt}: "
-                      f"status={resp.status_code} len={len(resp.text)}")
-                deny = resp.headers.get("x-deny-reason", "")
-                if deny:
-                    print(f"[scraper]    ⚠️  Deny reason: {deny}")
+                print(f"[scraper] ⚠️ Bad response: {resp.status_code}")
+
         except Exception as e:
-            print(f"[scraper]    ⚠️  ZenRows attempt {attempt} error: {e}")
+            print(f"[scraper] ⚠️ Error: {e}")
 
-        if attempt < retries:
-            time.sleep(5 * attempt)
+        time.sleep(5 * attempt)
 
-    print("[scraper]    ❌ ZenRows failed after all retries")
+    print("[scraper] ❌ ZenRows failed after retries")
     return ""
-
+    
 # ─────────────────────────────────────────────────────────────────────────────
 # SPEC MAPPING
 # ─────────────────────────────────────────────────────────────────────────────
