@@ -1,73 +1,65 @@
-"""
-scraper.py
-──────────
-AliExpress UK scraper — ScraperAPI + Playwright DOM parsing.
-
-WHY ScraperAPI:
-  GCP/AWS/cloud VM IPs are blocked by AliExpress bot detection.
-  The page loads with a CAPTCHA punishment overlay (_____tmd_____/punish).
-  ScraperAPI fetches the page through a residential UK IP, bypassing CAPTCHA,
-  and returns the fully rendered HTML. We then parse that HTML locally.
-
-Flow:
-  1. ScraperAPI fetches + renders the page (residential UK IP, JS enabled)
-  2. Playwright loads the returned HTML via page.set_content()
-  3. We extract data from:
-       a. Embedded JSON blobs (__NEXT_DATA__, window.runParams, script tags)
-       b. DOM selectors (recursive leaf walker for description)
-
-RULE: Seller info is NEVER sent to LLM. Always stored as original scraped values.
-"""
-
 import re
 import json
 import time
 import requests
 import urllib.request
+import os
 from playwright.sync_api import sync_playwright
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# SCRAPERAPI CONFIG — paste your key here
+# ZENROWS CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-SCRAPER_API_KEY = "bfb3989af13615b35a0b7e908acebe66"   # ← replace with your real key
-
+ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY", "")
 
 def fetch_rendered_html(url: str, retries: int = 3) -> str:
     """
-    Fetch fully rendered page HTML via ScraperAPI residential proxy.
-    Uses UK IP + JS rendering to bypass AliExpress bot detection.
+    Fetch fully rendered page HTML via ZenRows residential proxy.
+    Uses JS rendering + wait_for selector to ensure async product data is loaded.
     """
     for attempt in range(1, retries + 1):
         try:
-            print(f"[scraper]    🌐 ScraperAPI fetch (attempt {attempt})...")
+            print(f"[scraper]    🌐 ZenRows fetch (attempt {attempt})...")
             resp = requests.get(
-                "http://api.scraperapi.com",
+                "https://api.zenrows.com/v1/",
                 params={
-                    "api_key":      SCRAPER_API_KEY,
-                    "url":          url,
-                    "render":       "true",       # full JS rendering
-                    "country_code": "gb",         # UK IP
-                    "premium":      "true",        # residential proxy
+                    "apikey":          ZENROWS_API_KEY,
+                    "url":             url,
+                    "js_render":       "true",
+                    "premium_proxy":   "true",
+                    "proxy_country":   "gb",
+                    "wait_for":        "[data-pl='product-title'],h1.product-title-text",
+                    "wait":            "6000",
+                    "response_type":   "html",
+                    "original_status": "true",
                 },
-                timeout=120
+                timeout=120,
             )
             if resp.status_code == 200 and len(resp.text) > 5000:
-                print(f"[scraper]    ✅ ScraperAPI returned {len(resp.text)} chars")
+                print(f"[scraper]    ✅ ZenRows returned {len(resp.text)} chars")
+                # Check if product data is actually present
+                has_specs  = "PRODUCT_PROP_PC" in resp.text
+                has_seller = "SHOP_CARD_PC"     in resp.text
+                print(f"[scraper]    📦 Has specs: {has_specs} | Has seller: {has_seller}")
+                if not has_specs and attempt < retries:
+                    print(f"[scraper]    ⚠️  Product data missing, retrying with longer wait...")
+                    time.sleep(5 * attempt)
+                    continue
                 return resp.text
             else:
-                print(f"[scraper]    ⚠️  ScraperAPI attempt {attempt}: "
+                print(f"[scraper]    ⚠️  ZenRows attempt {attempt}: "
                       f"status={resp.status_code} len={len(resp.text)}")
+                deny = resp.headers.get("x-deny-reason", "")
+                if deny:
+                    print(f"[scraper]    ⚠️  Deny reason: {deny}")
         except Exception as e:
-            print(f"[scraper]    ⚠️  ScraperAPI attempt {attempt} error: {e}")
+            print(f"[scraper]    ⚠️  ZenRows attempt {attempt} error: {e}")
 
         if attempt < retries:
-            time.sleep(3 * attempt)
+            time.sleep(5 * attempt)
 
-    print("[scraper]    ❌ ScraperAPI failed after all retries")
+    print("[scraper]    ❌ ZenRows failed after all retries")
     return ""
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SPEC MAPPING
@@ -115,7 +107,6 @@ SPEC_MAPPING = {
     'fit':               ['fit'],
 }
 
-
 def map_props_to_fields(props: list) -> tuple:
     raw = {}
     for item in props:
@@ -148,14 +139,56 @@ def map_props_to_fields(props: list) -> tuple:
 
     return mapped, raw
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # EMBEDDED JSON EXTRACTOR
-# Finds the product data embedded in <script> tags or window variables
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_page_json(page) -> dict:
     """Try all known locations for embedded product JSON."""
+
+    # Strategy 0: Scan all scripts for PRODUCT_PROP_PC / SHOP_CARD_PC blobs
+    print("[scraper]    🔍 Strategy 0: direct script scan for product keys...")
+    try:
+        scripts = page.evaluate('''() => {
+            return Array.from(document.querySelectorAll("script"))
+                .map(s => s.textContent || "")
+                .filter(t => t.length > 500 && (
+                    t.includes("PRODUCT_PROP_PC") ||
+                    t.includes("SHOP_CARD_PC")
+                ));
+        }''')
+        for script_text in scripts:
+            # Try to find a large JSON object containing the product keys
+            for pattern in [
+                r'window\.runParams\s*=\s*(\{.+\})\s*;',
+                r'window\.__aer_data__\s*=\s*(\{.+\})\s*;',
+                r'window\._dida_config_\s*=\s*(\{.+\})\s*;',
+                r'var\s+_init_data_\s*=\s*(\{.+\})\s*;',
+                r'"result"\s*:\s*(\{"GLOBAL_DATA".+?\})\s*(?:,|\})',
+            ]:
+                m = re.search(pattern, script_text, re.DOTALL)
+                if m:
+                    try:
+                        data   = json.loads(m.group(1))
+                        result = _find_product_result(data)
+                        if result and _result_has_product_data(result):
+                            print("[scraper]    ✅ Strategy 0: data from script pattern")
+                            return result
+                    except Exception:
+                        pass
+
+            # Try extracting the full JSON blob if script text IS valid JSON
+            try:
+                data   = json.loads(script_text)
+                result = _find_product_result(data)
+                if result and _result_has_product_data(result):
+                    print("[scraper]    ✅ Strategy 0: script text is direct JSON")
+                    return result
+            except Exception:
+                pass
+
+    except Exception as e:
+        print(f"[scraper]    ⚠️  Strategy 0 error: {e}")
 
     # Strategy A: __NEXT_DATA__
     try:
@@ -196,7 +229,7 @@ def extract_page_json(page) -> dict:
     except Exception as e:
         print(f"[scraper]    ⚠️  window.__aer_data__ error: {e}")
 
-    # Strategy D: window._dida_config_ init data
+    # Strategy D: window._dida_config_
     try:
         raw = page.evaluate('() => JSON.stringify(window._dida_config_ || null)')
         if raw and raw != 'null':
@@ -208,8 +241,8 @@ def extract_page_json(page) -> dict:
     except Exception as e:
         print(f"[scraper]    ⚠️  window._dida_config_ error: {e}")
 
-    # Strategy E: scan all script tags for product JSON blobs
-    print("[scraper]    🔍 Scanning script tags...")
+    # Strategy E: full script tag scan (broader)
+    print("[scraper]    🔍 Strategy E: broad script tag scan...")
     try:
         scripts = page.evaluate('''() => {
             return Array.from(document.querySelectorAll("script"))
@@ -226,7 +259,6 @@ def extract_page_json(page) -> dict:
         }''')
 
         for script_text in scripts:
-            # Try common assignment patterns
             for pattern in [
                 r'window\.runParams\s*=\s*(\{.+\})\s*;',
                 r'window\.__aer_data__\s*=\s*(\{.+\})\s*;',
@@ -244,9 +276,7 @@ def extract_page_json(page) -> dict:
                     except Exception:
                         pass
 
-            # Try extracting any large JSON that has product keys
             try:
-                # Find JSON objects that contain product keys
                 for m in re.finditer(r'(\{[^{}]{20,}\})', script_text):
                     try:
                         data = json.loads(m.group(1))
@@ -260,10 +290,39 @@ def extract_page_json(page) -> dict:
                 pass
 
     except Exception as e:
-        print(f"[scraper]    ⚠️  Script scan error: {e}")
+        print(f"[scraper]    ⚠️  Strategy E error: {e}")
+
+    # Strategy F: evaluate window object directly for DCData with full product info
+    print("[scraper]    🔍 Strategy F: window DCData deep scan...")
+    try:
+        raw = page.evaluate('''() => {
+            try {
+                var dc = window._d_c_ && window._d_c_.DCData;
+                if (dc) return JSON.stringify(dc);
+            } catch(e) {}
+            return null;
+        }''')
+        if raw and raw != 'null' and len(raw) > 200:
+            data = json.loads(raw)
+            result = _find_product_result(data)
+            if result:
+                print("[scraper]    ✅ Data from window._d_c_.DCData")
+                return result
+    except Exception as e:
+        print(f"[scraper]    ⚠️  Strategy F error: {e}")
 
     print("[scraper]    ⚠️  No embedded product JSON found")
     return {}
+
+
+def _result_has_product_data(result: dict) -> bool:
+    """Quick check that a result dict actually contains product spec/seller data."""
+    return bool(
+        result.get('PRODUCT_PROP_PC') or
+        result.get('SHOP_CARD_PC') or
+        result.get('titleModule') or
+        (result.get('GLOBAL_DATA', {}) or {}).get('globalData', {})
+    )
 
 
 def _find_product_result(data, depth: int = 0) -> dict:
@@ -271,12 +330,10 @@ def _find_product_result(data, depth: int = 0) -> dict:
     if depth > 8 or not isinstance(data, dict):
         return {}
 
-    # Direct hit
     if any(k in data for k in ['PRODUCT_PROP_PC', 'SHOP_CARD_PC', 'HEADER_IMAGE_PC',
                                 'imageModule', 'titleModule', 'GLOBAL_DATA']):
         return data
 
-    # Fast-path common wrappers
     for path in [
         ['data', 'result'],
         ['props', 'pageProps', 'componentData'],
@@ -295,7 +352,6 @@ def _find_product_result(data, depth: int = 0) -> dict:
             if found:
                 return found
 
-    # Full recursive search
     for v in data.values():
         if isinstance(v, dict):
             found = _find_product_result(v, depth + 1)
@@ -303,7 +359,6 @@ def _find_product_result(data, depth: int = 0) -> dict:
                 return found
 
     return {}
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SELLER INFO EXTRACTOR
@@ -353,7 +408,6 @@ def extract_seller_info(result: dict) -> dict:
                 seller['store_url'] = ('https:' + raw_url
                                        if raw_url.startswith('//') else raw_url)
 
-        # GLOBAL_DATA fallbacks
         if not seller['store_name']:
             try:
                 seller['store_name'] = str(
@@ -378,7 +432,6 @@ def extract_seller_info(result: dict) -> dict:
         print(f"[scraper]    ⚠️  Seller extraction error: {e}")
 
     return seller
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PRICE EXTRACTOR
@@ -407,9 +460,8 @@ def extract_price(result: dict) -> str:
         pass
     return ''
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# DESCRIPTION FETCHER (from embedded URL)
+# DESCRIPTION FETCHER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_description_url(result: dict) -> str:
@@ -432,7 +484,6 @@ def fetch_description_url(result: dict) -> str:
         print(f"[scraper]    ⚠️  Desc URL error: {e}")
     return ''
 
-
 def _parse_desc_json(data) -> str:
     if isinstance(data, str):
         c = ' '.join(re.sub(r'<[^>]+>', ' ', data).split()).strip()
@@ -451,9 +502,8 @@ def _parse_desc_json(data) -> str:
         return ' '.join(parts)[:2000] if parts else ''
     return ''
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# DESCRIPTION — DOM RECURSIVE LEAF WALKER (your friend's approach)
+# DESCRIPTION — DOM FALLBACKS
 # ─────────────────────────────────────────────────────────────────────────────
 
 DESC_SELECTORS = [
@@ -477,24 +527,20 @@ LEAF_WALKER_JS = '''(selectors) => {
         var tag = (node.tagName || "").toLowerCase();
         if (["script","style","noscript","svg","iframe","button",
              "input","select","textarea","nav","header","footer"].indexOf(tag) !== -1) return;
-        // Pure text node
         if (node.nodeType === 3) {
             var t = (node.textContent || "").trim();
             if (t.length > 0) texts.push(t);
             return;
         }
-        // No children — use element text directly
         if (!node.hasChildNodes()) {
             var t = (node.textContent || "").trim();
             if (t.length > 0) texts.push(t);
             return;
         }
-        // Recurse into every child
         for (var i = 0; i < node.childNodes.length; i++) {
             getLeafTexts(node.childNodes[i], texts);
         }
     }
-
     for (var s = 0; s < selectors.length; s++) {
         var els = document.querySelectorAll(selectors[s]);
         for (var e = 0; e < els.length; e++) {
@@ -512,9 +558,7 @@ LEAF_WALKER_JS = '''(selectors) => {
     return "";
 }'''
 
-
 def get_description_from_dom(page) -> str:
-    # Strategy 1: recursive leaf walker on known selectors
     print("[scraper]    🔍 Desc: recursive leaf walker...")
     try:
         raw = page.evaluate(LEAF_WALKER_JS, DESC_SELECTORS)
@@ -527,7 +571,6 @@ def get_description_from_dom(page) -> str:
     except Exception as e:
         print(f"[scraper]       Leaf walker error: {e}")
 
-    # Strategy 2: iframes
     print("[scraper]    🔍 Desc: iframe scan...")
     try:
         for frame in page.frames:
@@ -564,7 +607,6 @@ def get_description_from_dom(page) -> str:
     except Exception as e:
         print(f"[scraper]       Iframe scan error: {e}")
 
-    # Strategy 3: script tag embedded description strings
     print("[scraper]    🔍 Desc: script tag scan...")
     try:
         desc = page.evaluate('''() => {
@@ -603,7 +645,6 @@ def get_description_from_dom(page) -> str:
     except Exception as e:
         print(f"[scraper]       Script scan error: {e}")
 
-    # Strategy 4: largest block with desc/detail in class
     print("[scraper]    🔍 Desc: largest content block...")
     try:
         desc = page.evaluate('''() => {
@@ -634,7 +675,6 @@ def get_description_from_dom(page) -> str:
 
     return ''
 
-
 def _clean_description(text: str) -> str:
     if not text:
         return ''
@@ -644,7 +684,6 @@ def _clean_description(text: str) -> str:
     text = re.sub(r'(Smarter Shopping|Better Living).*$', '',
                   text, flags=re.IGNORECASE)
     return text.strip()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DOM FALLBACKS — title and images
@@ -666,7 +705,6 @@ def get_title_from_dom(page) -> str:
         except Exception:
             pass
     return ''
-
 
 def get_images_from_dom(page) -> dict:
     images = {}
@@ -698,7 +736,6 @@ def get_images_from_dom(page) -> dict:
         pass
     return images
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -706,15 +743,14 @@ def get_images_from_dom(page) -> dict:
 def get_product_info(url: str) -> dict | None:
     print(f'\n[scraper] 🚀 Starting: {url}')
 
-    # ── Step 1: Fetch rendered HTML via ScraperAPI ─────────────────────────
+    # ── Step 1: Fetch rendered HTML via ZenRows ────────────────────────────
     html = fetch_rendered_html(url)
     if not html:
-        print('[scraper] ❌ Could not fetch HTML via ScraperAPI')
+        print('[scraper] ❌ Could not fetch HTML via ZenRows')
         return None
 
-    # Quick sanity check — if we still got a punishment page
     if '_____tmd_____/punish' in html and 'PRODUCT_PROP_PC' not in html:
-        print('[scraper] ❌ Still getting CAPTCHA page — try premium=true or different region')
+        print('[scraper] ❌ Still getting CAPTCHA page')
         return None
 
     extracted = {}
@@ -731,7 +767,7 @@ def get_product_info(url: str) -> dict | None:
             )
             page = context.new_page()
 
-            # Load the ScraperAPI-fetched HTML locally — no network from VM
+            # Load the ZenRows-fetched HTML into Playwright for DOM parsing
             page.set_content(html, wait_until='domcontentloaded')
             page.wait_for_timeout(2000)
 
