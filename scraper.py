@@ -29,7 +29,7 @@ def fetch_rendered_html(url: str, retries: int = 3) -> str:
                     "premium_proxy":   "true",
                     "proxy_country":   "gb",
                     # "wait_for":        "[data-pl='product-title'],h1.product-title-text",
-                    "wait":            "8000",
+                    "wait":            "8",
                     "response_type":   "html",
                     "original_status": "true",
                 },
