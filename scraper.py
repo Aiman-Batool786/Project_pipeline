@@ -33,7 +33,7 @@ def fetch_rendered_html(url: str, retries: int = 3) -> str:
                     "response_type":   "html",
                     "original_status": "true",
                 },
-                timeout=120,
+                timeout=300,
             )
             if resp.status_code == 200 and len(resp.text) > 5000:
                 print(f"[scraper]    ✅ ZenRows returned {len(resp.text)} chars")
