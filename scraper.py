@@ -5,6 +5,11 @@ import requests
 import urllib.request
 import os
 from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ZENROWS_API_KEY = os.environ.get("ZENROWS_API_KEY", "")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ZENROWS CONFIG
