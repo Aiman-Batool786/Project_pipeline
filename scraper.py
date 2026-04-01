@@ -371,9 +371,15 @@ def get_title_from_html(html: str) -> str:
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_product_info(url: str) -> dict | None:
-    print(f'\n[scraper] 🚀 Starting: {url}')
+import re
+import json
+import urllib.request
+import concurrent.futures
+from camoufox.sync_api import Camoufox
 
+
+def _scrape_in_thread(url: str) -> dict:
+    """Runs Camoufox in a separate thread to avoid asyncio conflict."""
     captured_pdp = []
     html         = ''
 
@@ -395,12 +401,11 @@ def get_product_info(url: str) -> dict | None:
 
             page = context.new_page()
 
-            # Intercept AliExpress product API responses
             def handle_response(response):
                 try:
                     url_r = response.url
-                    if ('mtop.aliexpress.pdp.pc.query'    in url_r or
-                            'mtop.aliexpress.itemdetail'  in url_r):
+                    if ('mtop.aliexpress.pdp.pc.query' in url_r or
+                            'mtop.aliexpress.itemdetail' in url_r):
 
                         if '_____tmd_____' in url_r or 'punish' in url_r:
                             print("[scraper]    ⛔ Skipped punish URL")
@@ -430,7 +435,6 @@ def get_product_info(url: str) -> dict | None:
             except Exception as e:
                 print(f"[scraper]    ⚠️  Navigation warning: {e}")
 
-            # Wait up to 30s for a good API response
             print("[scraper]    ⏳ Waiting for product API response...")
             for i in range(30):
                 page.wait_for_timeout(1000)
@@ -442,7 +446,6 @@ def get_product_info(url: str) -> dict | None:
                     print(f"[scraper]    ✅ Got full API response at {i+1}s")
                     break
 
-                # Simulate user interaction to trigger lazy API calls
                 if i == 5:
                     page.mouse.wheel(0, 300)
                 if i == 10:
@@ -458,7 +461,6 @@ def get_product_info(url: str) -> dict | None:
 
             print(f"[scraper]    📦 Total API responses: {len(captured_pdp)}")
 
-            # Get HTML for fallbacks
             try:
                 html = page.content()
             except Exception:
@@ -471,7 +473,20 @@ def get_product_info(url: str) -> dict | None:
         print(f'[scraper] ❌ Browser error: {e}')
         import traceback
         traceback.print_exc()
-        return None
+
+    return {'captured_pdp': captured_pdp, 'html': html}
+
+
+def get_product_info(url: str) -> dict | None:
+    print(f'\n[scraper] 🚀 Starting: {url}')
+
+    # ✅ Run Camoufox in a separate thread to avoid asyncio conflict
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_scrape_in_thread, url)
+        result = future.result(timeout=180)  # 3 min max
+
+    captured_pdp = result.get('captured_pdp', [])
+    html         = result.get('html', '')
 
     # Parse captured API responses — largest first
     extracted = {}
@@ -540,7 +555,6 @@ def get_product_info(url: str) -> dict | None:
         extracted.setdefault(f'image_{i}', '')
 
     return extracted
-
 
 if __name__ == '__main__':
     test_url = 'https://www.aliexpress.com/item/1005009130457901.html'
