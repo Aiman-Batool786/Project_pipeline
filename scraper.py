@@ -1,8 +1,8 @@
 """
 scraper.py
 ──────────
-Camoufox (Firefox) + Tor UK exit nodes
-Intercepts mtop.aliexpress.pdp.pc.query API response
+Camoufox (Firefox) — intercepts mtop.aliexpress.pdp.pc.query API response
+No Tor — uses direct connection (GCP VM IP is fine for this approach)
 """
 
 import re
@@ -139,7 +139,6 @@ def extract_seller_info(result: dict) -> dict:
                 seller['store_url'] = ('https:' + raw_url
                                        if raw_url.startswith('//') else raw_url)
 
-        # GLOBAL_DATA fallbacks
         if not seller['store_name']:
             try:
                 seller['store_name'] = str(
@@ -245,6 +244,8 @@ def _parse_desc_json(data) -> str:
 def parse_pdp_response(text: str) -> dict | None:
     try:
         text = text.strip()
+
+        # Strip JSONP wrapper if present e.g. mtopjsonp1({...});
         m = re.match(r'^[a-zA-Z_$][a-zA-Z0-9_$]*\s*\((.*)\)\s*;?\s*$', text, re.DOTALL)
         if m:
             text = m.group(1)
@@ -257,7 +258,7 @@ def parse_pdp_response(text: str) -> dict | None:
 
         extracted = {}
 
-        # ── Title ──
+        # Title
         try:
             extracted['title'] = result['GLOBAL_DATA']['globalData']['subject']
         except (KeyError, TypeError):
@@ -268,7 +269,7 @@ def parse_pdp_response(text: str) -> dict | None:
             except (KeyError, TypeError):
                 pass
 
-        # ── Specs ──
+        # Specs
         props = []
         try:
             props = result['PRODUCT_PROP_PC']['showedProps'] or []
@@ -288,10 +289,10 @@ def parse_pdp_response(text: str) -> dict | None:
         else:
             print("[scraper]    ⚠️  No specs found")
 
-        # ── Seller ──
+        # Seller
         extracted.update(extract_seller_info(result))
 
-        # ── Images ──
+        # Images
         images = []
         for img_key in ['HEADER_IMAGE_PC', 'imageModule']:
             try:
@@ -302,7 +303,6 @@ def parse_pdp_response(text: str) -> dict | None:
             except (KeyError, TypeError):
                 pass
 
-        # Deep search fallback
         if not images:
             def find_images(obj, depth=0):
                 if depth > 6 or not isinstance(obj, dict):
@@ -323,12 +323,12 @@ def parse_pdp_response(text: str) -> dict | None:
                 img = 'https:' + img if img.startswith('//') else img
                 extracted[f'image_{idx}'] = re.sub(r'_\d+x\d+', '', img)
 
-        # ── Price ──
+        # Price
         price = extract_price(result)
         if price:
             extracted['price'] = price
 
-        # ── Description ──
+        # Description
         desc = fetch_description_url(result)
         if desc:
             extracted['description'] = desc
@@ -341,13 +341,12 @@ def parse_pdp_response(text: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IMAGE FALLBACK FROM HTML
+# HTML FALLBACKS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_images_from_html(html: str) -> dict:
     images = {}
     try:
-        # From DCData.imagePathList (confirmed in your HTML)
         m = re.search(r'"imagePathList"\s*:\s*(\[[^\]]+\])', html)
         if m:
             urls = json.loads(m.group(1))
@@ -361,12 +360,7 @@ def get_images_from_html(html: str) -> dict:
     return images
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TITLE FALLBACK FROM HTML
-# ─────────────────────────────────────────────────────────────────────────────
-
 def get_title_from_html(html: str) -> str:
-    # og:title is reliable even without JS
     m = re.search(r'<meta[^>]*property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']', html)
     if m:
         return m.group(1).strip()
@@ -381,70 +375,66 @@ def get_product_info(url: str) -> dict | None:
     print(f'\n[scraper] 🚀 Starting: {url}')
 
     captured_pdp = []
+    html         = ''
 
     try:
         with Firefox(
             headless=True,
-            proxy={"server": "socks5://127.0.0.1:9050"},  # Tor
-            geoip=True,        # auto geo based on exit node IP
-            os='windows',      # spoof Windows OS fingerprint
+            geoip=True,
+            os='windows',
         ) as browser:
 
             context = browser.new_context(
                 viewport={'width': 1366, 'height': 900},
-                locale='en-GB',
-                timezone_id='Europe/London',
+                locale='en-US',
+                timezone_id='America/New_York',
                 extra_http_headers={
-                    'Accept-Language': 'en-GB,en;q=0.9',
+                    'Accept-Language': 'en-US,en;q=0.9',
                 }
             )
 
             page = context.new_page()
 
-            # ── Intercept API responses ──────────────────────────────────
+            # Intercept AliExpress product API responses
             def handle_response(response):
                 try:
                     url_r = response.url
-                    if ('mtop.aliexpress.pdp.pc.query' in url_r or
-                            'mtop.aliexpress.itemdetail' in url_r):
+                    if ('mtop.aliexpress.pdp.pc.query'    in url_r or
+                            'mtop.aliexpress.itemdetail'  in url_r):
 
-                        # Skip CAPTCHA/punish URLs
                         if '_____tmd_____' in url_r or 'punish' in url_r:
-                            print(f"[scraper]    ⛔ Skipped punish URL")
+                            print("[scraper]    ⛔ Skipped punish URL")
                             return
 
                         body = response.body()
-                        if len(body) < 1000:
+                        if len(body) < 500:
                             return
 
                         text = body.decode('utf-8', errors='replace')
 
-                        # ✅ Accept any real response
-                        if 'FAIL_SYS_TOKEN_EMPTY' in text[:100]:
-                            print(f"[scraper]    ⏭  Token empty — skipped")
+                        if 'FAIL_SYS_TOKEN_EMPTY' in text[:200]:
+                            print("[scraper]    ⏭  Token empty — skip")
                             return
 
                         captured_pdp.append(text)
-                        print(f"[scraper]    📡 PDP captured: {len(text)} bytes")
-
-                        # Save for debug
-                        with open(f"/tmp/pdp_cap_{len(captured_pdp)}.json", "w") as f:
-                            f.write(text)
+                        print(f"[scraper]    📡 API captured: {len(text)} bytes")
 
                 except Exception as e:
                     print(f"[scraper]    ⚠️  Response handler error: {e}")
 
             page.on('response', handle_response)
 
-            print(f'[scraper]    🌐 Opening: {url}')
-            page.goto(url, timeout=90000, wait_until='domcontentloaded')
+            print(f'[scraper]    🌐 Navigating to: {url}')
+            try:
+                page.goto(url, timeout=90000, wait_until='domcontentloaded')
+            except Exception as e:
+                print(f"[scraper]    ⚠️  Navigation warning: {e}")
 
-            # ── Wait for API response ────────────────────────────────────
-            print("[scraper]    ⏳ Waiting for API response...")
-            for i in range(25):
+            # Wait up to 30s for a good API response
+            print("[scraper]    ⏳ Waiting for product API response...")
+            for i in range(30):
                 page.wait_for_timeout(1000)
 
-                # Check if we got a good response
                 good = [t for t in captured_pdp
                         if 'PRODUCT_PROP_PC' in t or 'SHOP_CARD_PC' in t
                         or len(t) > 50000]
@@ -452,7 +442,7 @@ def get_product_info(url: str) -> dict | None:
                     print(f"[scraper]    ✅ Got full API response at {i+1}s")
                     break
 
-                # Trigger more API calls by scrolling
+                # Simulate user interaction to trigger lazy API calls
                 if i == 5:
                     page.mouse.wheel(0, 300)
                 if i == 10:
@@ -460,13 +450,19 @@ def get_product_info(url: str) -> dict | None:
                     page.mouse.move(400, 400)
                 if i == 15:
                     page.mouse.wheel(0, 1000)
+                if i == 20:
+                    page.mouse.wheel(0, 1500)
 
-                print(f"[scraper]    ⏳ {i+1}s | captured: {len(captured_pdp)}")
+                if (i + 1) % 5 == 0:
+                    print(f"[scraper]    ⏳ {i+1}s | captured: {len(captured_pdp)}")
 
-            print(f"[scraper]    📦 Total PDP responses: {len(captured_pdp)}")
+            print(f"[scraper]    📦 Total API responses: {len(captured_pdp)}")
 
-            # ── Get HTML for fallbacks ───────────────────────────────────
-            html = page.content()
+            # Get HTML for fallbacks
+            try:
+                html = page.content()
+            except Exception:
+                pass
 
             page.close()
             context.close()
@@ -477,21 +473,19 @@ def get_product_info(url: str) -> dict | None:
         traceback.print_exc()
         return None
 
-    # ── Parse captured API responses ──────────────────────────────────────
+    # Parse captured API responses — largest first
     extracted = {}
-
-    # Sort by size — biggest response has most data
     captured_pdp.sort(key=len, reverse=True)
 
     for resp_text in captured_pdp:
         parsed = parse_pdp_response(resp_text)
         if parsed:
-            print(f'[scraper]    ✅ Parsed {len(parsed)} fields')
+            print(f'[scraper]    ✅ Parsed {len(parsed)} fields from API response')
             for k, v in parsed.items():
                 if k not in extracted or not extracted[k]:
                     extracted[k] = v
 
-    # ── HTML fallbacks ────────────────────────────────────────────────────
+    # HTML fallbacks
     if not extracted.get('title'):
         extracted['title'] = get_title_from_html(html)
         if extracted.get('title'):
@@ -500,12 +494,12 @@ def get_product_info(url: str) -> dict | None:
     if not extracted.get('image_1'):
         extracted.update(get_images_from_html(html))
 
-    # ── Validate ──────────────────────────────────────────────────────────
+    # Validate
     if not extracted.get('title'):
         print('[scraper] ❌ No title — aborting')
         return None
 
-    # ── Summary ───────────────────────────────────────────────────────────
+    # Summary
     core          = ['brand', 'color', 'dimensions', 'weight', 'material',
                      'certifications', 'country_of_origin', 'warranty', 'product_type']
     seller_fields = ['store_name', 'store_id', 'seller_positive_rate',
@@ -517,9 +511,9 @@ def get_product_info(url: str) -> dict | None:
     print(f'[scraper]    Desc   : {len(extracted.get("description", ""))} chars')
     print(f'[scraper]    Specs  : {[k for k in core if extracted.get(k)]}')
     print(f'[scraper]    Seller : {[k for k in seller_fields if extracted.get(k)]}')
-    print(f'[scraper]    Images : {sum(1 for i in range(1,21) if extracted.get(f"image_{i}"))}')
+    print(f'[scraper]    Images : {sum(1 for i in range(1, 21) if extracted.get(f"image_{i}"))}')
 
-    # ── Apply defaults ────────────────────────────────────────────────────
+    # Apply defaults
     defaults = {
         'description': '', 'brand': '', 'color': '', 'dimensions': '',
         'weight': '', 'material': '', 'certifications': '',
@@ -552,10 +546,10 @@ if __name__ == '__main__':
     test_url = 'https://www.aliexpress.com/item/1005009130457901.html'
     result   = get_product_info(test_url)
     if result:
-        print('\n' + '='*60)
+        print('\n' + '=' * 60)
         for k, v in result.items():
             if v and not k.startswith('image_'):
                 print(f'  {k:25s}: {str(v)[:100]}')
-        print(f'  {"images":25s}: {sum(1 for i in range(1,21) if result.get(f"image_{i}"))}')
+        print(f'  {"images":25s}: {sum(1 for i in range(1, 21) if result.get(f"image_{i}"))}')
     else:
         print('FAILED')
