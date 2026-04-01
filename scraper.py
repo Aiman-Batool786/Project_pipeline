@@ -386,7 +386,7 @@ def _scrape_in_thread(url: str) -> dict:
     try:
         with Camoufox(
             headless=True,
-            geoip=True,
+            geoip=False,
             os='windows',
         ) as browser:
 
