@@ -447,17 +447,17 @@ def _scrape_in_thread(url: str) -> dict:
                     break
 
                 if i == 2:
-                print("[scraper]    ⏳ Triggering page activity...")
+    print("[scraper]    ⏳ Triggering page activity...")
 
-                page.mouse.click(500, 500)
-                page.wait_for_timeout(1000)
+    page.mouse.click(500, 500)
+    page.wait_for_timeout(1000)
 
-                for _ in range(5):
-                 page.mouse.wheel(0, 800)
-                 page.wait_for_timeout(800)
+    for _ in range(5):
+        page.mouse.wheel(0, 800)
+        page.wait_for_timeout(800)
 
-               page.mouse.move(300, 300)
-               page.wait_for_timeout(1000)
+    page.mouse.move(300, 300)
+    page.wait_for_timeout(1000)
 
                 if (i + 1) % 5 == 0:
                     print(f"[scraper]    ⏳ {i+1}s | captured: {len(captured_pdp)}")
