@@ -1,8 +1,8 @@
 """
-FastAPI Server - HYBRID APPROACH v2.4
+FastAPI Server - HYBRID APPROACH v2.5
 ─────────────────────────────────────
 Pipeline steps:
-  1. Scrape  → product data + seller info (via ScraperAPI, original never LLM-enhanced)
+  1. Scrape  → product data + seller info (via Camoufox Firefox browser)
   2. Store   → scraped_products + seller_info tables
   3. Enhance → OpenAI enhances product content only (NOT seller info)
   4. Categorize
@@ -11,11 +11,6 @@ Pipeline steps:
 
 Seller info rule: stored as original, shown in API response,
                   written to template as-is, never sent to LLM.
-
-Changes from v2.3:
-  - Removed 'merged' and 'template_specs' from API response
-  - Fixed template file not being generated (path + error surfacing)
-  - scraper now uses ScraperAPI to bypass GCP IP block
 """
 
 from fastapi import FastAPI, HTTPException
@@ -35,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Octopia Template Pipeline - HYBRID Approach",
-    version="2.4.0"
+    version="2.5.0"
 )
 
 DB_NAME   = "products.db"
@@ -78,9 +73,9 @@ def root():
     return {
         "status":  "running",
         "service": "Octopia Template Pipeline",
-        "version": "2.4.0",
+        "version": "2.5.0",
         "features": [
-            "ScraperAPI-based scraping (bypasses GCP IP block)",
+            "Camoufox Firefox browser (API interception)",
             "Seller info from SHOP_CARD_PC (original, not LLM-enhanced)",
             "Content enhancement via OpenAI (product only)",
             "Octopia categorization",
@@ -131,7 +126,6 @@ def process_product_complete(url: str) -> Dict[str, Any]:
 
         create_all_tables()
 
-        # Look for template in current directory and common locations
         TEMPLATE_PATH        = None
         FILLED_TEMPLATES_DIR = "./filled_templates"
         os.makedirs(FILLED_TEMPLATES_DIR, exist_ok=True)
@@ -150,7 +144,7 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             logger.warning("⚠️  Template file not found — Excel will be skipped")
 
         # ── STEP 1: SCRAPE ──────────────────────────────────────────────────
-        logger.info("📥 Scraping...")
+        logger.info("📥 Scraping with Camoufox...")
         scraped_data = get_product_info(url)
 
         if not scraped_data:
@@ -236,7 +230,6 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             enh_val = specs_enhanced.get(field, '')
             enriched_data_for_template[field] = enh_val if (enh_val and enh_val.strip()) else ""
 
-        # Seller fields pass through as original
         for field in SELLER_FIELDS:
             enriched_data_for_template[field] = scraped_data.get(field, '')
 
@@ -299,12 +292,12 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                     log_processing(product_id, url, "template_fill", "success")
                     logger.info(f"✅ Template: {os.path.basename(template_file)}")
                 else:
-                    logger.warning(f"⚠️  Template filler returned no file path")
+                    logger.warning("⚠️  Template filler returned no file path")
             except Exception as e:
                 logger.error(f"❌ Template generation failed: {e}", exc_info=True)
                 log_processing(product_id, url, "template_fill", "error", str(e))
         else:
-            logger.warning("⚠️  Skipping template — .xlsm file not found in project directory")
+            logger.warning("⚠️  Skipping template — .xlsm file not found")
 
         logger.info("✅ Processing complete\n")
 
@@ -321,15 +314,14 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                 "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}"))
             },
 
-            # Seller info — original, never LLM-enhanced
             "seller": {f: scraped_data.get(f, "") for f in SELLER_FIELDS},
 
             "enhanced": {
-                "title":                 enhanced.get("title", ""),
-                "description":           (enhanced.get("description", "")[:200] + "..."
-                                          if enhanced.get("description") else ""),
-                "bullet_points":         enhanced.get("bullet_points", [])[:3],
-                "has_html_description":  bool(enhanced.get("html_description", "")),
+                "title":                   enhanced.get("title", ""),
+                "description":             (enhanced.get("description", "")[:200] + "..."
+                                            if enhanced.get("description") else ""),
+                "bullet_points":           enhanced.get("bullet_points", [])[:3],
+                "has_html_description":    bool(enhanced.get("html_description", "")),
                 "specifications_enhanced": specs_enhanced
             },
 
@@ -349,8 +341,8 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             "extracted": {
                 "specifications": sum(1 for k in SPEC_FIELDS
                                       if enriched_data_for_template.get(k)),
-                "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}")),
-                "seller_fields": len([k for k in SELLER_FIELDS if scraped_data.get(k)])
+                "images":         sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}")),
+                "seller_fields":  len([k for k in SELLER_FIELDS if scraped_data.get(k)])
             },
 
             "audit": {
@@ -389,7 +381,7 @@ def generate_products(req: BulkProductRequest):
     if len(req.urls) > 20:
         raise HTTPException(status_code=400, detail="Maximum 20 URLs per request")
 
-    results = []
+    results    = []
     successful = failed = 0
     for url in req.urls:
         result = process_product_complete(url)
@@ -575,5 +567,5 @@ def get_stats():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v2.4 — ScraperAPI edition")
+    logger.info("🚀 Octopia Template Pipeline v2.5 — Camoufox edition")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
