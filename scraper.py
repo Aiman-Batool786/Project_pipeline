@@ -9,7 +9,7 @@ import re
 import json
 import time
 import urllib.request
-from camoufox.sync_api import Firefox
+from camoufox.sync_api import Camoufox
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -378,7 +378,7 @@ def get_product_info(url: str) -> dict | None:
     html         = ''
 
     try:
-        with Firefox(
+        with Camoufox(
             headless=True,
             geoip=True,
             os='windows',
