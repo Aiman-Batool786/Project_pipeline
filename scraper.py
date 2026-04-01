@@ -446,15 +446,18 @@ def _scrape_in_thread(url: str) -> dict:
                     print(f"[scraper]    ✅ Got full API response at {i+1}s")
                     break
 
-                if i == 5:
-                    page.mouse.wheel(0, 300)
-                if i == 10:
-                    page.mouse.wheel(0, 600)
-                    page.mouse.move(400, 400)
-                if i == 15:
-                    page.mouse.wheel(0, 1000)
-                if i == 20:
-                    page.mouse.wheel(0, 1500)
+                if i == 2:
+                print("[scraper]    ⏳ Triggering page activity...")
+
+                page.mouse.click(500, 500)
+                page.wait_for_timeout(1000)
+
+                for _ in range(5):
+                 page.mouse.wheel(0, 800)
+                 page.wait_for_timeout(800)
+
+               page.mouse.move(300, 300)
+               page.wait_for_timeout(1000)
 
                 if (i + 1) % 5 == 0:
                     print(f"[scraper]    ⏳ {i+1}s | captured: {len(captured_pdp)}")
