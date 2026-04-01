@@ -412,7 +412,7 @@ def _scrape_in_thread(url: str) -> dict:
                             return
 
                         body = response.body()
-                        if len(body) < 500:
+                        if len(body) < 20000:
                             return
 
                         text = body.decode('utf-8', errors='replace')
