@@ -138,7 +138,6 @@ def fetch_description(url):
 # BROWSER INTERCEPTOR
 # ─────────────────────────────────────────────────────────────────────────────
 def _scrape_in_thread(url: str) -> dict:
-    """Runs Camoufox in a separate thread to avoid asyncio conflict."""
     captured = []
     html     = ""
     seller   = {}
@@ -160,145 +159,175 @@ def _scrape_in_thread(url: str) -> dict:
                         if len(body) < 15000:
                             return
                         text = body.decode('utf-8', errors='replace')
-                        if any(x in text for x in ['titleModule', 'storeModule', 'skuModule',
+                        if any(x in text for x in ['titleModule', 'storeModule',
                                                     'PRODUCT_PROP_PC', 'SHOP_CARD_PC']):
                             captured.append(text)
-                            print(f"[scraper] 📡 Captured rich PDP ({len(text)} bytes)")
+                            print(f"[scraper] 📡 Captured PDP ({len(text)} bytes)")
                 except Exception:
                     pass
 
             page.on('response', handle_response)
             page.goto(url, timeout=90000, wait_until='domcontentloaded')
 
-            # Scroll to trigger lazy loading
-            for _ in range(6):
-                page.wait_for_timeout(800)
+            # ── Wait for page to fully render ──────────────────────────────
+            page.wait_for_timeout(5000)
+            for _ in range(4):
                 page.mouse.wheel(0, 600)
+                page.wait_for_timeout(800)
             page.wait_for_timeout(2000)
 
-            # ✅ Extract seller info from DOM
-            print("[scraper]    🏪 Extracting seller info from DOM...")
-            try:
-                # ── Click the store/trader link to open popup ──
-                store_selectors = [
-                    'a[href*="/store/"]',
-                    'span:has-text("Trader")',
-                    '.store-detail--storeName',
-                    '[class*="store-header"]',
-                    '[class*="storeName"]',
-                    'a[class*="store"]',
-                ]
-                clicked = False
-                for sel in store_selectors:
-                    try:
-                        el = page.locator(sel).first
-                        if el.count() > 0:
-                            el.click(timeout=3000)
-                            page.wait_for_timeout(2000)
-                            clicked = True
-                            print(f"[scraper]    ✅ Clicked store link: {sel}")
-                            break
-                    except Exception:
-                        continue
+            # ── Step 1: Try to get seller from page BEFORE clicking ─────────
+            print("[scraper]    🏪 Trying seller info from page...")
 
-                # ── Extract from popup or page ──
-                # Store name
-                for sel in [
-                    '.store-detail--storeInfo--BMDFsTB td:nth-child(2)',
-                    '[class*="storeInfo"] td:nth-child(2)',
-                    '[class*="store-name"]',
-                    '[class*="storeName"]',
-                ]:
+            # Try extracting store name directly from visible page (no click needed)
+            try:
+                # These are visible on the product page without clicking
+                store_name_selectors = [
+                    '[class*="store-header--storeName"]',
+                    '[class*="shop-name"]',
+                    'a[href*="/store/"] span',
+                    '[class*="sellerName"]',
+                    '[class*="seller-name"]',
+                    '.store-name',
+                ]
+                for sel in store_name_selectors:
                     try:
                         el = page.locator(sel).first
                         if el.count() > 0:
                             text = el.inner_text().strip()
                             if text and len(text) > 1:
                                 seller['store_name'] = text
-                                print(f"[scraper]    ✅ Store name: {text}")
+                                print(f"[scraper]    ✅ Store name from page: {text}")
                                 break
                     except Exception:
                         continue
+            except Exception as e:
+                print(f"[scraper]    ⚠️ Store name error: {e}")
 
-                # ── Extract all table rows from store popup ──
-                try:
-                    rows = page.locator('.store-detail--storeInfo--BMDFsTB table tr').all()
+            # ── Step 2: Get store URL and ID from page links ────────────────
+            try:
+                import re as re_mod
+                links = page.locator('a[href*="/store/"]').all()
+                for link in links[:5]:
+                    href = link.get_attribute('href') or ''
+                    if '/store/' in href:
+                        if href.startswith('//'):
+                            href = 'https:' + href
+                        m = re_mod.search(r'/store/(\d+)', href)
+                        if m:
+                            seller['store_id']  = m.group(1)
+                            seller['store_url'] = f"https://www.aliexpress.com/store/{m.group(1)}"
+                            print(f"[scraper]    ✅ Store ID: {m.group(1)}")
+                            break
+            except Exception as e:
+                print(f"[scraper]    ⚠️ Store URL error: {e}")
+
+            # ── Step 3: Click store info to open popup ──────────────────────
+            print("[scraper]    🖱️  Clicking store info...")
+            try:
+                # Wait for store section to be visible first
+                page.wait_for_selector(
+                    'a[href*="/store/"], [class*="store"], [class*="seller"]',
+                    timeout=10000
+                )
+
+                # Try multiple click targets
+                click_selectors = [
+                    'span:text("Trader")',
+                    'span:text("trader")',
+                    '[class*="trader"]',
+                    'a[href*="/store/"]',
+                    '[class*="store-header"]',
+                    '[class*="sellerInfo"]',
+                    '[class*="seller-info"]',
+                ]
+                for sel in click_selectors:
+                    try:
+                        el = page.locator(sel).first
+                        if el.count() > 0:
+                            el.click(timeout=3000)
+                            page.wait_for_timeout(3000)
+                            print(f"[scraper]    ✅ Clicked: {sel}")
+                            break
+                    except Exception:
+                        continue
+
+            except Exception as e:
+                print(f"[scraper]    ⚠️ Click error: {e}")
+
+            # ── Step 4: Extract from popup after click ──────────────────────
+            try:
+                # Check if popup appeared
+                popup_selectors = [
+                    '.store-detail--storeInfo--BMDFsTB',
+                    '[class*="storeInfo"]',
+                    '[class*="store-detail"]',
+                ]
+                popup_found = False
+                for sel in popup_selectors:
+                    if page.locator(sel).count() > 0:
+                        popup_found = True
+                        print(f"[scraper]    ✅ Popup found: {sel}")
+                        break
+
+                if popup_found:
+                    # Extract store info table
+                    rows = page.locator(
+                        '.store-detail--storeInfo--BMDFsTB table tr, '
+                        '[class*="storeInfo"] table tr'
+                    ).all()
                     for row in rows:
-                        cells = row.locator('td').all()
-                        if len(cells) >= 2:
-                            key   = cells[0].inner_text().strip().lower().rstrip(':')
-                            value = cells[1].inner_text().strip()
-                            if 'name' in key:
-                                seller['store_name'] = value
-                            elif 'store no' in key or 'no.' in key:
-                                seller['store_id'] = value
-                                seller['store_url'] = f"https://www.aliexpress.com/store/{value}"
-                            elif 'location' in key or 'country' in key:
-                                seller['seller_country'] = value
-                            elif 'open' in key or 'since' in key:
-                                seller['store_open_date'] = value
-                    if seller:
-                        print(f"[scraper]    ✅ Store table extracted: {seller}")
-                except Exception as e:
-                    print(f"[scraper]    ⚠️  Store table error: {e}")
-
-                # ── Extract seller ratings ──
-                try:
-                    rating_rows = page.locator('.store-detail--storeRating--Z2j7q9u table tr').all()
-                    for row in rating_rows:
-                        cells = row.locator('td').all()
-                        if len(cells) >= 2:
-                            key   = cells[0].inner_text().strip().lower()
-                            value = cells[1].locator('b').first.inner_text().strip()
-                            if 'item' in key or 'described' in key:
-                                seller['seller_rating'] = value
-                            elif 'communication' in key:
-                                seller['seller_communication'] = value
-                            elif 'shipping' in key:
-                                seller['seller_shipping_speed'] = value
-                    if seller.get('seller_rating'):
-                        print(f"[scraper]    ✅ Ratings extracted: {seller.get('seller_rating')}")
-                except Exception as e:
-                    print(f"[scraper]    ⚠️  Ratings error: {e}")
-
-                # ── Fallback: extract store name from page header ──
-                if not seller.get('store_name'):
-                    for sel in [
-                        '[class*="store-header--storeName"]',
-                        '[class*="shop-name"]',
-                        'a[href*="/store/"] span',
-                        '[data-pl="store-name"]',
-                    ]:
                         try:
-                            el = page.locator(sel).first
-                            if el.count() > 0:
-                                text = el.inner_text().strip()
-                                if text and len(text) > 1:
-                                    seller['store_name'] = text
-                                    break
+                            cells = row.locator('td').all()
+                            if len(cells) >= 2:
+                                key   = cells[0].inner_text().strip().lower().rstrip(':')
+                                value = cells[1].inner_text().strip()
+                                print(f"[scraper]       Row: {key} = {value}")
+                                if 'name' in key:
+                                    seller['store_name'] = value
+                                elif 'store no' in key or 'no.' in key:
+                                    seller['store_id']  = value
+                                    seller['store_url'] = f"https://www.aliexpress.com/store/{value}"
+                                elif 'location' in key or 'country' in key:
+                                    seller['seller_country'] = value.strip()
+                                elif 'open' in key or 'since' in key:
+                                    seller['store_open_date'] = value
                         except Exception:
                             continue
 
-                # ── Extract store URL from page ──
-                if not seller.get('store_url'):
-                    try:
-                        store_link = page.locator('a[href*="/store/"]').first
-                        if store_link.count() > 0:
-                            href = store_link.get_attribute('href') or ''
-                            if '/store/' in href:
-                                if href.startswith('//'):
-                                    href = 'https:' + href
-                                seller['store_url'] = href
-                                # Extract store ID from URL
-                                import re as re_mod
-                                m = re_mod.search(r'/store/(\d+)', href)
-                                if m and not seller.get('store_id'):
-                                    seller['store_id'] = m.group(1)
-                    except Exception:
-                        pass
+                    # Extract ratings
+                    rating_rows = page.locator(
+                        '.store-detail--storeRating--Z2j7q9u table tr, '
+                        '[class*="storeRating"] table tr'
+                    ).all()
+                    for row in rating_rows:
+                        try:
+                            cells = row.locator('td').all()
+                            if len(cells) >= 2:
+                                key = cells[0].inner_text().strip().lower()
+                                # Rating value is inside <b> tag
+                                b_el = cells[1].locator('b').first
+                                value = b_el.inner_text().strip() if b_el.count() > 0 else cells[1].inner_text().strip()
+                                print(f"[scraper]       Rating: {key} = {value}")
+                                if 'item' in key or 'described' in key:
+                                    seller['seller_rating'] = value
+                                elif 'communication' in key:
+                                    seller['seller_communication'] = value
+                                elif 'shipping' in key:
+                                    seller['seller_shipping_speed'] = value
+                        except Exception:
+                            continue
+                else:
+                    print("[scraper]    ⚠️ Popup not found — saving page HTML for debug")
+                    # Save HTML to debug what's actually on the page
+                    with open('/tmp/seller_debug.html', 'w') as f:
+                        f.write(page.content())
+                    print("[scraper]    💾 Saved to /tmp/seller_debug.html")
 
             except Exception as e:
-                print(f"[scraper]    ⚠️  Seller DOM extraction error: {e}")
+                print(f"[scraper]    ⚠️ Popup extraction error: {e}")
+
+            print(f"[scraper]    📊 Seller extracted: {seller}")
 
             html = page.content()
             page.close()
@@ -310,6 +339,14 @@ def _scrape_in_thread(url: str) -> dict:
         traceback.print_exc()
 
     return {'captured': captured, 'html': html, 'seller': seller}
+```
+
+After updating, run a test and check your VM logs. Look for these lines:
+```
+[scraper]    🖱️  Clicking store info...
+[scraper]    ✅ Clicked: <selector>
+[scraper]    ✅ Popup found: <selector>
+[scraper]       Row: name = Comwingo Store
 
 def get_product_info(url: str) -> dict | None:
     print(f"[scraper] Starting: {url}")
