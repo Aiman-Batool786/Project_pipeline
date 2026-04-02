@@ -73,8 +73,29 @@ def load_categories():
         return [], [], np.array([])
 
 
-# Load once at startup
-category_ids, category_names, category_embeddings = load_categories()
+# ── FIX: Lazy load ────────────────────────────────────────────────────────────
+# Previously this ran at import time.  If the DB didn't exist yet (first
+# startup) it silently loaded 0 categories and EVERY product got
+# "Uncategorized" forever — even after the DB was populated later.
+# Now we load on first use inside assign_category() instead.
+# ─────────────────────────────────────────────────────────────────────────────
+category_ids        = []
+category_names      = []
+category_embeddings = np.array([])
+_categories_loaded  = False
+
+
+def _ensure_categories_loaded():
+    """Load categories from DB on first call; no-op on subsequent calls."""
+    global category_ids, category_names, category_embeddings, _categories_loaded
+    if _categories_loaded:
+        return
+    print("[category] Lazy-loading categories from DB...")
+    category_ids, category_names, category_embeddings = load_categories()
+    _categories_loaded = True
+    if len(category_ids) == 0:
+        print("[category] ⚠️  No categories loaded — "
+              "run create_categories_db.py first")
 
 
 def get_embedding(text):
@@ -94,6 +115,9 @@ def assign_category(title, description):
     """
     Assign category and extract LEAF category from full path
     """
+    # FIX: ensure DB categories are loaded before we try to use them
+    _ensure_categories_loaded()
+
     title = (title or "").strip()
     description = (description or "").strip()
     product_text = (title + " " + description).strip()
