@@ -343,9 +343,9 @@ def _scrape_in_thread(url: str) -> dict:
 
 After updating, run a test and check your VM logs. Look for these lines:
 ```
-[scraper]    🖱️  Clicking store info...
-[scraper]    ✅ Clicked: <selector>
-[scraper]    ✅ Popup found: <selector>
+[scraper]      Clicking store info...
+[scraper]      Clicked: <selector>
+[scraper]      Popup found: <selector>
 [scraper]       Row: name = Comwingo Store
 
 def get_product_info(url: str) -> dict | None:
