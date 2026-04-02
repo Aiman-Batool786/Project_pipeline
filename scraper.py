@@ -1,27 +1,85 @@
+"""
+scraper.py
+──────────
+Camoufox-based AliExpress product scraper.
+
+Changes vs previous version:
+  - FIX 1: Corrupted markdown text removed (caused SyntaxError on import)
+  - FIX 2: SPEC_MAPPING now includes 'certifications' and 'product_type'
+  - FIX 3: bullet_points extraction added (3 API path attempts)
+  - FIX 4: All 14 seller fields extracted from SHOP_CARD_PC / storeModule
+  - FIX 5: Region rotation, user-agent rotation, retry mechanism added
+"""
+
 import re
 import json
+import random
+import time
 import urllib.request
 import concurrent.futures
 from camoufox.sync_api import Camoufox
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# UPDATED SPEC MAPPING (2026)
+# FIX 2 — COMPLETE SPEC MAPPING
+# Added: 'certifications', 'product_type'  (were missing, always blank before)
 # ─────────────────────────────────────────────────────────────────────────────
 SPEC_MAPPING = {
-    'brand': ['brand', 'brand name', 'marque'],
-    'color': ['color', 'colour', 'main color'],
-    'dimensions': ['dimensions', 'size', 'product size', 'package size'],
-    'weight': ['weight', 'net weight', 'gross weight'],
-    'material': ['material', 'materials', 'composition'],
-    'country_of_origin': ['origin', 'country of origin', 'made in'],
-    'warranty': ['warranty', 'garantie'],
-    # Add more as needed
+    'brand':             ['brand', 'brand name', 'marque', 'manufacturer'],
+    'color':             ['color', 'colour', 'main color', 'couleur'],
+    'dimensions':        ['dimensions', 'size', 'product size', 'package size',
+                          'item size', 'product dimensions'],
+    'weight':            ['weight', 'net weight', 'gross weight', 'poids'],
+    'material':          ['material', 'materials', 'composition', 'matiere',
+                          'fabric type'],
+    'country_of_origin': ['origin', 'country of origin', 'made in',
+                          'country/region of manufacture'],
+    'warranty':          ['warranty', 'garantie', 'warranty period',
+                          'warranty type', 'warranty information'],
+    'certifications':    ['certification', 'certifications', 'certificate',
+                          'compliance', 'standard', 'normes', 'ce', 'rohs'],   # NEW
+    'product_type':      ['product type', 'type', 'item type',
+                          'type de produit', 'style', 'category'],             # NEW
 }
 
-def map_props_to_fields(props):
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 5 — REGION ROTATION + USER-AGENT ROTATION
+# ─────────────────────────────────────────────────────────────────────────────
+REGIONS = ["US", "GB", "DE", "FR", "AE", "AU", "CA"]
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_3) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/16.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+]
+
+MAX_RETRIES = 3
+
+
+def _get_rotated_url(url: str) -> str:
+    """Append a random shipFromCountry param to reduce region-based blocks."""
+    region    = random.choice(REGIONS)
+    separator = '&' if '?' in url else '?'
+    print(f"[scraper] 🌍 Region rotated → {region}")
+    return f"{url}{separator}shipFromCountry={region}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPEC HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def map_props_to_fields(props: list) -> tuple:
     raw = {}
     for item in props:
-        name = str(item.get('attrName') or item.get('name') or '').strip().lower()
+        name  = str(item.get('attrName') or item.get('name')  or '').strip().lower()
         value = str(item.get('attrValue') or item.get('value') or '').strip()
         if name and value and value.lower() != 'none':
             raw[name] = value
@@ -35,6 +93,101 @@ def map_props_to_fields(props):
     return mapped, raw
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 4 — FULL SELLER EXTRACTION  (all 14 SELLER_FIELDS from main.py)
+# Old code only grabbed 4 fields; this grabs all 14.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_seller_block(store: dict) -> dict:
+    """
+    Extract every seller field from storeModule or SHOP_CARD_PC.
+    Covers all 14 keys expected by main.py SELLER_FIELDS.
+    """
+    sid = str(store.get('storeNum') or store.get('sellerId') or
+              store.get('storeId') or '')
+
+    seller = {
+        'store_name':            (store.get('storeName')
+                                  or store.get('sellerName')
+                                  or store.get('name') or ''),
+        'store_id':              sid,
+        'seller_id':             str(store.get('sellerId')
+                                  or store.get('userId') or ''),
+        'store_url':             (store.get('storeUrl')
+                                  or (f"https://www.aliexpress.com/store/{sid}"
+                                      if sid else '')),
+        'seller_country':        (store.get('country')
+                                  or store.get('countryCompleteName') or ''),
+        'seller_rating':         str(store.get('positiveRate')
+                                  or store.get('itemAs') or ''),
+        'seller_positive_rate':  str(store.get('positiveRate') or ''),
+        'seller_communication':  str(store.get('communicationRating')
+                                  or store.get('serviceAs') or ''),
+        'seller_shipping_speed': str(store.get('shippingRating')
+                                  or store.get('shippingAs') or ''),
+        'store_open_date':       str(store.get('openTime')
+                                  or store.get('openDate') or ''),
+        'seller_level':          str(store.get('sellerLevel')
+                                  or store.get('shopLevel') or ''),
+        'seller_total_reviews':  str(store.get('totalEvaluationNum')
+                                  or store.get('reviewNum') or ''),
+        'seller_positive_num':   str(store.get('positiveNum') or ''),
+        'is_top_rated':          str(store.get('isTopRatedSeller')
+                                  or store.get('topRatedSeller') or ''),
+    }
+    # Return only non-empty values
+    return {k: v for k, v in seller.items() if v and str(v).strip()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 3 — BULLET POINTS EXTRACTION  (was completely missing before)
+# Tries 3 different API paths used by AliExpress.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_bullet_points(result: dict) -> list:
+    bullets = []
+
+    # Path 1: highlightModule
+    try:
+        highlights = (result.get('highlights') or
+                      result.get('highlightModule', {}).get('highlightList') or
+                      result.get('tradeModule', {}).get('highlights') or [])
+        if isinstance(highlights, list) and highlights:
+            bullets = [str(h.get('title') or h.get('text') or h)
+                       for h in highlights if h]
+    except Exception:
+        pass
+
+    # Path 2: descriptionModule features
+    if not bullets:
+        try:
+            features = (result.get('descriptionModule', {}).get('features') or
+                        result.get('PRODUCT_PROP_PC', {}).get('features') or [])
+            if isinstance(features, list) and features:
+                bullets = [str(f) for f in features if f]
+        except Exception:
+            pass
+
+    # Path 3: sellingPoints / keyPoints
+    if not bullets:
+        try:
+            points = (result.get('sellingPoints') or
+                      result.get('keyPoints') or
+                      result.get('productFeatures') or [])
+            if isinstance(points, list) and points:
+                bullets = [str(p.get('text') or p.get('point') or p)
+                           for p in points if p]
+        except Exception:
+            pass
+
+    cleaned = [b.strip() for b in bullets if b.strip()]
+    return cleaned[:10]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API RESPONSE PARSER
+# ─────────────────────────────────────────────────────────────────────────────
+
 def parse_pdp_response(text: str):
     try:
         # Remove JSONP wrapper if present
@@ -42,65 +195,73 @@ def parse_pdp_response(text: str):
         if m:
             text = m.group(1)
 
-        data = json.loads(text)
-        result = data.get('data', {}).get('result', {}) or data.get('data', {}) or {}
-
+        data   = json.loads(text)
+        result = (data.get('data', {}).get('result', {})
+                  or data.get('data', {}) or {})
         if not result:
             return None
 
         extracted = {}
 
-        # === TITLE ===
+        # ── TITLE ──────────────────────────────────────────────────────────
         try:
             extracted['title'] = result['titleModule']['subject']
-        except:
+        except Exception:
             try:
                 extracted['title'] = result['GLOBAL_DATA']['globalData']['subject']
-            except:
+            except Exception:
                 pass
 
-        # === PRICE ===
+        # ── PRICE ──────────────────────────────────────────────────────────
         try:
-            price_mod = result.get('priceModule') or {}
-            extracted['price'] = price_mod.get('formatedActivityPrice') or price_mod.get('formatedPrice')
-        except:
+            pm = result.get('priceModule') or {}
+            extracted['price'] = (pm.get('formatedActivityPrice')
+                                  or pm.get('formatedPrice'))
+        except Exception:
             pass
 
-        # === SELLER INFO (Updated 2026) ===
-        seller = {}
+        # ── SELLER — FIX 4 ─────────────────────────────────────────────────
         try:
-            store = result.get('storeModule') or result.get('SHOP_CARD_PC', {})
-            seller['store_name'] = store.get('storeName') or store.get('sellerName')
-            seller['store_id'] = store.get('storeNum') or store.get('sellerId')
-            seller['seller_country'] = store.get('country')
-            seller['seller_rating'] = store.get('positiveRate')
-        except:
-            pass
+            store = (result.get('storeModule')
+                     or result.get('SHOP_CARD_PC')
+                     or result.get('sellerModule') or {})
+            if store:
+                seller_data = _parse_seller_block(store)
+                extracted.update(seller_data)
+                print(f"[scraper] 🏪 Seller from API: {list(seller_data.keys())}")
+        except Exception as e:
+            print(f"[scraper] ⚠️  Seller parse error: {e}")
 
-        extracted.update({k: v for k, v in seller.items() if v})
-
-        # === SPECIFICATIONS (New paths) ===
+        # ── SPECIFICATIONS — FIX 2 ─────────────────────────────────────────
         props = []
         try:
-            # Common 2026 paths
-            props = (result.get('skuModule', {}).get('productSKUPropertyList', []) or
-                    result.get('productProp', {}).get('props', []) or
-                    result.get('PRODUCT_PROP_PC', {}).get('showedProps', []))
-        except:
+            props = (
+                result.get('skuModule', {}).get('productSKUPropertyList', []) or
+                result.get('productProp', {}).get('props', []) or
+                result.get('PRODUCT_PROP_PC', {}).get('showedProps', []) or
+                result.get('specsModule', {}).get('props', [])
+            )
+        except Exception:
             pass
 
         if props:
             mapped, _ = map_props_to_fields(props)
             extracted.update(mapped)
-            print(f"[scraper] ✅ Found {len(props)} specification items")
+            print(f"[scraper] ✅ {len(props)} spec items → "
+                  f"mapped fields: {list(mapped.keys())}")
 
-        # === IMAGES ===
+        # ── BULLET POINTS — FIX 3 ──────────────────────────────────────────
+        bullets = _extract_bullet_points(result)
+        if bullets:
+            extracted['bullet_points'] = bullets
+            print(f"[scraper] ✅ Bullet points: {len(bullets)} items")
+
+        # ── IMAGES ─────────────────────────────────────────────────────────
         images = []
         try:
-            images = result.get('imageModule', {}).get('imagePathList', [])
-            if not images:
-                images = result.get('titleModule', {}).get('images', [])
-        except:
+            images = (result.get('imageModule', {}).get('imagePathList', []) or
+                      result.get('titleModule', {}).get('images', []))
+        except Exception:
             pass
 
         for idx, img in enumerate(images[:20], 1):
@@ -108,12 +269,12 @@ def parse_pdp_response(text: str):
                 img = 'https:' + img if str(img).startswith('//') else img
                 extracted[f'image_{idx}'] = re.sub(r'_\d+x\d+', '', img)
 
-        # === DESCRIPTION ===
+        # ── DESCRIPTION ────────────────────────────────────────────────────
         try:
-            desc_url = result.get('descriptionModule', {}).get('descriptionUrl') or ""
+            desc_url = result.get('descriptionModule', {}).get('descriptionUrl', '')
             if desc_url:
                 extracted['description'] = fetch_description(desc_url)
-        except:
+        except Exception:
             pass
 
         return extracted if extracted.get('title') else None
@@ -123,30 +284,37 @@ def parse_pdp_response(text: str):
         return None
 
 
-def fetch_description(url):
+def fetch_description(url: str) -> str:
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        ua  = random.choice(USER_AGENTS)
+        req = urllib.request.Request(url, headers={'User-Agent': ua})
         with urllib.request.urlopen(req, timeout=10) as r:
-            raw = r.read().decode('utf-8', errors='replace')
+            raw   = r.read().decode('utf-8', errors='replace')
             clean = re.sub(r'<[^>]+>', ' ', raw)
             return ' '.join(clean.split())[:3000]
-    except:
-        return ""
+    except Exception:
+        return ''
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BROWSER INTERCEPTOR
+# BROWSER INTERCEPTOR  — FIX 5: user-agent rotation added
 # ─────────────────────────────────────────────────────────────────────────────
+
 def _scrape_in_thread(url: str) -> dict:
     captured = []
-    html     = ""
+    html     = ''
     seller   = {}
+
+    # FIX 5 — rotate user-agent per browser session
+    ua = random.choice(USER_AGENTS)
+    print(f"[scraper] 🕵️  UA: {ua[:65]}...")
 
     try:
         with Camoufox(headless=True, os='windows') as browser:
             context = browser.new_context(
                 viewport={'width': 1366, 'height': 900},
                 locale='en-US',
+                user_agent=ua,
                 extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'}
             )
             page = context.new_page()
@@ -169,19 +337,16 @@ def _scrape_in_thread(url: str) -> dict:
             page.on('response', handle_response)
             page.goto(url, timeout=90000, wait_until='domcontentloaded')
 
-            # ── Wait for page to fully render ──────────────────────────────
-            page.wait_for_timeout(5000)
+            # Human-like random delays (FIX 5)
+            page.wait_for_timeout(random.randint(4000, 7000))
             for _ in range(4):
-                page.mouse.wheel(0, 600)
-                page.wait_for_timeout(800)
+                page.mouse.wheel(0, random.randint(400, 800))
+                page.wait_for_timeout(random.randint(600, 1200))
             page.wait_for_timeout(2000)
 
-            # ── Step 1: Try to get seller from page BEFORE clicking ─────────
+            # ── Step 1: Store name from visible page ────────────────────────
             print("[scraper]    🏪 Trying seller info from page...")
-
-            # Try extracting store name directly from visible page (no click needed)
             try:
-                # These are visible on the product page without clicking
                 store_name_selectors = [
                     '[class*="store-header--storeName"]',
                     '[class*="shop-name"]',
@@ -197,48 +362,43 @@ def _scrape_in_thread(url: str) -> dict:
                             text = el.inner_text().strip()
                             if text and len(text) > 1:
                                 seller['store_name'] = text
-                                print(f"[scraper]    ✅ Store name from page: {text}")
+                                print(f"[scraper]    ✅ Store name: {text}")
                                 break
                     except Exception:
                         continue
             except Exception as e:
                 print(f"[scraper]    ⚠️ Store name error: {e}")
 
-            # ── Step 2: Get store URL and ID from page links ────────────────
+            # ── Step 2: Store URL + ID from links ───────────────────────────
             try:
-                import re as re_mod
                 links = page.locator('a[href*="/store/"]').all()
                 for link in links[:5]:
                     href = link.get_attribute('href') or ''
                     if '/store/' in href:
                         if href.startswith('//'):
                             href = 'https:' + href
-                        m = re_mod.search(r'/store/(\d+)', href)
+                        m = re.search(r'/store/(\d+)', href)
                         if m:
                             seller['store_id']  = m.group(1)
-                            seller['store_url'] = f"https://www.aliexpress.com/store/{m.group(1)}"
+                            seller['store_url'] = (
+                                f"https://www.aliexpress.com/store/{m.group(1)}"
+                            )
                             print(f"[scraper]    ✅ Store ID: {m.group(1)}")
                             break
             except Exception as e:
                 print(f"[scraper]    ⚠️ Store URL error: {e}")
 
-            # ── Step 3: Click store info to open popup ──────────────────────
+            # ── Step 3: Click store info to open popup ───────────────────────
             print("[scraper]    🖱️  Clicking store info...")
             try:
-                # Wait for store section to be visible first
                 page.wait_for_selector(
                     'a[href*="/store/"], [class*="store"], [class*="seller"]',
                     timeout=10000
                 )
-
-                # Try multiple click targets
                 click_selectors = [
-                    'span:text("Trader")',
-                    'span:text("trader")',
-                    '[class*="trader"]',
-                    'a[href*="/store/"]',
-                    '[class*="store-header"]',
-                    '[class*="sellerInfo"]',
+                    'span:text("Trader")', 'span:text("trader")',
+                    '[class*="trader"]',   'a[href*="/store/"]',
+                    '[class*="store-header"]', '[class*="sellerInfo"]',
                     '[class*="seller-info"]',
                 ]
                 for sel in click_selectors:
@@ -251,13 +411,11 @@ def _scrape_in_thread(url: str) -> dict:
                             break
                     except Exception:
                         continue
-
             except Exception as e:
                 print(f"[scraper]    ⚠️ Click error: {e}")
 
-            # ── Step 4: Extract from popup after click ──────────────────────
+            # ── Step 4: Extract from popup ───────────────────────────────────
             try:
-                # Check if popup appeared
                 popup_selectors = [
                     '.store-detail--storeInfo--BMDFsTB',
                     '[class*="storeInfo"]',
@@ -267,11 +425,10 @@ def _scrape_in_thread(url: str) -> dict:
                 for sel in popup_selectors:
                     if page.locator(sel).count() > 0:
                         popup_found = True
-                        print(f"[scraper]    ✅ Popup found: {sel}")
+                        print(f"[scraper]    ✅ Popup: {sel}")
                         break
 
                 if popup_found:
-                    # Extract store info table
                     rows = page.locator(
                         '.store-detail--storeInfo--BMDFsTB table tr, '
                         '[class*="storeInfo"] table tr'
@@ -287,7 +444,9 @@ def _scrape_in_thread(url: str) -> dict:
                                     seller['store_name'] = value
                                 elif 'store no' in key or 'no.' in key:
                                     seller['store_id']  = value
-                                    seller['store_url'] = f"https://www.aliexpress.com/store/{value}"
+                                    seller['store_url'] = (
+                                        f"https://www.aliexpress.com/store/{value}"
+                                    )
                                 elif 'location' in key or 'country' in key:
                                     seller['seller_country'] = value.strip()
                                 elif 'open' in key or 'since' in key:
@@ -295,7 +454,6 @@ def _scrape_in_thread(url: str) -> dict:
                         except Exception:
                             continue
 
-                    # Extract ratings
                     rating_rows = page.locator(
                         '.store-detail--storeRating--Z2j7q9u table tr, '
                         '[class*="storeRating"] table tr'
@@ -304,10 +462,11 @@ def _scrape_in_thread(url: str) -> dict:
                         try:
                             cells = row.locator('td').all()
                             if len(cells) >= 2:
-                                key = cells[0].inner_text().strip().lower()
-                                # Rating value is inside <b> tag
+                                key  = cells[0].inner_text().strip().lower()
                                 b_el = cells[1].locator('b').first
-                                value = b_el.inner_text().strip() if b_el.count() > 0 else cells[1].inner_text().strip()
+                                value = (b_el.inner_text().strip()
+                                         if b_el.count() > 0
+                                         else cells[1].inner_text().strip())
                                 print(f"[scraper]       Rating: {key} = {value}")
                                 if 'item' in key or 'described' in key:
                                     seller['seller_rating'] = value
@@ -318,17 +477,15 @@ def _scrape_in_thread(url: str) -> dict:
                         except Exception:
                             continue
                 else:
-                    print("[scraper]    ⚠️ Popup not found — saving page HTML for debug")
-                    # Save HTML to debug what's actually on the page
+                    print("[scraper]    ⚠️ Popup not found — saving debug HTML")
                     with open('/tmp/seller_debug.html', 'w') as f:
                         f.write(page.content())
-                    print("[scraper]    💾 Saved to /tmp/seller_debug.html")
+                    print("[scraper]    💾 Saved /tmp/seller_debug.html")
 
             except Exception as e:
                 print(f"[scraper]    ⚠️ Popup extraction error: {e}")
 
-            print(f"[scraper]    📊 Seller extracted: {seller}")
-
+            print(f"[scraper]    📊 DOM seller: {seller}")
             html = page.content()
             page.close()
             context.close()
@@ -339,25 +496,74 @@ def _scrape_in_thread(url: str) -> dict:
         traceback.print_exc()
 
     return {'captured': captured, 'html': html, 'seller': seller}
-```
 
-After updating, run a test and check your VM logs. Look for these lines:
-```
-[scraper]      Clicking store info...
-[scraper]      Clicked: <selector>
-[scraper]      Popup found: <selector>
-[scraper]       Row: name = Comwingo Store
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 5 — RETRY MECHANISM  (wraps browser call, rotates region each attempt)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scrape_with_retry(url: str) -> dict:
+    """
+    Try up to MAX_RETRIES times.
+    Each attempt uses a different region + fresh random user-agent.
+    Returns the best result obtained (or last attempt if all fail).
+    """
+    best_result = {'captured': [], 'html': '', 'seller': {}}
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        print(f"\n[scraper] 🔄 Attempt {attempt}/{MAX_RETRIES}")
+
+        attempt_url = _get_rotated_url(url)
+
+        # Back-off between retries
+        if attempt > 1:
+            delay = random.uniform(3, 7)
+            print(f"[scraper] ⏳ Back-off {delay:.1f}s...")
+            time.sleep(delay)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(_scrape_in_thread, attempt_url)
+                result = future.result(timeout=180)
+
+            # Check if we got useful data
+            got_data = False
+            for text in sorted(result['captured'], key=len, reverse=True):
+                parsed = parse_pdp_response(text)
+                if parsed and parsed.get('title'):
+                    got_data = True
+                    break
+
+            if got_data:
+                print(f"[scraper] ✅ Success on attempt {attempt}")
+                return result
+
+            # Keep the attempt with the most captured data as fallback
+            if len(result['captured']) >= len(best_result['captured']):
+                best_result = result
+
+            print(f"[scraper] ⚠️  Attempt {attempt} incomplete — retrying...")
+
+        except Exception as e:
+            print(f"[scraper] ❌ Attempt {attempt} error: {e}")
+
+    print(f"[scraper] ⚠️  All {MAX_RETRIES} attempts done — using best result")
+    return best_result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_product_info(url: str) -> dict | None:
     print(f"[scraper] Starting: {url}")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_scrape_in_thread, url)
-        data   = future.result(timeout=180)
+    # FIX 5: use retry wrapper
+    data = _scrape_with_retry(url)
 
     extracted = {}
 
-    # Parse API responses
+    # Parse API responses (longest = most complete, try first)
     for text in sorted(data['captured'], key=len, reverse=True):
         parsed = parse_pdp_response(text)
         if parsed:
@@ -366,24 +572,24 @@ def get_product_info(url: str) -> dict | None:
                     extracted[k] = v
             break
 
-    # ✅ Merge DOM seller info
+    # Merge DOM seller info (fills any gaps not covered by API)
     dom_seller = data.get('seller', {})
     for k, v in dom_seller.items():
         if v and (k not in extracted or not extracted[k]):
             extracted[k] = v
             print(f"[scraper]    ✅ Seller from DOM: {k} = {v}")
 
-    # Title fallback
+    # Title fallback from HTML <meta> tag
     if not extracted.get('title') and data['html']:
-        import re
-        m = re.search(r'<meta[^>]*property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']',
-                      data['html'])
+        m = re.search(
+            r'<meta[^>]*property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']',
+            data['html']
+        )
         if m:
             extracted['title'] = m.group(1).strip()
 
-    # Image fallback
+    # Image fallback from embedded HTML JSON
     if not extracted.get('image_1') and data['html']:
-        import re, json
         m = re.search(r'"imagePathList"\s*:\s*(\[[^\]]+\])', data['html'])
         if m:
             try:
@@ -394,10 +600,15 @@ def get_product_info(url: str) -> dict | None:
             except Exception:
                 pass
 
+    # Summary log
     print(f"[scraper] Final extracted fields: {len(extracted)}")
-    print(f"[scraper] Seller fields found: {[k for k in ['store_name','store_id','seller_rating','seller_country'] if extracted.get(k)]}")
+    print(f"[scraper] Seller fields:  "
+          f"{[k for k in ['store_name','store_id','seller_rating','seller_country','seller_positive_rate','seller_communication','seller_shipping_speed','is_top_rated'] if extracted.get(k)]}")
+    print(f"[scraper] Spec fields:    "
+          f"{[k for k in ['brand','color','dimensions','weight','material','certifications','country_of_origin','warranty','product_type'] if extracted.get(k)]}")
+    print(f"[scraper] Bullet points:  {len(extracted.get('bullet_points', []))} items")
 
-    # Apply defaults
+    # Apply defaults (ensures all expected keys exist)
     defaults = {
         'description': '', 'brand': '', 'color': '', 'dimensions': '',
         'weight': '', 'material': '', 'certifications': '',
@@ -420,12 +631,12 @@ def get_product_info(url: str) -> dict | None:
 
     return extracted if extracted.get('title') else None
 
+
 if __name__ == '__main__':
     test_url = "https://www.aliexpress.com/item/1005010089125608.html"
-    result = get_product_info(test_url)
-    
+    result   = get_product_info(test_url)
     if result:
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         for k, v in sorted(result.items()):
             if not k.startswith('image_'):
-                print(f"{k:20}: {str(v)[:120]}")
+                print(f"{k:25}: {str(v)[:120]}")
