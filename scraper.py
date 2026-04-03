@@ -1,683 +1,814 @@
-#!/usr/bin/env python3
 """
-AliExpress Product Detail Page (PDP) Scraper with Multi-Region Support
-Supports Pakistan (PK) and Poland (PL/EU) regions with fallback parsing
+scraper.py
+──────────
+Camoufox-based AliExpress product detail page (PDP) scraper.
+
+REGION ISSUE FIX:
+  When your server IP is in Pakistan (or any non-EU country), using EU regions
+  (DE, FR, PL, GB) causes AliExpress to:
+    1. Trigger bot-detection (IP country ≠ requested region)
+    2. Show GDPR consent banners that block all popup clicks
+    3. Load EU DSA-compliant 'Trader' popup (different structure)
+    4. Possibly redirect to country subdomains (de.aliexpress.com)
+
+  FIX: Only rotate between non-EU regions that work from any IP.
+       AE (UAE), US, AU, CA, PK all work reliably from Pakistan.
+       If you move server to EU, re-add EU regions and handle GDPR banner.
 """
 
-import json
 import re
-import time
+import json
 import random
-import logging
-import requests
-from typing import Dict, Optional, List, Any
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import time
+import urllib.request
+import concurrent.futures
+from camoufox.sync_api import Camoufox
 
-# Try to import optional dependencies
-try:
-    from playwright.sync_api import sync_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
 
-try:
-    from bs4 import BeautifulSoup
-    BS4_AVAILABLE = True
-except ImportError:
-    BS4_AVAILABLE = False
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# Constants
-MAX_RETRIES = 3
-RETRY_DELAY = 2
-TIMEOUT = 30
-
-# Supported regions
-REGIONS = {
-    "US": "United States", "GB": "United Kingdom", "DE": "Germany", "FR": "France",
-    "AE": "UAE", "AU": "Australia", "CA": "Canada", "PK": "Pakistan", "PL": "Poland"
+# ─────────────────────────────────────────────────────────────────────────────
+# SPEC MAPPING
+# ─────────────────────────────────────────────────────────────────────────────
+SPEC_MAPPING = {
+    'brand':             ['brand', 'brand name', 'marque', 'manufacturer'],
+    'color':             ['color', 'colour', 'main color', 'couleur'],
+    'dimensions':        ['dimensions', 'size', 'product size', 'package size',
+                          'item size', 'product dimensions'],
+    'weight':            ['weight', 'net weight', 'gross weight', 'poids'],
+    'material':          ['material', 'materials', 'composition', 'matiere',
+                          'fabric type'],
+    'country_of_origin': ['origin', 'country of origin', 'made in',
+                          'country/region of manufacture'],
+    'warranty':          ['warranty', 'garantie', 'warranty period',
+                          'warranty type', 'warranty information'],
+    'certifications':    ['certification', 'certifications', 'certificate',
+                          'compliance', 'standard', 'normes', 'ce', 'rohs'],
+    'product_type':      ['product type', 'type', 'item type',
+                          'type de produit', 'style', 'category'],
 }
 
-# User agents
+# ─────────────────────────────────────────────────────────────────────────────
+# REGION LIST — NON-EU ONLY
+#
+# WHY NO EU REGIONS (DE, FR, PL, GB, etc.):
+#   EU regions trigger GDPR consent banners and DSA "Trader" popup requirements.
+#   These have completely different page structures that break our selectors.
+#   From a Pakistan server IP, EU region params also trigger bot-detection
+#   because AliExpress sees IP country ≠ requested region.
+#
+#   SAFE regions from any non-EU server: AE, US, AU, CA, PK, SA, TR, JP
+# ─────────────────────────────────────────────────────────────────────────────
+REGIONS_SAFE = ["AE", "US", "AU", "CA", "PK", "SA", "TR"]
+
+# EU regions — only use if your server IP is inside EU
+REGIONS_EU   = ["DE", "FR", "NL", "IT", "ES"]
+
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
-# API endpoints
-REGIONAL_API_ENDPOINTS = {
-    "default": ["mtop.aliexpress.pdp.detail", "mtop.aliexpress.product.detail", "mtop.aliexpress.pdp.v2"],
-    "EU": ["mtop.aliexpress.gdpr.product.detail", "mtop.aliexpress.eu.pdp", "mtop.aliexpress.product.eu.detail"]
-}
+MAX_RETRIES = 3
 
-# EU field mappings
-EU_FIELD_MAPPINGS = {
-    "title": ["subject", "title", "productTitle", "euProductName", "gdprProductName"],
-    "price": ["price", "salePrice", "euPrice", "gdprPrice"],
-    "original_price": ["originalPrice", "marketPrice", "euOriginalPrice"],
-    "discount": ["discount", "discountRate", "euDiscount"],
-    "seller": ["storeName", "sellerName", "euStoreInfo", "euSellerName"],
-    "seller_id": ["storeId", "sellerId", "euStoreId", "euSellerId"],
-    "rating": ["averageStarRate", "rating", "euRating"],
-    "reviews": ["reviewCount", "reviews", "euReviewCount"],
-    "orders": ["orders", "tradeCount", "euOrders"],
-    "specifications": ["productPropDtos", "specifications", "euProductSpecs", "gdprSpecifications"],
-    "images": ["images", "imagePathList", "euImagePathList", "gdprImages"],
-    "description_url": ["descriptionUrl", "description", "euDescriptionUrl", "gdprDescriptionUrl"],
-    "bullet_points": ["bulletPoints", "highlights", "euBulletPoints"]
-}
+# Set to True if your server is inside the EU
+SERVER_IS_EU = False
 
-def get_region_from_url(url: str) -> str:
-    """Extract region from URL or return default"""
-    parsed = urlparse(url)
-    query_params = parse_qs(parsed.query)
-    
-    if 'shipFromCountry' in query_params:
-        region = query_params['shipFromCountry'][0].upper()
-        if region in REGIONS:
-            return region
-    
-    return "US"
 
-def add_region_to_url(url: str, region: str) -> str:
-    """Add or update region parameter in URL"""
-    parsed = urlparse(url)
-    query_params = parse_qs(parsed.query)
-    query_params['shipFromCountry'] = [region.upper()]
-    new_query = urlencode(query_params, doseq=True)
-    return urlunparse(parsed._replace(query=new_query))
+def _get_regions():
+    """Return safe region list based on server location."""
+    return REGIONS_EU if SERVER_IS_EU else REGIONS_SAFE
 
-def get_random_user_agent() -> str:
-    """Get random user agent"""
-    return random.choice(USER_AGENTS)
 
-def clean_text(text: str) -> str:
-    """Clean and normalize text"""
-    if not text:
-        return ""
-    return re.sub(r'\s+', ' ', text.strip())
+def _get_rotated_url(url: str) -> str:
+    """Append a non-EU shipFromCountry param. Never adds EU regions from non-EU IPs."""
+    region = random.choice(_get_regions())
+    sep    = '&' if '?' in url else '?'
+    print(f"[scraper] 🌍 Region → {region}")
+    return f"{url}{sep}shipFromCountry={region}"
 
-def extract_price(text: str) -> Dict[str, Any]:
-    """Extract price information from text"""
-    if not text:
-        return {"price": 0.0, "currency": "USD"}
-    
-    price_match = re.search(r'(\d+(?:\.\d{1,2})?)', text.replace(',', ''))
-    currency_match = re.search(r'([A-Z]{3}|\$|€|£|₹|PKR|PLN)', text)
-    
-    price = float(price_match.group(1)) if price_match else 0.0
-    currency = currency_match.group(1) if currency_match else "USD"
-    
-    currency_map = {'$': 'USD', '€': 'EUR', '£': 'GBP', '₹': 'INR', 'PKR': 'PKR', 'PLN': 'PLN'}
-    currency = currency_map.get(currency, currency)
-    
-    return {"price": price, "currency": currency}
 
-def _extract_field_with_fallback(data: Dict, field_names: List[str]) -> Any:
-    """Extract field value trying multiple possible field names"""
-    for field_name in field_names:
-        if field_name in data:
-            return data[field_name]
-        if '.' in field_name:
-            parts = field_name.split('.')
-            current = data
-            try:
-                for part in parts:
-                    current = current[part]
-                return current
-            except (KeyError, TypeError):
-                continue
-    return None
+# ─────────────────────────────────────────────────────────────────────────────
+# SPEC HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_price_with_fallback(data: Dict, price_fields: List[str], original_price_fields: List[str]) -> Dict[str, float]:
-    """Extract price information with fallback logic"""
-    result = {"price": 0.0, "original_price": 0.0, "discount": 0, "currency": "USD"}
-    
-    for field in price_fields:
-        if field in data and data[field]:
-            price_data = extract_price(str(data[field]))
-            result.update(price_data)
-            break
-    
-    for field in original_price_fields:
-        if field in data and data[field]:
-            orig_data = extract_price(str(data[field]))
-            result["original_price"] = orig_data["price"]
-            break
-    
-    if result["price"] and result["original_price"] and result["original_price"] > result["price"]:
-        result["discount"] = round((1 - result["price"] / result["original_price"]) * 100)
-    
-    return result
+def map_props_to_fields(props: list) -> tuple:
+    raw = {}
+    for item in props:
+        name  = str(item.get('attrName') or item.get('name')  or '').strip().lower()
+        value = str(item.get('attrValue') or item.get('value') or '').strip()
+        if name and value and value.lower() != 'none':
+            raw[name] = value
+    mapped = {}
+    for field, keywords in SPEC_MAPPING.items():
+        for k, v in raw.items():
+            if any(kw in k for kw in keywords):
+                mapped[field] = v
+                break
+    return mapped, raw
 
-def _extract_seller_info(data: Dict, region: str) -> Dict[str, Any]:
-    """Extract seller information with region-specific handling"""
-    result = {}
-    
-    seller_fields = EU_FIELD_MAPPINGS['seller']
-    seller_id_fields = EU_FIELD_MAPPINGS['seller_id']
-    
-    # For EU regions, check for euStoreInfo structure
-    if region in ["PL", "DE", "FR"] or 'euStoreInfo' in data:
-        eu_store = data.get('euStoreInfo', {})
-        if eu_store:
-            result['seller'] = eu_store.get('storeName', '')
-            result['seller_id'] = eu_store.get('storeId', '')
-            result['seller_rating'] = eu_store.get('rating', 0)
-            result['seller_reviews'] = eu_store.get('reviewCount', 0)
-            return result
-    
-    # Standard seller extraction
-    for field in seller_fields:
-        if field in data and data[field]:
-            result['seller'] = str(data[field])
-            break
-    
-    for field in seller_id_fields:
-        if field in data and data[field]:
-            result['seller_id'] = str(data[field])
-            break
-    
-    return result
 
-def _extract_specifications(data: Dict, region: str) -> List[Dict[str, str]]:
-    """Extract product specifications with region-specific handling"""
-    specs = []
-    
-    # Try EU-specific specification extraction
-    if region in ["PL", "DE", "FR"]:
-        eu_specs = data.get('gdprModule', {}).get('specifications', [])
-        if eu_specs:
-            for spec in eu_specs:
-                if isinstance(spec, dict):
-                    specs.append({'name': spec.get('name', ''), 'value': spec.get('value', '')})
-            return specs
-        
-        # Try euProductSpecs
-        eu_product_specs = data.get('euProductSpecs', [])
-        if eu_product_specs:
-            for spec in eu_product_specs:
-                if isinstance(spec, dict):
-                    specs.append({'name': spec.get('name', ''), 'value': spec.get('value', '')})
-            return specs
-    
-    # Standard specification extraction
-    spec_fields = EU_FIELD_MAPPINGS['specifications']
-    for field in spec_fields:
-        if field in data and data[field]:
-            spec_data = data[field]
-            if isinstance(spec_data, list):
-                specs = [{'name': str(item.get('name', '')), 'value': str(item.get('value', ''))} 
-                        for item in spec_data if isinstance(item, dict)]
-            break
-    
-    return specs
+# ─────────────────────────────────────────────────────────────────────────────
+# SELLER BLOCK PARSER
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_images(data: Dict, region: str) -> List[str]:
-    """Extract product images with region-specific handling"""
-    images = []
-    
-    # Try EU-specific image extraction
-    if region in ["PL", "DE", "FR"]:
-        # Try euImagePathList
-        eu_images = data.get('euImagePathList', [])
-        if eu_images:
-            return [str(img) for img in eu_images if img]
-        
-        # Try gdprImages
-        gdpr_images = data.get('gdprImages', [])
-        if gdpr_images:
-            return [str(img) for img in gdpr_images if img]
-    
-    # Standard image extraction
-    image_fields = EU_FIELD_MAPPINGS['images']
-    for field in image_fields:
-        if field in data and data[field]:
-            img_data = data[field]
-            if isinstance(img_data, list):
-                images = [str(img) for img in img_data if img]
-            elif isinstance(img_data, str):
-                images = [img_data]
-            break
-    
-    return images
+def _parse_seller_block(store: dict) -> dict:
+    sid = str(store.get('storeNum') or store.get('sellerId') or
+              store.get('storeId') or '')
+    seller = {
+        'store_name':            store.get('storeName') or store.get('sellerName') or '',
+        'store_id':              sid,
+        'seller_id':             str(store.get('sellerId') or store.get('userId') or ''),
+        'store_url':             (store.get('storeUrl') or
+                                  (f"https://www.aliexpress.com/store/{sid}" if sid else '')),
+        'seller_country':        store.get('country') or store.get('countryCompleteName') or '',
+        'seller_rating':         str(store.get('positiveRate') or store.get('itemAs') or ''),
+        'seller_positive_rate':  str(store.get('positiveRate') or ''),
+        'seller_communication':  str(store.get('communicationRating') or store.get('serviceAs') or ''),
+        'seller_shipping_speed': str(store.get('shippingRating') or store.get('shippingAs') or ''),
+        'store_open_date':       str(store.get('openTime') or store.get('openDate') or ''),
+        'seller_level':          str(store.get('sellerLevel') or store.get('shopLevel') or ''),
+        'seller_total_reviews':  str(store.get('totalEvaluationNum') or store.get('reviewNum') or ''),
+        'seller_positive_num':   str(store.get('positiveNum') or ''),
+        'is_top_rated':          str(store.get('isTopRatedSeller') or store.get('topRatedSeller') or ''),
+    }
+    return {k: v for k, v in seller.items() if v and str(v).strip()}
 
-def _extract_bullet_points(data: Dict, region: str) -> List[str]:
-    """Extract bullet points with region-specific handling"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BULLET POINTS EXTRACTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_bullet_points(result: dict) -> list:
     bullets = []
-    
-    # Try EU-specific bullet extraction
-    if region in ["PL", "DE", "FR"]:
-        eu_bullets = data.get('gdprModule', {}).get('bulletPoints', [])
-        if eu_bullets:
-            return [str(bullet) for bullet in eu_bullets if bullet]
-        
-        # Try euBulletPoints
-        eu_bullets = data.get('euBulletPoints', [])
-        if eu_bullets:
-            return [str(bullet) for bullet in eu_bullets if bullet]
-    
-    # Standard bullet extraction
-    bullet_fields = EU_FIELD_MAPPINGS['bullet_points']
-    for field in bullet_fields:
-        if field in data and data[field]:
-            bullet_data = data[field]
-            if isinstance(bullet_data, list):
-                bullets = [str(bullet) for bullet in bullet_data if bullet]
-            break
-    
-    return bullets
-
-def _parse_init_data(html: str) -> Dict[str, Any]:
-    """Parse _init_data_ from HTML as fallback"""
-    result = {}
-    
-    # Look for _init_data_ in script tags
-    init_data_match = re.search(r'window\._init_data_\s*=\s*({.+?});', html, re.DOTALL)
-    if init_data_match:
+    for path in [
+        lambda r: r.get('highlights') or r.get('highlightModule', {}).get('highlightList'),
+        lambda r: r.get('tradeModule', {}).get('highlights'),
+        lambda r: r.get('descriptionModule', {}).get('features'),
+        lambda r: r.get('PRODUCT_PROP_PC', {}).get('features'),
+        lambda r: r.get('sellingPoints') or r.get('keyPoints') or r.get('productFeatures'),
+    ]:
         try:
-            init_data = json.loads(init_data_match.group(1))
-            
-            # Extract basic info
-            if 'title' in init_data:
-                result['title'] = init_data['title']
-            if 'price' in init_data:
-                result['price'] = init_data['price']
-            if 'images' in init_data:
-                result['images'] = init_data['images']
-            
-            logger.info("Parsed _init_data_ successfully")
-        except json.JSONDecodeError:
-            logger.error("Failed to parse _init_data_ JSON")
-    
-    return result
+            items = path(result)
+            if items and isinstance(items, list):
+                bullets = [str(h.get('title') or h.get('text') or h) for h in items if h]
+                if bullets:
+                    break
+        except Exception:
+            pass
+    return [b.strip() for b in bullets if b.strip()][:10]
 
-def _parse_eu_fallback(html: str, url: str) -> Dict[str, Any]:
-    """Parse EU-specific page structure as fallback"""
-    result = {}
-    
-    if not BS4_AVAILABLE:
-        logger.warning("BeautifulSoup4 not available, using regex fallback")
-        # Simple regex-based parsing without BeautifulSoup
-        title_match = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
-        if title_match:
-            result['title'] = title_match.group(1).split(' - ')[0].strip()
-        
-        price_match = re.search(r'\$(\d+(?:\.\d{1,2})?)', html)
-        if price_match:
-            result['price'] = {"price": float(price_match.group(1)), "currency": "USD"}
-        
-        return result
-    
-    # Use BeautifulSoup if available
-    soup = BeautifulSoup(html, 'html.parser')
-    
-    # EU pages have different selectors
-    try:
-        # Title - EU pages often use different title selectors
-        title_selectors = [
-            'h1[data-e2e="product-title"]',
-            '.product-title',
-            'h1[class*="title"]',
-            'title'
-        ]
-        for selector in title_selectors:
-            title_elem = soup.select_one(selector)
-            if title_elem:
-                result['title'] = clean_text(title_elem.get_text())
-                break
-        
-        # Price - EU pages have GDPR-compliant price display
-        price_selectors = [
-            '[data-e2e="price"]',
-            '.price-current',
-            '[class*="price"][class*="current"]',
-            '.notranslate'
-        ]
-        for selector in price_selectors:
-            price_elem = soup.select_one(selector)
-            if price_elem:
-                price_text = clean_text(price_elem.get_text())
-                result['price'] = extract_price(price_text)
-                break
-        
-        # Seller info - EU pages have GDPR-compliant seller info
-        seller_selectors = [
-            '[data-e2e="store-name"]',
-            '.store-name',
-            '[class*="seller"][class*="name"]'
-        ]
-        for selector in seller_selectors:
-            seller_elem = soup.select_one(selector)
-            if seller_elem:
-                result['seller'] = clean_text(seller_elem.get_text())
-                break
-        
-        # Images - EU pages may have different image galleries
-        image_selectors = [
-            'img[data-e2e="product-image"]',
-            '.product-image img',
-            'img[class*="gallery"]'
-        ]
-        images = []
-        for selector in image_selectors:
-            img_elems = soup.select(selector)
-            for img in img_elems:
-                src = img.get('src') or img.get('data-src')
-                if src and 'placeholder' not in src:
-                    images.append(src)
-        if images:
-            result['images'] = images[:10]  # Limit to first 10
-        
-        logger.info(f"Parsed EU fallback for {url}: {len(result)} fields")
-        
-    except Exception as e:
-        logger.error(f"EU fallback parsing failed for {url}: {e}")
-    
-    return result
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DESCRIPTION FETCHER
+# ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_description(url: str) -> str:
-    """Fetch and clean product description"""
-    if not url:
-        return ""
-    
     try:
-        headers = {'User-Agent': get_random_user_agent()}
-        response = requests.get(url, headers=headers, timeout=TIMEOUT)
-        response.raise_for_status()
-        
-        if not BS4_AVAILABLE:
-            # Simple text extraction without BeautifulSoup
-            text = re.sub(r'<[^>]+>', '', response.text)
-            return text[:3000] if len(text) > 3000 else text
-        
-        # Clean HTML with BeautifulSoup
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Remove script and style elements
-        for elem in soup(['script', 'style', 'noscript']):
-            elem.decompose()
-        
-        # Get text and clean
-        text = soup.get_text()
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        description = '\n'.join(lines)
-        
-        # Limit length
-        if len(description) > 3000:
-            description = description[:3000] + "..."
-        
-        return description
-        
+        req = urllib.request.Request(
+            url,
+            headers={
+                'User-Agent': random.choice(USER_AGENTS),
+                'Accept': 'text/html,application/xhtml+xml',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://www.aliexpress.com/',
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read().decode('utf-8', errors='replace')
+        clean = re.sub(r'<style[^>]*>.*?</style>', ' ', raw, flags=re.DOTALL)
+        clean = re.sub(r'<script[^>]*>.*?</script>', ' ', clean, flags=re.DOTALL)
+        clean = re.sub(r'<[^>]+>', ' ', clean)
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        return clean[:3000]
     except Exception as e:
-        logger.error(f"Failed to fetch description from {url}: {e}")
-        return ""
+        print(f"[scraper] ⚠️  Description fetch failed: {e}")
+        return ''
 
-def _scrape_with_playwright(url: str) -> Dict[str, Any]:
-    """Scrape using Playwright with region detection"""
-    if not PLAYWRIGHT_AVAILABLE:
-        logger.warning("Playwright not available, using requests fallback")
-        return _scrape_with_requests(url)
-    
-    region = get_region_from_url(url)
-    logger.info(f"Scraping URL for region {region}: {url}")
-    
-    captured_data = {}
-    html_content = ""
-    
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API RESPONSE PARSER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_pdp_response(text: str) -> dict | None:
     try:
-        from playwright.sync_api import sync_playwright
-        
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent=get_random_user_agent(),
-                viewport={'width': 1920, 'height': 1080}
+        m = re.match(r'^[a-zA-Z0-9_$]+\((.*)\);?\s*$', text.strip(), re.DOTALL)
+        if m:
+            text = m.group(1)
+
+        data   = json.loads(text)
+        result = (data.get('data', {}).get('result', {}) or data.get('data', {}) or {})
+        if not result:
+            return None
+
+        extracted = {}
+
+        # Title
+        try:
+            extracted['title'] = result['titleModule']['subject']
+        except Exception:
+            try:
+                extracted['title'] = result.get('GLOBAL_DATA', {}).get('globalData', {}).get('subject', '')
+            except Exception:
+                pass
+
+        # Price
+        try:
+            pm = result.get('priceModule') or {}
+            extracted['price'] = pm.get('formatedActivityPrice') or pm.get('formatedPrice') or ''
+        except Exception:
+            pass
+
+        # Seller
+        try:
+            store = (result.get('storeModule') or result.get('SHOP_CARD_PC') or
+                     result.get('sellerModule') or {})
+            if store:
+                seller_data = _parse_seller_block(store)
+                extracted.update(seller_data)
+                print(f"[scraper] 🏪 API seller: {list(seller_data.keys())}")
+        except Exception as e:
+            print(f"[scraper] ⚠️  API seller parse error: {e}")
+
+        # Specs
+        props = []
+        try:
+            props = (
+                result.get('PRODUCT_PROP_PC', {}).get('showedProps', []) or
+                result.get('skuModule', {}).get('productSKUPropertyList', []) or
+                result.get('productProp', {}).get('props', []) or
+                result.get('specsModule', {}).get('props', [])
             )
-            
+        except Exception:
+            pass
+        if props:
+            mapped, _ = map_props_to_fields(props)
+            extracted.update(mapped)
+            print(f"[scraper] ✅ {len(props)} specs → {list(mapped.keys())}")
+
+        # Bullet points
+        bullets = _extract_bullet_points(result)
+        if bullets:
+            extracted['bullet_points'] = bullets
+
+        # Images
+        images = []
+        try:
+            images = (result.get('imageModule', {}).get('imagePathList', []) or
+                      result.get('titleModule', {}).get('images', []))
+        except Exception:
+            pass
+        for idx, img in enumerate(images[:20], 1):
+            if img:
+                img = 'https:' + img if str(img).startswith('//') else img
+                extracted[f'image_{idx}'] = re.sub(r'_\d+x\d+', '', img)
+
+        # Description URL (fetched later)
+        try:
+            desc_url = result.get('descriptionModule', {}).get('descriptionUrl', '')
+            if desc_url:
+                extracted['_description_url'] = desc_url
+        except Exception:
+            pass
+
+        return extracted if extracted.get('title') else None
+
+    except Exception as e:
+        print(f"[scraper] ⚠️  API parse error: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INIT_DATA FALLBACK PARSER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_init_data(html: str) -> dict:
+    try:
+        m = re.search(
+            r'window\._dida_config_\._init_data_\s*=\s*\{[^{]*data:\s*(\{.*?\})\s*\}',
+            html, re.DOTALL
+        )
+        if not m:
+            return {}
+        data   = json.loads(m.group(1))
+        result = data.get('data', {}) or {}
+        if not result:
+            return {}
+
+        extracted = {}
+        title = (result.get('titleModule', {}).get('subject') or
+                 result.get('GLOBAL_DATA', {}).get('globalData', {}).get('subject', ''))
+        if title:
+            extracted['title'] = title
+
+        pm = result.get('priceModule') or {}
+        price = pm.get('formatedActivityPrice') or pm.get('formatedPrice')
+        if price:
+            extracted['price'] = price
+
+        store = result.get('storeModule') or result.get('SHOP_CARD_PC') or {}
+        if store:
+            extracted.update(_parse_seller_block(store))
+
+        props = (result.get('PRODUCT_PROP_PC', {}).get('showedProps', []) or
+                 result.get('skuModule', {}).get('productSKUPropertyList', []) or [])
+        if props:
+            mapped, _ = map_props_to_fields(props)
+            extracted.update(mapped)
+
+        for idx, img in enumerate(result.get('imageModule', {}).get('imagePathList', [])[:20], 1):
+            if img:
+                img = 'https:' + img if str(img).startswith('//') else img
+                extracted[f'image_{idx}'] = re.sub(r'_\d+x\d+', '', img)
+
+        desc_url = result.get('descriptionModule', {}).get('descriptionUrl', '')
+        if desc_url:
+            extracted['_description_url'] = desc_url
+
+        return extracted
+    except Exception as e:
+        print(f"[scraper] ⚠️  init_data parse error: {e}")
+        return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GDPR CONSENT BANNER DISMISSER
+# Only needed for EU pages. Tries to click "Accept" on consent banners.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dismiss_gdpr_banner(page) -> bool:
+    """
+    Dismiss GDPR cookie consent banners that block interactions on EU pages.
+    Returns True if a banner was found and dismissed.
+    """
+    gdpr_accept_selectors = [
+        # AliExpress specific
+        '[class*="gdpr"] button:has-text("Accept")',
+        '[class*="gdpr"] button:has-text("Accept All")',
+        '[class*="cookie"] button:has-text("Accept")',
+        '[class*="cookie"] button:has-text("OK")',
+        '[id*="gdpr"] button:has-text("Accept")',
+        '[id*="cookie"] button:has-text("Accept")',
+        # Generic EU consent banners
+        'button:has-text("Accept all cookies")',
+        'button:has-text("Accept All Cookies")',
+        'button:has-text("Agree")',
+        'button:has-text("I Accept")',
+        '#accept-all',
+        '.accept-all',
+        '[data-testid="accept-all"]',
+    ]
+    for sel in gdpr_accept_selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0 and el.is_visible(timeout=1500):
+                el.click(timeout=2000)
+                page.wait_for_timeout(1000)
+                print(f"[scraper] 🍪 GDPR banner dismissed: {sel}")
+                return True
+        except Exception:
+            continue
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SELLER POPUP EXTRACTOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_seller_from_popup(page, is_eu_page: bool = False) -> dict:
+    """
+    Extract seller info from the store popup.
+    Handles both standard and EU DSA "Trader" popup structures.
+    """
+    seller = {}
+
+    # ── Step 1: Store ID + URL from links (no click needed) ─────────────────
+    try:
+        links = page.locator('a[href*="/store/"]').all()
+        for link in links[:5]:
+            href = link.get_attribute('href') or ''
+            if '/store/' in href:
+                if href.startswith('//'):
+                    href = 'https:' + href
+                m = re.search(r'/store/(\d+)', href)
+                if m:
+                    seller['store_id']  = m.group(1)
+                    seller['store_url'] = f"https://www.aliexpress.com/store/{m.group(1)}"
+                    print(f"[scraper]    ✅ Store ID: {m.group(1)}")
+                    break
+    except Exception as e:
+        print(f"[scraper]    ⚠️  Store link error: {e}")
+
+    # ── Step 2: Store name from visible page elements ────────────────────────
+    store_name_selectors = [
+        '[class*="store-header--storeName"]',
+        '[class*="shopName"]',
+        '[class*="shop-name"]',
+        '[class*="sellerName"]',
+        '[class*="StoreName"]',
+        'a[href*="/store/"] span',
+        '[class*="store-info"] h3',
+        '[class*="storeInfo"] h3',
+    ]
+    for sel in store_name_selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0:
+                text = el.inner_text().strip()
+                if text and 2 < len(text) < 100:
+                    seller['store_name'] = text
+                    print(f"[scraper]    ✅ Store name: {text}")
+                    break
+        except Exception:
+            continue
+
+    # ── Step 3: Click the store info trigger ────────────────────────────────
+    # EU pages show a "Trader" badge (required by DSA law) instead of store name.
+    # Non-EU pages show the store name as a clickable link.
+    click_selectors = [
+        # EU DSA "Trader" badge (Poland/EU pages)
+        'span:text("Trader")',
+        'span:text("Verkäufer")',      # German "Trader"
+        'span:text("Vendeur")',        # French "Trader"
+        'span:text("Venditore")',      # Italian "Trader"
+        '[class*="trader"]',
+        '[class*="Trader"]',
+        # Standard (non-EU) — store header link
+        '[class*="store-header"]',
+        '[class*="shopHeader"]',
+        # Universal fallback
+        'a[href*="/store/"]',
+        '[class*="sellerInfo"]',
+        '[class*="seller-info"]',
+        '[class*="storeScore"]',
+    ]
+
+    popup_opened = False
+    for sel in click_selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0 and el.is_visible(timeout=2000):
+                el.click(timeout=3000)
+                page.wait_for_timeout(2500)
+                print(f"[scraper]    ✅ Clicked: {sel}")
+                popup_opened = True
+                break
+        except Exception:
+            continue
+
+    if not popup_opened:
+        print("[scraper]    ⚠️  Could not open seller popup")
+
+    # ── Step 4: Parse seller info table ─────────────────────────────────────
+    info_container_selectors = [
+        '[class*="storeInfo"]',
+        '[class*="store-detail"]',
+        '[class*="shopInfo"]',
+        # EU DSA Trader popup has different container class names
+        '[class*="traderInfo"]',
+        '[class*="trader-info"]',
+        '[class*="sellerDetail"]',
+    ]
+
+    for container_sel in info_container_selectors:
+        try:
+            container = page.locator(container_sel).first
+            if container.count() > 0:
+                print(f"[scraper]    ✅ Info container: {container_sel}")
+                rows = container.locator('table tr').all()
+
+                if not rows:
+                    # EU Trader popup may use dl/dt/dd instead of table
+                    rows_dl = container.locator('dl').all()
+                    if rows_dl:
+                        dts = container.locator('dt').all()
+                        dds = container.locator('dd').all()
+                        for dt, dd in zip(dts, dds):
+                            key   = dt.inner_text().strip().lower().rstrip(':')
+                            value = dd.inner_text().strip()
+                            _map_seller_label(key, value, seller)
+                        break
+
+                for row in rows:
+                    try:
+                        cells = row.locator('td').all()
+                        if len(cells) >= 2:
+                            key   = cells[0].inner_text().strip().lower().rstrip(':')
+                            value = cells[1].inner_text().strip()
+                            print(f"[scraper]       [{key}] = [{value}]")
+                            _map_seller_label(key, value, seller)
+                    except Exception:
+                        continue
+                break
+        except Exception:
+            continue
+
+    # ── Step 5: Parse rating table ───────────────────────────────────────────
+    rating_container_selectors = [
+        '[class*="storeRating"]',
+        '[class*="shopRating"]',
+        '[class*="sellerRating"]',
+    ]
+
+    for container_sel in rating_container_selectors:
+        try:
+            container = page.locator(container_sel).first
+            if container.count() > 0:
+                print(f"[scraper]    ✅ Rating container: {container_sel}")
+                for row in container.locator('table tr').all():
+                    try:
+                        cells = row.locator('td').all()
+                        if len(cells) >= 2:
+                            key  = cells[0].inner_text().strip().lower()
+                            b_el = cells[1].locator('b').first
+                            raw_val = (b_el.inner_text().strip()
+                                       if b_el.count() > 0
+                                       else cells[1].inner_text().strip())
+                            num_m = re.search(r'[\d.]+', raw_val)
+                            value = num_m.group(0) if num_m else raw_val
+                            print(f"[scraper]       rating [{key}] = [{value}]")
+                            if any(k in key for k in ['item', 'described', 'produit', 'articulo']):
+                                seller['seller_rating'] = value
+                            elif any(k in key for k in ['communic', 'contact', 'kommunik']):
+                                seller['seller_communication'] = value
+                            elif any(k in key for k in ['ship', 'deliver', 'livr', 'envio', 'versand']):
+                                seller['seller_shipping_speed'] = value
+                    except Exception:
+                        continue
+                break
+        except Exception:
+            continue
+
+    # ── Step 6: Save debug HTML if nothing was found ─────────────────────────
+    if not seller.get('store_name') and not seller.get('seller_rating'):
+        print("[scraper]    ⚠️  Popup yielded no data — saving debug HTML")
+        try:
+            with open('/tmp/seller_popup_debug.html', 'w', encoding='utf-8') as f:
+                f.write(page.content())
+            print("[scraper]    💾 /tmp/seller_popup_debug.html")
+        except Exception:
+            pass
+
+    return {k: v for k, v in seller.items() if v}
+
+
+def _map_seller_label(key: str, value: str, seller: dict):
+    """Map a label→value pair to the correct seller field. Supports multiple languages."""
+    if not value:
+        return
+    # Store name
+    if any(k in key for k in ['name', 'store name', 'nom', 'nombre', 'naam', 'nome']):
+        seller.setdefault('store_name', value)
+    # Store ID
+    elif any(k in key for k in ['id', 'no.', 'number', 'store id', 'numero', 'nr']):
+        if re.match(r'^\d+$', value.strip()):
+            seller.setdefault('store_id', value.strip())
+            seller.setdefault('store_url', f"https://www.aliexpress.com/store/{value.strip()}")
+    # Country
+    elif any(k in key for k in ['location', 'country', 'pays', 'pais', 'land', 'paese', 'kraj']):
+        seller.setdefault('seller_country', value.strip())
+    # Open date
+    elif any(k in key for k in ['open', 'since', 'date', 'ouvert', 'abierto', 'geöffnet', 'aperto']):
+        seller.setdefault('store_open_date', value)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BROWSER SCRAPE FUNCTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_eu_page(url: str, html: str) -> bool:
+    """
+    Detect if the loaded page is an EU-regulated page.
+    EU pages have GDPR banners, Trader badges, and different structure.
+    """
+    eu_indicators = [
+        'gdpr', 'cookie-consent', 'Trader', 'DSA', 'digital-services',
+        'de.aliexpress.com', 'fr.aliexpress.com', 'it.aliexpress.com',
+        'es.aliexpress.com', 'nl.aliexpress.com',
+    ]
+    check_str = url + html[:5000]
+    return any(indicator in check_str for indicator in eu_indicators)
+
+
+def _scrape_in_thread(url: str) -> dict:
+    captured = []
+    html     = ''
+    seller   = {}
+
+    ua = random.choice(USER_AGENTS)
+    print(f"[scraper] 🕵️  UA: {ua[:65]}...")
+
+    try:
+        with Camoufox(headless=True, os='windows') as browser:
+            context = browser.new_context(
+                viewport={'width': 1366, 'height': 900},
+                locale='en-US',
+                user_agent=ua,
+                extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'}
+            )
             page = context.new_page()
-            
-            # Intercept network requests to capture API responses
+
             def handle_response(response):
                 try:
-                    # Check for regional API endpoints
-                    all_endpoints = REGIONAL_API_ENDPOINTS["default"] + REGIONAL_API_ENDPOINTS["EU"]
-                    
-                    for endpoint in all_endpoints:
-                        if endpoint in response.url:
-                            if response.status == 200:
-                                text = response.text()
-                                if len(text) > 100:  # Only capture substantial responses
-                                    parsed = parse_pdp_response(text, region)
-                                    if parsed and 'title' in parsed:
-                                        captured_data.update(parsed)
-                                        logger.info(f"Captured API response from {endpoint}")
-                            break
-                except Exception as e:
-                    logger.error(f"Error handling response: {e}")
-            
-            page.on("response", handle_response)
-            
-            try:
-                page.goto(url, wait_until='networkidle', timeout=TIMEOUT * 1000)
-                
-                # Scroll to trigger lazy loading
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                page.wait_for_timeout(2000)
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(2000)
-                
-                html_content = page.content()
-                
-            except Exception as e:
-                logger.error(f"Playwright navigation error: {e}")
-            
-            browser.close()
-    except ImportError:
-        logger.error("Playwright not available")
-        return _scrape_with_requests(url)
-    
-    return {
-        'captured': captured_data,
-        'html': html_content
-    }
+                    url_str = response.url
+                    if ('mtop.aliexpress.pdp.pc.query' in url_str or
+                            'mtop.aliexpress.itemdetail' in url_str):
+                        body = response.body()
+                        if len(body) < 5000:
+                            return
+                        text = body.decode('utf-8', errors='replace')
+                        if any(x in text for x in ['titleModule', 'storeModule',
+                                                    'PRODUCT_PROP_PC', 'SHOP_CARD_PC',
+                                                    'imageModule', 'descriptionModule']):
+                            captured.append(text)
+                            print(f"[scraper] 📡 Captured API ({len(text):,} bytes)")
+                except Exception:
+                    pass
 
-def _scrape_with_requests(url: str) -> Dict[str, Any]:
-    """Fallback scraping using requests library"""
-    logger.info(f"Using requests fallback for: {url}")
-    
-    try:
-        headers = {'User-Agent': get_random_user_agent()}
-        response = requests.get(url, headers=headers, timeout=TIMEOUT)
-        response.raise_for_status()
-        
-        return {
-            'captured': {},
-            'html': response.text
-        }
+            page.on('response', handle_response)
+            page.goto(url, timeout=90_000, wait_until='domcontentloaded')
+            page.wait_for_timeout(random.randint(4000, 6000))
+
+            # ── Detect if page is EU-regulated ───────────────────────────────
+            current_url = page.url
+            page_html_snippet = page.content()[:5000]
+            is_eu = _detect_eu_page(current_url, page_html_snippet)
+
+            if is_eu:
+                print("[scraper] 🇪🇺 EU page detected — dismissing GDPR banner...")
+                _dismiss_gdpr_banner(page)
+                page.wait_for_timeout(1000)
+
+            # Simulate human scrolling
+            for _ in range(5):
+                page.mouse.wheel(0, random.randint(300, 700))
+                page.wait_for_timeout(random.randint(500, 1000))
+            page.wait_for_timeout(2000)
+
+            # ── Extract seller from popup ─────────────────────────────────────
+            print("[scraper] 🏪 Extracting seller info...")
+            seller = _extract_seller_from_popup(page, is_eu_page=is_eu)
+            print(f"[scraper]    DOM seller: {seller}")
+
+            html = page.content()
+            page.close()
+            context.close()
+
     except Exception as e:
-        logger.error(f"Requests fallback failed: {e}")
-        return {'captured': {}, 'html': ''}
+        print(f'[scraper] ❌ Browser error: {e}')
+        import traceback
+        traceback.print_exc()
 
-def get_product_info(url: str) -> Optional[Dict[str, Any]]:
-    """Get comprehensive product information with region support"""
-    
-    # Ensure region is in URL
-    if 'shipFromCountry=' not in url:
-        region = get_region_from_url(url)
-        url = add_region_to_url(url, region)
-    
-    region = get_region_from_url(url)
-    logger.info(f"Getting product info for region {region}")
-    
-    result = {}
-    
-    # Try scraping with Playwright or requests
-    scrape_result = _scrape_with_playwright(url)
-    
-    # Use captured API data if available
-    if scrape_result['captured']:
-        result.update(scrape_result['captured'])
-        logger.info("Using captured API data")
-    
-    # If no title from API, try fallback parsing
-    if not result.get('title'):
-        logger.info("No title from API, trying fallbacks...")
-        
-        # Try _init_data_ parsing
-        init_data = _parse_init_data(scrape_result['html'])
-        if init_data.get('title'):
-            result.update(init_data)
-            logger.info("Got title from _init_data_")
-        
-        # If still no title, try EU fallback
-        if not result.get('title') and region in ["PL", "DE", "FR"]:
-            logger.info("Trying EU fallback parsing...")
-            eu_fallback = _parse_eu_fallback(scrape_result['html'], url)
-            if eu_fallback.get('title'):
-                result.update(eu_fallback)
-                logger.info("Got title from EU fallback")
-        
-        # Final fallback to meta tags
-        if not result.get('title'):
-            title_match = re.search(r'<title>([^<]+)</title>', scrape_result['html'], re.IGNORECASE)
-            if title_match:
-                result['title'] = title_match.group(1).split(' - ')[0]
-                logger.info("Got title from og:meta")
-    
-    # Fetch description if we have URL
-    if result.get('description_url'):
-        logger.info("Fetching description...")
-        result['description'] = fetch_description(result['description_url'])
-    
-    # Ensure all expected fields exist
-    defaults = {
-        'title': '',
-        'price': {'price': 0.0, 'currency': 'USD'},
-        'original_price': 0.0,
-        'discount': 0,
-        'seller': '',
-        'seller_id': '',
-        'seller_rating': 0,
-        'seller_reviews': 0,
-        'rating': 0,
-        'reviews': 0,
-        'orders': 0,
-        'specifications': [],
-        'images': [],
-        'bullet_points': [],
-        'description': '',
-        'description_url': '',
-        'region': region
-    }
-    
-    # Apply defaults
-    for key, default_value in defaults.items():
-        if key not in result:
-            result[key] = default_value
-    
-    # Ensure image fields exist
-    for i in range(1, 21):
-        key = f'image_{i}'
-        if key not in result:
-            result[key] = ''
-    
-    # Fill image fields from images list
-    if result['images'] and isinstance(result['images'], list):
-        for i, img in enumerate(result['images'][:20], 1):
-            result[f'image_{i}'] = str(img)
-    
-    logger.info(f"Final result for region {region}: {result.get('title', 'No title')}")
-    return result
+    return {'captured': captured, 'html': html, 'seller': seller}
 
-# Test function
-def test_regions():
-    """Test scraper with different regions"""
-    test_urls = [
-        "https://www.aliexpress.com/item/1005010089125608.html?shipFromCountry=PK",
-        "https://www.aliexpress.com/item/1005010089125608.html?shipFromCountry=PL"
-    ]
-    
-    results = {}
-    
-    for url in test_urls:
-        region = get_region_from_url(url)
-        logger.info(f"Testing region: {region}")
-        
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RETRY WRAPPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scrape_with_retry(url: str) -> dict:
+    best_result = {'captured': [], 'html': '', 'seller': {}}
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        print(f"\n[scraper] 🔄 Attempt {attempt}/{MAX_RETRIES}")
+        attempt_url = _get_rotated_url(url)
+
+        if attempt > 1:
+            delay = random.uniform(3, 8)
+            print(f"[scraper] ⏳ Back-off {delay:.1f}s...")
+            time.sleep(delay)
+
         try:
-            result = get_product_info(url)
-            if result:
-                results[region] = {
-                    'success': True,
-                    'title': result.get('title', 'No title'),
-                    'price': result.get('price', {}),
-                    'seller': result.get('seller', 'No seller'),
-                    'images_count': len(result.get('images', [])),
-                    'specs_count': len(result.get('specifications', [])),
-                    'error': None
-                }
-                logger.info(f"✓ {region}: {result.get('title', 'No title')}")
-            else:
-                results[region] = {
-                    'success': False,
-                    'error': 'No result returned'
-                }
-                logger.error(f"✗ {region}: No result")
-                
-        except Exception as e:
-            results[region] = {
-                'success': False,
-                'error': str(e)
-            }
-            logger.error(f"✗ {region}: {e}")
-    
-    return results
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(_scrape_in_thread, attempt_url)
+                result = future.result(timeout=180)
 
-if __name__ == "__main__":
-    # Test with both regions
-    logger.info("Testing AliExpress scraper with Pakistan and Poland regions...")
-    
-    test_results = test_regions()
-    
-    print("\n=== Test Results ===")
-    for region, result in test_results.items():
-        print(f"\n{region} ({REGIONS.get(region, 'Unknown')}):")
-        if result['success']:
-            print(f"  Title: {result['title']}")
-            print(f"  Price: {result['price']}")
-            print(f"  Seller: {result['seller']}")
-            print(f"  Images: {result['images_count']}")
-            print(f"  Specs: {result['specs_count']}")
-        else:
-            print(f"  Error: {result['error']}")
-    
-    # Test individual URL
+            for text in sorted(result['captured'], key=len, reverse=True):
+                parsed = parse_pdp_response(text)
+                if parsed and parsed.get('title'):
+                    print(f"[scraper] ✅ Success on attempt {attempt}")
+                    return result
+
+            if len(result['captured']) >= len(best_result['captured']):
+                best_result = result
+            print(f"[scraper] ⚠️  Attempt {attempt}: no title found")
+
+        except Exception as e:
+            print(f"[scraper] ❌ Attempt {attempt} error: {e}")
+
+    print(f"[scraper] ⚠️  All {MAX_RETRIES} attempts done")
+    return best_result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN PUBLIC FUNCTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_product_info(url: str) -> dict | None:
+    print(f"[scraper] Starting: {url}")
+    data = _scrape_with_retry(url)
+
+    extracted = {}
+
+    # Parse API responses
+    for text in sorted(data['captured'], key=len, reverse=True):
+        parsed = parse_pdp_response(text)
+        if parsed:
+            for k, v in parsed.items():
+                if v and k not in extracted:
+                    extracted[k] = v
+            if extracted.get('title'):
+                break
+
+    # Fallback: init_data from HTML
+    if not extracted.get('title') and data['html']:
+        print("[scraper] 🔍 Trying init_data fallback...")
+        for k, v in _parse_init_data(data['html']).items():
+            if v and k not in extracted:
+                extracted[k] = v
+
+    # Fallback: og:title
+    if not extracted.get('title') and data['html']:
+        m = re.search(
+            r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']{5,200})["\']',
+            data['html']
+        )
+        if m:
+            extracted['title'] = m.group(1).strip()
+
+    # Fallback: images from HTML
+    if not extracted.get('image_1') and data['html']:
+        m = re.search(r'"imagePathList"\s*:\s*(\[[^\]]{10,}\])', data['html'])
+        if m:
+            try:
+                urls = json.loads(m.group(1))
+                for idx, img_url in enumerate(urls[:20], 1):
+                    if img_url and not extracted.get(f'image_{idx}'):
+                        extracted[f'image_{idx}'] = img_url
+            except Exception:
+                pass
+
+    # Fetch description
+    desc_url = extracted.pop('_description_url', '')
+    if desc_url and not extracted.get('description'):
+        print(f"[scraper] 📄 Fetching description...")
+        extracted['description'] = fetch_description(desc_url)
+        if extracted['description']:
+            print(f"[scraper] ✅ Description: {len(extracted['description'])} chars")
+
+    # Merge DOM seller (fills gaps)
+    for k, v in data.get('seller', {}).items():
+        if v and not extracted.get(k):
+            extracted[k] = v
+            print(f"[scraper]    ✅ Seller from DOM: {k} = {v}")
+
+    # Summary
+    print(f"[scraper] ═══════════════════════════════")
+    print(f"[scraper] Title:       {str(extracted.get('title',''))[:70]}")
+    print(f"[scraper] Description: {len(extracted.get('description',''))} chars")
+    print(f"[scraper] Seller:      {[k for k in ['store_name','store_id','seller_rating','seller_country'] if extracted.get(k)]}")
+    print(f"[scraper] Specs:       {[k for k in ['brand','color','material','warranty','certifications'] if extracted.get(k)]}")
+    print(f"[scraper] Images:      {sum(1 for i in range(1,21) if extracted.get(f'image_{i}'))}")
+    print(f"[scraper] ═══════════════════════════════")
+
+    # Apply defaults
+    defaults = {
+        'description': '', 'brand': '', 'color': '', 'dimensions': '',
+        'weight': '', 'material': '', 'certifications': '',
+        'country_of_origin': '', 'warranty': '', 'product_type': '',
+        'shipping': '', 'price': '', 'rating': '', 'reviews': '',
+        'bullet_points': [], 'age_from': '', 'age_to': '',
+        'gender': '', 'safety_warning': '',
+        'store_name': '', 'store_id': '', 'store_url': '',
+        'seller_id': '', 'seller_positive_rate': '', 'seller_rating': '',
+        'seller_communication': '', 'seller_shipping_speed': '',
+        'seller_country': '', 'store_open_date': '', 'seller_level': '',
+        'seller_total_reviews': '', 'seller_positive_num': '', 'is_top_rated': '',
+    }
+    for key, default in defaults.items():
+        if key not in extracted or not extracted[key]:
+            extracted[key] = default
+
+    for i in range(1, 21):
+        extracted.setdefault(f'image_{i}', '')
+
+    return extracted if extracted.get('title') else None
+
+
+if __name__ == '__main__':
     test_url = "https://www.aliexpress.com/item/1005010089125608.html"
-    logger.info(f"\nTesting individual URL: {test_url}")
-    
-    # Test Pakistan
-    pk_url = add_region_to_url(test_url, "PK")
-    pk_result = get_product_info(pk_url)
-    
-    if pk_result:
-        print(f"\nPakistan Result:")
-        print(f"Title: {pk_result.get('title', 'N/A')}")
-        print(f"Price: {pk_result.get('price', {}).get('price', 'N/A')}")
-        print(f"Seller: {pk_result.get('seller', 'N/A')}")
-        print(f"Images: {len(pk_result.get('images', []))}")
-    
-    # Test Poland
-    pl_url = add_region_to_url(test_url, "PL")
-    pl_result = get_product_info(pl_url)
-    
-    if pl_result:
-        print(f"\nPoland Result:")
-        print(f"Title: {pl_result.get('title', 'N/A')}")
-        print(f"Price: {pl_result.get('price', {}).get('price', 'N/A')}")
-        print(f"Seller: {pl_result.get('seller', 'N/A')}")
-        print(f"Images: {len(pl_result.get('images', []))}")
-    
-    print("\nScraping complete!")
+    result   = get_product_info(test_url)
+    if result:
+        print("\n" + "=" * 80)
+        for k, v in sorted(result.items()):
+            if not k.startswith('image_'):
+                val = str(v)
+                print(f"{k:28}: {val[:100]}{'...' if len(val) > 100 else ''}")
+    else:
+        print("❌ No result extracted")
