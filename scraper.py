@@ -297,7 +297,7 @@ def _scrape_in_thread(url: str) -> dict:
     seller = {}
 
     try:
-        with Camoufox() as browser:
+        with Camoufox(headless=True) as browser:
             context = browser.new_context(
                 user_agent=random.choice(USER_AGENTS),
                 viewport={'width': 1440, 'height': 900},
