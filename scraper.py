@@ -382,39 +382,30 @@ def _dismiss_gdpr_banner(page) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_seller_from_popup(page, is_eu_page: bool = False) -> dict:
-    """
-    Extract seller info from the store popup.
-    Handles both standard and EU DSA "Trader" popup structures.
-    """
+    """Extract seller info from popup — now works on Polish/EU pages too."""
     seller = {}
 
-    # ── Step 1: Store ID + URL from links (no click needed) ─────────────────
+    # Step 1: Store ID + URL from any store link (works everywhere)
     try:
-        links = page.locator('a[href*="/store/"]').all()
-        for link in links[:5]:
+        for link in page.locator('a[href*="/store/"]').all()[:5]:
             href = link.get_attribute('href') or ''
             if '/store/' in href:
-                if href.startswith('//'):
-                    href = 'https:' + href
+                if href.startswith('//'): href = 'https:' + href
                 m = re.search(r'/store/(\d+)', href)
                 if m:
-                    seller['store_id']  = m.group(1)
+                    seller['store_id'] = m.group(1)
                     seller['store_url'] = f"https://www.aliexpress.com/store/{m.group(1)}"
-                    print(f"[scraper]    ✅ Store ID: {m.group(1)}")
+                    print(f"[scraper] ✅ Store ID found: {m.group(1)}")
                     break
-    except Exception as e:
-        print(f"[scraper]    ⚠️  Store link error: {e}")
+    except Exception:
+        pass
 
-    # ── Step 2: Store name from visible page elements ────────────────────────
+    # Step 2: Store name (works on both normal and EU pages)
     store_name_selectors = [
-        '[class*="store-header--storeName"]',
-        '[class*="shopName"]',
-        '[class*="shop-name"]',
-        '[class*="sellerName"]',
-        '[class*="StoreName"]',
-        'a[href*="/store/"] span',
-        '[class*="store-info"] h3',
-        '[class*="storeInfo"] h3',
+        '[class*="store-header--storeName"]', '[class*="shopName"]',
+        '[class*="shop-name"]', '[class*="sellerName"]', '[class*="StoreName"]',
+        'a[href*="/store/"] span', '[class*="store-info"] h3', '[class*="storeInfo"] h3',
+        'span:text("Trader")', 'span:text("Sprzedawca")'  # Polish Trader badge
     ]
     for sel in store_name_selectors:
         try:
@@ -423,129 +414,80 @@ def _extract_seller_from_popup(page, is_eu_page: bool = False) -> dict:
                 text = el.inner_text().strip()
                 if text and 2 < len(text) < 100:
                     seller['store_name'] = text
-                    print(f"[scraper]    ✅ Store name: {text}")
+                    print(f"[scraper] ✅ Store name: {text}")
                     break
         except Exception:
             continue
 
-    # ── Step 3: Click the store info trigger ────────────────────────────────
-    # EU pages show a "Trader" badge (required by DSA law) instead of store name.
-    # Non-EU pages show the store name as a clickable link.
+    # Step 3: Click the seller / Trader trigger
     click_selectors = [
-        # EU DSA "Trader" badge (Poland/EU pages)
-        'span:text("Trader")',
-        'span:text("Verkäufer")',      # German "Trader"
-        'span:text("Vendeur")',        # French "Trader"
-        'span:text("Venditore")',      # Italian "Trader"
-        '[class*="trader"]',
-        '[class*="Trader"]',
-        # Standard (non-EU) — store header link
-        '[class*="store-header"]',
-        '[class*="shopHeader"]',
-        # Universal fallback
-        'a[href*="/store/"]',
-        '[class*="sellerInfo"]',
-        '[class*="seller-info"]',
-        '[class*="storeScore"]',
+        'span:text("Trader")', 'span:text("Sprzedawca")', 'span:text("Verkäufer")',
+        'span:text("Vendeur")', 'span:text("Venditore")', '[class*="trader"]',
+        '[class*="Trader"]', '[class*="store-header"]', '[class*="shopHeader"]',
+        'a[href*="/store/"]', '[class*="sellerInfo"]', '[class*="seller-info"]'
     ]
-
-    popup_opened = False
     for sel in click_selectors:
         try:
             el = page.locator(sel).first
-            if el.count() > 0 and el.is_visible(timeout=2000):
-                el.click(timeout=3000)
+            if el.count() > 0 and el.is_visible(timeout=3000):
+                el.click(timeout=4000)
                 page.wait_for_timeout(2500)
-                print(f"[scraper]    ✅ Clicked: {sel}")
-                popup_opened = True
+                print(f"[scraper] ✅ Clicked seller/Trader: {sel}")
                 break
         except Exception:
             continue
 
-    if not popup_opened:
-        print("[scraper]    ⚠️  Could not open seller popup")
-
-    # ── Step 4: Parse seller info table ─────────────────────────────────────
-    info_container_selectors = [
-        '[class*="storeInfo"]',
-        '[class*="store-detail"]',
-        '[class*="shopInfo"]',
-        # EU DSA Trader popup has different container class names
-        '[class*="traderInfo"]',
-        '[class*="trader-info"]',
-        '[class*="sellerDetail"]',
-    ]
-
-    for container_sel in info_container_selectors:
+    # Step 4: Parse seller info (handles both table and dl/dt/dd used in EU)
+    info_selectors = ['[class*="storeInfo"]', '[class*="store-detail"]', '[class*="shopInfo"]',
+                      '[class*="traderInfo"]', '[class*="trader-info"]', '[class*="sellerDetail"]']
+    for container_sel in info_selectors:
         try:
             container = page.locator(container_sel).first
-            if container.count() > 0:
-                print(f"[scraper]    ✅ Info container: {container_sel}")
-                rows = container.locator('table tr').all()
+            if container.count() == 0: continue
 
-                if not rows:
-                    # EU Trader popup may use dl/dt/dd instead of table
-                    rows_dl = container.locator('dl').all()
-                    if rows_dl:
-                        dts = container.locator('dt').all()
-                        dds = container.locator('dd').all()
-                        for dt, dd in zip(dts, dds):
-                            key   = dt.inner_text().strip().lower().rstrip(':')
-                            value = dd.inner_text().strip()
-                            _map_seller_label(key, value, seller)
-                        break
-
-                for row in rows:
-                    try:
-                        cells = row.locator('td').all()
-                        if len(cells) >= 2:
-                            key   = cells[0].inner_text().strip().lower().rstrip(':')
-                            value = cells[1].inner_text().strip()
-                            print(f"[scraper]       [{key}] = [{value}]")
-                            _map_seller_label(key, value, seller)
-                    except Exception:
-                        continue
+            # EU pages often use <dl><dt><dd>
+            dts = container.locator('dt').all()
+            if dts:
+                dds = container.locator('dd').all()
+                for dt, dd in zip(dts, dds):
+                    key = dt.inner_text().strip().lower().rstrip(':')
+                    value = dd.inner_text().strip()
+                    _map_seller_label(key, value, seller)
                 break
+
+            # Normal table structure
+            for row in container.locator('table tr').all():
+                cells = row.locator('td').all()
+                if len(cells) >= 2:
+                    key = cells[0].inner_text().strip().lower().rstrip(':')
+                    value = cells[1].inner_text().strip()
+                    _map_seller_label(key, value, seller)
+            break
         except Exception:
             continue
 
-    # ── Step 5: Parse rating table ───────────────────────────────────────────
-    rating_container_selectors = [
-        '[class*="storeRating"]',
-        '[class*="shopRating"]',
-        '[class*="sellerRating"]',
-    ]
-
-    for container_sel in rating_container_selectors:
+    # Step 5: Parse rating table (works in Polish too)
+    for container_sel in ['[class*="storeRating"]', '[class*="shopRating"]', '[class*="sellerRating"]']:
         try:
             container = page.locator(container_sel).first
-            if container.count() > 0:
-                print(f"[scraper]    ✅ Rating container: {container_sel}")
-                for row in container.locator('table tr').all():
-                    try:
-                        cells = row.locator('td').all()
-                        if len(cells) >= 2:
-                            key  = cells[0].inner_text().strip().lower()
-                            b_el = cells[1].locator('b').first
-                            raw_val = (b_el.inner_text().strip()
-                                       if b_el.count() > 0
-                                       else cells[1].inner_text().strip())
-                            num_m = re.search(r'[\d.]+', raw_val)
-                            value = num_m.group(0) if num_m else raw_val
-                            print(f"[scraper]       rating [{key}] = [{value}]")
-                            if any(k in key for k in ['item', 'described', 'produit', 'articulo']):
-                                seller['seller_rating'] = value
-                            elif any(k in key for k in ['communic', 'contact', 'kommunik']):
-                                seller['seller_communication'] = value
-                            elif any(k in key for k in ['ship', 'deliver', 'livr', 'envio', 'versand']):
-                                seller['seller_shipping_speed'] = value
-                    except Exception:
-                        continue
-                break
+            if container.count() == 0: continue
+            for row in container.locator('table tr').all():
+                cells = row.locator('td').all()
+                if len(cells) >= 2:
+                    key = cells[0].inner_text().strip().lower()
+                    val = cells[1].inner_text().strip()
+                    num = re.search(r'[\d.]+', val)
+                    value = num.group(0) if num else val
+                    if any(k in key for k in ['item', 'described', 'produit', 'articulo', 'przedmiot']):
+                        seller['seller_rating'] = value
+                    elif any(k in key for k in ['communic', 'contact', 'kommunik', 'komunikacja']):
+                        seller['seller_communication'] = value
+                    elif any(k in key for k in ['ship', 'deliver', 'livr', 'envio', 'versand', 'dostawa']):
+                        seller['seller_shipping_speed'] = value
         except Exception:
             continue
 
-    # ── Step 6: Save debug HTML if nothing was found ─────────────────────────
+    return {k: v for k, v in seller.items() if v}    # ── Step 6: Save debug HTML if nothing was found ─────────────────────────
     if not seller.get('store_name') and not seller.get('seller_rating'):
         print("[scraper]    ⚠️  Popup yielded no data — saving debug HTML")
         try:
@@ -576,6 +518,57 @@ def _map_seller_label(key: str, value: str, seller: dict):
     # Open date
     elif any(k in key for k in ['open', 'since', 'date', 'ouvert', 'abierto', 'geöffnet', 'aperto']):
         seller.setdefault('store_open_date', value)
+# ─────────────────────────────────────────────────────────────────────────────
+# BROWSER compiliance FUNCTION
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPLIANCE / MANUFACTURER INFO (EU DSA popup)
+# ─────────────────────────────────────────────────────────────────────────────
+def _extract_compliance_info(page) -> dict:
+    """Extract Product Compliance Information modal — works in English + Polish."""
+    compliance = {
+        "manufacturer_name": "", "manufacturer_address": "", "manufacturer_email": "",
+        "manufacturer_phone": "", "eu_responsible_name": "", "eu_responsible_address": "",
+        "eu_responsible_email": "", "eu_responsible_phone": "", "product_id_compliance": ""
+    }
+
+    try:
+        # Click the compliance link (supports both languages)
+        link = page.locator('text=/Product Compliance Information|Informacje o zgodności produktu|Compliance|Zgodności/i').first
+        if link.count() == 0:
+            link = page.locator('a[data-spm-anchor-id*="i7"], button:has-text("Compliance")').first
+
+        if link.count() > 0:
+            link.click(timeout=5000)
+            page.wait_for_selector('.comet-v2-modal-title, .comet-v2-modal', timeout=8000)
+            page.wait_for_timeout(1500)
+
+            modal_text = page.locator('.comet-v2-modal-content, .comet-v2-modal-body').inner_text()
+
+            patterns = {
+                "manufacturer_name": r'(Name|Imię i nazwisko|Dane producenta).*?[:：]\s*([^\n]+)',
+                "manufacturer_address": r'(Address|Adres).*?[:：]\s*([^\n]+(?:\n[^\n]+)*?)',
+                "manufacturer_email": r'(Email address|Adres e-mail).*?[:：]\s*([^\n]+)',
+                "manufacturer_phone": r'(Telephone number|Numer telefonu).*?[:：]\s*([^\n]+)',
+                "eu_responsible_name": r'(person responsible|odpowiedzialna osoba|EU).*?Name[:：]\s*([^\n]+)',
+                "eu_responsible_address": r'(person responsible|odpowiedzialna osoba|EU).*?Address[:：]\s*([^\n]+(?:\n[^\n]+)*?)',
+                "eu_responsible_email": r'(person responsible|odpowiedzialna osoba|EU).*?Email[:：]\s*([^\n]+)',
+                "eu_responsible_phone": r'(person responsible|odpowiedzialna osoba|EU).*?Telephone[:：]\s*([^\n]+)',
+                "product_id_compliance": r'Product ID.*?(\d+[-\d]+)'
+            }
+
+            for key, pat in patterns.items():
+                m = re.search(pat, modal_text, re.I | re.S)
+                if m:
+                    compliance[key] = m.group(2 if key != "product_id_compliance" else 1).strip()
+
+            print(f"[scraper] ✅ Compliance extracted: {len([v for v in compliance.values() if v])} fields")
+            # Close modal
+            page.locator('.comet-v2-modal-close, button:has-text("Close")').first.click(timeout=2000).catch(lambda: None)
+    except Exception as e:
+        print(f"[scraper] ⚠️ Compliance modal failed (non-critical): {e}")
+
+    return compliance
 
 
 # ─────────────────────────────────────────────────────────────────────────────
