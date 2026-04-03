@@ -12,8 +12,19 @@ import logging
 import requests
 from typing import Dict, Optional, List, Any
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-from playwright.sync_api import sync_playwright
-from bs4 import BeautifulSoup
+
+# Try to import optional dependencies
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -23,58 +34,26 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2
 TIMEOUT = 30
 
-# Supported regions with their country codes
+# Supported regions
 REGIONS = {
-    "US": "United States",
-    "GB": "United Kingdom", 
-    "DE": "Germany",
-    "FR": "France",
-    "AE": "UAE",
-    "AU": "Australia",
-    "CA": "Canada",
-    "PK": "Pakistan",
-    "PL": "Poland"
+    "US": "United States", "GB": "United Kingdom", "DE": "Germany", "FR": "France",
+    "AE": "UAE", "AU": "Australia", "CA": "Canada", "PK": "Pakistan", "PL": "Poland"
 }
 
-# User agents for rotation
+# User agents
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
 ]
 
-# API endpoints that vary by region
+# API endpoints
 REGIONAL_API_ENDPOINTS = {
-    "default": [
-        "mtop.aliexpress.pdp.detail",
-        "mtop.aliexpress.product.detail",
-        "mtop.aliexpress.pdp.v2"
-    ],
-    "EU": [
-        "mtop.aliexpress.gdpr.product.detail",
-        "mtop.aliexpress.eu.pdp", 
-        "mtop.aliexpress.product.eu.detail",
-        "mtop.aliexpress.gdpr.pdp"
-    ]
+    "default": ["mtop.aliexpress.pdp.detail", "mtop.aliexpress.product.detail", "mtop.aliexpress.pdp.v2"],
+    "EU": ["mtop.aliexpress.gdpr.product.detail", "mtop.aliexpress.eu.pdp", "mtop.aliexpress.product.eu.detail"]
 }
 
-# Specification mapping
-SPEC_MAPPING = {
-    "brand": ["Brand Name", "Brand", "Manufacturer", "Marke", "Marka"],
-    "model": ["Model Number", "Model", "Model No.", "Modell", "Model"],
-    "color": ["Color", "Colour", "Farbe", "Kolor", "Kleur"],
-    "size": ["Size", "Dimensions", "Dimension", "Größe", "Rozmiar"],
-    "material": ["Material", "Materials", "Materialien", "Materiał"],
-    "weight": ["Weight", "Net Weight", "Gewicht", "Waga"],
-    "warranty": ["Warranty", "Guarantee", "Garantie", "Gwarancja"],
-    "origin": ["Origin", "Country of Origin", "Herkunft", "Kraj pochodzenia"],
-    "certification": ["Certification", "Certifications", "Zertifizierung", "Certyfikaty"],
-    "product_type": ["Type", "Product Type", "Typ", "Typ produktu"]
-}
-
-# Fields that exist in EU responses
+# EU field mappings
 EU_FIELD_MAPPINGS = {
     "title": ["subject", "title", "productTitle", "euProductName", "gdprProductName"],
     "price": ["price", "salePrice", "euPrice", "gdprPrice"],
@@ -85,7 +64,6 @@ EU_FIELD_MAPPINGS = {
     "rating": ["averageStarRate", "rating", "euRating"],
     "reviews": ["reviewCount", "reviews", "euReviewCount"],
     "orders": ["orders", "tradeCount", "euOrders"],
-    "shipping": ["shipping", "freight", "euShipping"],
     "specifications": ["productPropDtos", "specifications", "euProductSpecs", "gdprSpecifications"],
     "images": ["images", "imagePathList", "euImagePathList", "gdprImages"],
     "description_url": ["descriptionUrl", "description", "euDescriptionUrl", "gdprDescriptionUrl"],
@@ -102,18 +80,13 @@ def get_region_from_url(url: str) -> str:
         if region in REGIONS:
             return region
     
-    # Default to US for unknown regions
     return "US"
 
 def add_region_to_url(url: str, region: str) -> str:
     """Add or update region parameter in URL"""
     parsed = urlparse(url)
     query_params = parse_qs(parsed.query)
-    
-    # Update or add region
     query_params['shipFromCountry'] = [region.upper()]
-    
-    # Rebuild URL
     new_query = urlencode(query_params, doseq=True)
     return urlunparse(parsed._replace(query=new_query))
 
@@ -132,86 +105,22 @@ def extract_price(text: str) -> Dict[str, Any]:
     if not text:
         return {"price": 0.0, "currency": "USD"}
     
-    # Match price patterns
     price_match = re.search(r'(\d+(?:\.\d{1,2})?)', text.replace(',', ''))
     currency_match = re.search(r'([A-Z]{3}|\$|€|£|₹|PKR|PLN)', text)
     
     price = float(price_match.group(1)) if price_match else 0.0
     currency = currency_match.group(1) if currency_match else "USD"
     
-    # Normalize currency symbols
-    currency_map = {
-        '$': 'USD',
-        '€': 'EUR', 
-        '£': 'GBP',
-        '₹': 'INR',
-        'PKR': 'PKR',
-        'PLN': 'PLN'
-    }
+    currency_map = {'$': 'USD', '€': 'EUR', '£': 'GBP', '₹': 'INR', 'PKR': 'PKR', 'PLN': 'PLN'}
     currency = currency_map.get(currency, currency)
     
     return {"price": price, "currency": currency}
-
-def parse_pdp_response(text: str, region: str = "US") -> Dict[str, Any]:
-    """Parse PDP API response with region-specific handling"""
-    result = {}
-    
-    try:
-        # Remove JSONP wrapper if present
-        if text.startswith('(') and text.endswith(')'):
-            text = text[1:-1]
-        
-        data = json.loads(text)
-        
-        # Handle different response structures
-        if 'data' in data:
-            data = data['data']
-        
-        # Extract basic info with region-specific field mapping
-        result['title'] = _extract_field_with_fallback(data, EU_FIELD_MAPPINGS['title'])
-        result['price'] = _extract_price_with_fallback(data, EU_FIELD_MAPPINGS['price'], EU_FIELD_MAPPINGS['original_price'])
-        result['discount'] = _extract_field_with_fallback(data, EU_FIELD_MAPPINGS['discount'])
-        
-        # Extract seller info
-        seller_info = _extract_seller_info(data, region)
-        result.update(seller_info)
-        
-        # Extract specifications
-        specs = _extract_specifications(data, region)
-        result['specifications'] = specs
-        
-        # Extract images
-        images = _extract_images(data, region)
-        result['images'] = images
-        
-        # Extract description URL
-        desc_url = _extract_field_with_fallback(data, EU_FIELD_MAPPINGS['description_url'])
-        result['description_url'] = desc_url
-        
-        # Extract bullet points
-        bullets = _extract_bullet_points(data, region)
-        result['bullet_points'] = bullets
-        
-        # Extract rating and reviews
-        result['rating'] = _extract_field_with_fallback(data, EU_FIELD_MAPPINGS['rating'])
-        result['reviews'] = _extract_field_with_fallback(data, EU_FIELD_MAPPINGS['reviews'])
-        result['orders'] = _extract_field_with_fallback(data, EU_FIELD_MAPPINGS['orders'])
-        
-        logger.info(f"Parsed PDP response for region {region}: {len(result)} fields extracted")
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse JSON response for region {region}: {e}")
-    except Exception as e:
-        logger.error(f"Error parsing PDP response for region {region}: {e}")
-    
-    return result
 
 def _extract_field_with_fallback(data: Dict, field_names: List[str]) -> Any:
     """Extract field value trying multiple possible field names"""
     for field_name in field_names:
         if field_name in data:
             return data[field_name]
-        # Try nested paths
         if '.' in field_name:
             parts = field_name.split('.')
             current = data
@@ -227,21 +136,18 @@ def _extract_price_with_fallback(data: Dict, price_fields: List[str], original_p
     """Extract price information with fallback logic"""
     result = {"price": 0.0, "original_price": 0.0, "discount": 0, "currency": "USD"}
     
-    # Try to find price
     for field in price_fields:
         if field in data and data[field]:
             price_data = extract_price(str(data[field]))
             result.update(price_data)
             break
     
-    # Try to find original price
     for field in original_price_fields:
         if field in data and data[field]:
             orig_data = extract_price(str(data[field]))
             result["original_price"] = orig_data["price"]
             break
     
-    # Calculate discount if possible
     if result["price"] and result["original_price"] and result["original_price"] > result["price"]:
         result["discount"] = round((1 - result["price"] / result["original_price"]) * 100)
     
@@ -251,7 +157,6 @@ def _extract_seller_info(data: Dict, region: str) -> Dict[str, Any]:
     """Extract seller information with region-specific handling"""
     result = {}
     
-    # Try different seller field mappings
     seller_fields = EU_FIELD_MAPPINGS['seller']
     seller_id_fields = EU_FIELD_MAPPINGS['seller_id']
     
@@ -288,10 +193,7 @@ def _extract_specifications(data: Dict, region: str) -> List[Dict[str, str]]:
         if eu_specs:
             for spec in eu_specs:
                 if isinstance(spec, dict):
-                    specs.append({
-                        'name': spec.get('name', ''),
-                        'value': spec.get('value', '')
-                    })
+                    specs.append({'name': spec.get('name', ''), 'value': spec.get('value', '')})
             return specs
         
         # Try euProductSpecs
@@ -299,10 +201,7 @@ def _extract_specifications(data: Dict, region: str) -> List[Dict[str, str]]:
         if eu_product_specs:
             for spec in eu_product_specs:
                 if isinstance(spec, dict):
-                    specs.append({
-                        'name': spec.get('name', ''),
-                        'value': spec.get('value', '')
-                    })
+                    specs.append({'name': spec.get('name', ''), 'value': spec.get('value', '')})
             return specs
     
     # Standard specification extraction
@@ -399,6 +298,21 @@ def _parse_init_data(html: str) -> Dict[str, Any]:
 def _parse_eu_fallback(html: str, url: str) -> Dict[str, Any]:
     """Parse EU-specific page structure as fallback"""
     result = {}
+    
+    if not BS4_AVAILABLE:
+        logger.warning("BeautifulSoup4 not available, using regex fallback")
+        # Simple regex-based parsing without BeautifulSoup
+        title_match = re.search(r'<title>([^<]+)</title>', html, re.IGNORECASE)
+        if title_match:
+            result['title'] = title_match.group(1).split(' - ')[0].strip()
+        
+        price_match = re.search(r'\$(\d+(?:\.\d{1,2})?)', html)
+        if price_match:
+            result['price'] = {"price": float(price_match.group(1)), "currency": "USD"}
+        
+        return result
+    
+    # Use BeautifulSoup if available
     soup = BeautifulSoup(html, 'html.parser')
     
     # EU pages have different selectors
@@ -475,7 +389,12 @@ def fetch_description(url: str) -> str:
         response = requests.get(url, headers=headers, timeout=TIMEOUT)
         response.raise_for_status()
         
-        # Clean HTML
+        if not BS4_AVAILABLE:
+            # Simple text extraction without BeautifulSoup
+            text = re.sub(r'<[^>]+>', '', response.text)
+            return text[:3000] if len(text) > 3000 else text
+        
+        # Clean HTML with BeautifulSoup
         soup = BeautifulSoup(response.text, 'html.parser')
         
         # Remove script and style elements
@@ -499,62 +418,89 @@ def fetch_description(url: str) -> str:
 
 def _scrape_with_playwright(url: str) -> Dict[str, Any]:
     """Scrape using Playwright with region detection"""
+    if not PLAYWRIGHT_AVAILABLE:
+        logger.warning("Playwright not available, using requests fallback")
+        return _scrape_with_requests(url)
+    
     region = get_region_from_url(url)
     logger.info(f"Scraping URL for region {region}: {url}")
     
     captured_data = {}
     html_content = ""
     
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=get_random_user_agent(),
-            viewport={'width': 1920, 'height': 1080}
-        )
+    try:
+        from playwright.sync_api import sync_playwright
         
-        page = context.new_page()
-        
-        # Intercept network requests to capture API responses
-        def handle_response(response):
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=get_random_user_agent(),
+                viewport={'width': 1920, 'height': 1080}
+            )
+            
+            page = context.new_page()
+            
+            # Intercept network requests to capture API responses
+            def handle_response(response):
+                try:
+                    # Check for regional API endpoints
+                    all_endpoints = REGIONAL_API_ENDPOINTS["default"] + REGIONAL_API_ENDPOINTS["EU"]
+                    
+                    for endpoint in all_endpoints:
+                        if endpoint in response.url:
+                            if response.status == 200:
+                                text = response.text()
+                                if len(text) > 100:  # Only capture substantial responses
+                                    parsed = parse_pdp_response(text, region)
+                                    if parsed and 'title' in parsed:
+                                        captured_data.update(parsed)
+                                        logger.info(f"Captured API response from {endpoint}")
+                            break
+                except Exception as e:
+                    logger.error(f"Error handling response: {e}")
+            
+            page.on("response", handle_response)
+            
             try:
-                # Check for regional API endpoints
-                all_endpoints = REGIONAL_API_ENDPOINTS["default"] + REGIONAL_API_ENDPOINTS["EU"]
+                page.goto(url, wait_until='networkidle', timeout=TIMEOUT * 1000)
                 
-                for endpoint in all_endpoints:
-                    if endpoint in response.url:
-                        if response.status == 200:
-                            text = response.text()
-                            if len(text) > 100:  # Only capture substantial responses
-                                parsed = parse_pdp_response(text, region)
-                                if parsed and 'title' in parsed:
-                                    captured_data.update(parsed)
-                                    logger.info(f"Captured API response from {endpoint}")
-                        break
+                # Scroll to trigger lazy loading
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                page.wait_for_timeout(2000)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(2000)
+                
+                html_content = page.content()
+                
             except Exception as e:
-                logger.error(f"Error handling response: {e}")
-        
-        page.on("response", handle_response)
-        
-        try:
-            page.goto(url, wait_until='networkidle', timeout=TIMEOUT * 1000)
+                logger.error(f"Playwright navigation error: {e}")
             
-            # Scroll to trigger lazy loading
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-            page.wait_for_timeout(2000)
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(2000)
-            
-            html_content = page.content()
-            
-        except Exception as e:
-            logger.error(f"Playwright navigation error: {e}")
-        
-        browser.close()
+            browser.close()
+    except ImportError:
+        logger.error("Playwright not available")
+        return _scrape_with_requests(url)
     
     return {
         'captured': captured_data,
         'html': html_content
     }
+
+def _scrape_with_requests(url: str) -> Dict[str, Any]:
+    """Fallback scraping using requests library"""
+    logger.info(f"Using requests fallback for: {url}")
+    
+    try:
+        headers = {'User-Agent': get_random_user_agent()}
+        response = requests.get(url, headers=headers, timeout=TIMEOUT)
+        response.raise_for_status()
+        
+        return {
+            'captured': {},
+            'html': response.text
+        }
+    except Exception as e:
+        logger.error(f"Requests fallback failed: {e}")
+        return {'captured': {}, 'html': ''}
 
 def get_product_info(url: str) -> Optional[Dict[str, Any]]:
     """Get comprehensive product information with region support"""
@@ -569,7 +515,7 @@ def get_product_info(url: str) -> Optional[Dict[str, Any]]:
     
     result = {}
     
-    # Try scraping with Playwright
+    # Try scraping with Playwright or requests
     scrape_result = _scrape_with_playwright(url)
     
     # Use captured API data if available
@@ -597,10 +543,9 @@ def get_product_info(url: str) -> Optional[Dict[str, Any]]:
         
         # Final fallback to meta tags
         if not result.get('title'):
-            soup = BeautifulSoup(scrape_result['html'], 'html.parser')
-            og_title = soup.find('meta', property='og:title')
-            if og_title:
-                result['title'] = og_title.get('content', '').split(' - ')[0]
+            title_match = re.search(r'<title>([^<]+)</title>', scrape_result['html'], re.IGNORECASE)
+            if title_match:
+                result['title'] = title_match.group(1).split(' - ')[0]
                 logger.info("Got title from og:meta")
     
     # Fetch description if we have URL
