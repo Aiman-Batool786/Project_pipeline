@@ -625,6 +625,16 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
             # Extract seller from DOM (always)
             dom_seller = _extract_seller_from_dom(page)
 
+            # EU trader popup (if not found in DOM)
+           if not dom_seller.get('store_name'):
+           print("[scraper] 🏪 Trying Trader popup mode...")
+           popup_seller = _extract_seller_from_popup(page)
+           if popup_seller:
+         # Merge without overwriting DOM fields
+          for k, v in popup_seller.items():
+            dom_seller.setdefault(k, v)
+
+
             # Extract compliance (EU only)
             if try_compliance:
                 print("[scraper] 🔒 Extracting compliance info...")
