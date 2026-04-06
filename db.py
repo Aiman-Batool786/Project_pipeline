@@ -1,7 +1,5 @@
 """
-db.py - HYBRID APPROACH + SELLER INFO
-Complete schema with audit trail and seller information table.
-Seller info is stored as original — never LLM-enhanced.
+db.py - Complete schema with seller_info + compliance tables.
 """
 
 import sqlite3
@@ -11,13 +9,8 @@ DB_NAME = "products.db"
 
 
 def create_connection():
-    conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    return conn
+    return sqlite3.connect(DB_NAME, check_same_thread=False)
 
-
-# ─────────────────────────────────────────
-# CREATE ALL TABLES
-# ─────────────────────────────────────────
 
 def create_all_tables():
     conn   = create_connection()
@@ -33,63 +26,6 @@ def create_all_tables():
         category_id   INTEGER PRIMARY KEY,
         category_name TEXT,
         embedding     BLOB
-    )""")
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS original_content (
-        product_id  INTEGER PRIMARY KEY AUTOINCREMENT,
-        url         TEXT UNIQUE,
-        title       TEXT,
-        description TEXT,
-        image_url   TEXT
-    )""")
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS enhanced_content (
-        id                INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id        INTEGER UNIQUE,
-        title             TEXT,
-        description       TEXT,
-        bullet_points     TEXT,
-        html_description  TEXT,
-        brand             TEXT,
-        color             TEXT,
-        dimensions        TEXT,
-        weight            TEXT,
-        material          TEXT,
-        certifications    TEXT,
-        country_of_origin TEXT,
-        warranty          TEXT,
-        product_type      TEXT,
-        enhanced_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
-    )""")
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS category_assignments (
-        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id             INTEGER UNIQUE,
-        original_category_id   INTEGER,
-        original_category_name TEXT,
-        enhanced_category_id   INTEGER,
-        enhanced_category_name TEXT,
-        confidence             REAL,
-        FOREIGN KEY (product_id) REFERENCES original_content(product_id)
-    )""")
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS products (
-        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-        url                  TEXT UNIQUE,
-        title                TEXT,
-        description          TEXT,
-        improved_title       TEXT,
-        improved_description TEXT,
-        bullet_points        TEXT,
-        category_id          INTEGER,
-        category_name        TEXT,
-        confidence           REAL,
-        enhanced_category    TEXT
     )""")
 
     cursor.execute("""
@@ -121,6 +57,82 @@ def create_all_tables():
         store_name         TEXT,
         raw_json           TEXT,
         scraped_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # ── SELLER INFO ────────────────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS seller_info (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id            INTEGER UNIQUE,
+        store_name            TEXT,
+        store_id              TEXT,
+        store_url             TEXT,
+        seller_id             TEXT,
+        seller_positive_rate  TEXT,
+        seller_rating         TEXT,
+        seller_communication  TEXT,
+        seller_shipping_speed TEXT,
+        seller_country        TEXT,
+        store_open_date       TEXT,
+        seller_level          TEXT,
+        seller_total_reviews  TEXT,
+        seller_positive_num   TEXT,
+        is_top_rated          TEXT,
+        scraped_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    # ── COMPLIANCE TABLE ────────────────────────────────────────────────────
+    # Composite unique key: product_id + compliance_product_id
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS compliance_info (
+        id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id               INTEGER NOT NULL,
+        compliance_product_id    TEXT,
+        manufacturer_name        TEXT,
+        manufacturer_address     TEXT,
+        manufacturer_email       TEXT,
+        manufacturer_phone       TEXT,
+        eu_responsible_name      TEXT,
+        eu_responsible_address   TEXT,
+        eu_responsible_email     TEXT,
+        eu_responsible_phone     TEXT,
+        extracted_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(product_id, compliance_product_id),
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS enhanced_content (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id        INTEGER UNIQUE,
+        title             TEXT,
+        description       TEXT,
+        bullet_points     TEXT,
+        html_description  TEXT,
+        brand             TEXT,
+        color             TEXT,
+        dimensions        TEXT,
+        weight            TEXT,
+        material          TEXT,
+        certifications    TEXT,
+        country_of_origin TEXT,
+        warranty          TEXT,
+        product_type      TEXT,
+        enhanced_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS category_assignments (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id             INTEGER UNIQUE,
+        original_category_id   TEXT,
+        original_category_name TEXT,
+        enhanced_category_id   TEXT,
+        enhanced_category_name TEXT,
+        confidence             REAL,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
     cursor.execute("""
@@ -231,95 +243,149 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # ── SELLER INFO TABLE (new) ────────────────────────────────────────────
-    # Stores original seller data — never LLM-enhanced
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS seller_info (
-        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-        product_id            INTEGER UNIQUE,
-        store_name            TEXT,
-        store_id              TEXT,
-        store_url             TEXT,
-        seller_id             TEXT,
-        seller_positive_rate  TEXT,
-        seller_rating         TEXT,
-        seller_communication  TEXT,
-        seller_shipping_speed TEXT,
-        seller_country        TEXT,
-        store_open_date       TEXT,
-        seller_level          TEXT,
-        seller_total_reviews  TEXT,
-        seller_positive_num   TEXT,
-        is_top_rated          TEXT,
-        scraped_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
-    )""")
-
     conn.commit()
     conn.close()
-    print("✅ All tables created (including seller_info table)")
+    print("✅ All tables created (including seller_info and compliance_info)")
 
 
 # ─────────────────────────────────────────
-# LEGACY INSERT FUNCTIONS
+# SELLER INFO
 # ─────────────────────────────────────────
 
-def insert_original_content(url, title, description, image_url):
+SELLER_FIELDS = [
+    'store_name', 'store_id', 'store_url', 'seller_id',
+    'seller_positive_rate', 'seller_rating', 'seller_communication',
+    'seller_shipping_speed', 'seller_country', 'store_open_date',
+    'seller_level', 'seller_total_reviews', 'seller_positive_num', 'is_top_rated'
+]
+
+
+def insert_seller_info(product_id: int, seller_data: dict) -> bool:
     conn   = create_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT INTO original_content (url, title, description, image_url)
-            VALUES (?, ?, ?, ?)
-        """, (url, title, description, image_url))
+            INSERT INTO seller_info (
+                product_id, store_name, store_id, store_url, seller_id,
+                seller_positive_rate, seller_rating, seller_communication,
+                seller_shipping_speed, seller_country, store_open_date,
+                seller_level, seller_total_reviews, seller_positive_num, is_top_rated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            seller_data.get('store_name', ''),
+            seller_data.get('store_id', ''),
+            seller_data.get('store_url', ''),
+            seller_data.get('seller_id', ''),
+            seller_data.get('seller_positive_rate', ''),
+            seller_data.get('seller_rating', ''),
+            seller_data.get('seller_communication', ''),
+            seller_data.get('seller_shipping_speed', ''),
+            seller_data.get('seller_country', ''),
+            seller_data.get('store_open_date', ''),
+            seller_data.get('seller_level', ''),
+            seller_data.get('seller_total_reviews', ''),
+            seller_data.get('seller_positive_num', ''),
+            seller_data.get('is_top_rated', ''),
+        ))
         conn.commit()
-        product_id = cursor.lastrowid
-        return product_id
+        print(f"✅ Seller info saved (product_id={product_id})")
+        return True
     except sqlite3.IntegrityError:
-        cursor.execute("SELECT product_id FROM original_content WHERE url = ?", (url,))
-        return cursor.fetchone()[0]
+        print(f"⚠️ Seller info already exists (product_id={product_id})")
+        return False
+    except Exception as e:
+        print(f"❌ Seller info error: {e}")
+        return False
     finally:
         conn.close()
 
 
-def insert_category_assignment(product_id, orig_cat_id, orig_cat_name,
-                                enh_cat_id, enh_cat_name, confidence):
-    conn   = create_connection()
+def get_seller_info(product_id: int) -> dict:
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     try:
-        cursor.execute("""
-            INSERT INTO category_assignments
-            (product_id, original_category_id, original_category_name,
-             enhanced_category_id, enhanced_category_name, confidence)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (product_id, orig_cat_id, orig_cat_name,
-              enh_cat_id, enh_cat_name, confidence))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
-    finally:
-        conn.close()
-
-
-def insert_product(data):
-    conn   = create_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""
-        INSERT INTO products (
-            url, title, description, improved_title, improved_description,
-            bullet_points, category_id, category_name, confidence, enhanced_category
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, data)
-        conn.commit()
-    except sqlite3.IntegrityError:
-        pass
+        cursor.execute("SELECT * FROM seller_info WHERE product_id = ?", (product_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
     finally:
         conn.close()
 
 
 # ─────────────────────────────────────────
-# TASK 2 INSERT FUNCTIONS
+# COMPLIANCE INFO
+# ─────────────────────────────────────────
+
+def insert_compliance_info(product_id: int, compliance_data: dict) -> bool:
+    """
+    Store compliance info with composite unique key (product_id, compliance_product_id).
+    This means if the same product is scraped twice with same compliance_product_id,
+    it won't duplicate.
+    """
+    if not compliance_data:
+        return False
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT OR IGNORE INTO compliance_info (
+                product_id,
+                compliance_product_id,
+                manufacturer_name,
+                manufacturer_address,
+                manufacturer_email,
+                manufacturer_phone,
+                eu_responsible_name,
+                eu_responsible_address,
+                eu_responsible_email,
+                eu_responsible_phone
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            compliance_data.get('compliance_product_id', ''),
+            compliance_data.get('manufacturer_name', ''),
+            compliance_data.get('manufacturer_address', ''),
+            compliance_data.get('manufacturer_email', ''),
+            compliance_data.get('manufacturer_phone', ''),
+            compliance_data.get('eu_responsible_name', ''),
+            compliance_data.get('eu_responsible_address', ''),
+            compliance_data.get('eu_responsible_email', ''),
+            compliance_data.get('eu_responsible_phone', ''),
+        ))
+        conn.commit()
+        if cursor.rowcount > 0:
+            print(f"✅ Compliance info saved (product_id={product_id})")
+        else:
+            print(f"⚠️ Compliance already exists (product_id={product_id})")
+        return True
+    except Exception as e:
+        print(f"❌ Compliance info error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def get_compliance_info(product_id: int) -> list:
+    """Returns list because one product can have multiple compliance records."""
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT * FROM compliance_info WHERE product_id = ?", (product_id,)
+        )
+        return [dict(r) for r in cursor.fetchall()]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────
+# SCRAPED PRODUCTS
 # ─────────────────────────────────────────
 
 def insert_scraped_product(url, attributes):
@@ -369,11 +435,34 @@ def insert_scraped_product(url, attributes):
     except sqlite3.IntegrityError:
         cursor.execute("SELECT product_id FROM scraped_products WHERE url = ?", (url,))
         product_id = cursor.fetchone()[0]
-        print(f"⚠  Product already exists (product_id={product_id})")
+        print(f"⚠️ Product already exists (product_id={product_id})")
         return product_id
     except Exception as e:
         print(f"❌ Error: {e}")
         return None
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────
+# REMAINING FUNCTIONS (unchanged)
+# ─────────────────────────────────────────
+
+def insert_category_assignment(product_id, orig_cat_id, orig_cat_name,
+                                enh_cat_id, enh_cat_name, confidence):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO category_assignments
+            (product_id, original_category_id, original_category_name,
+             enhanced_category_id, enhanced_category_name, confidence)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (product_id, orig_cat_id, orig_cat_name,
+              enh_cat_id, enh_cat_name, confidence))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
     finally:
         conn.close()
 
@@ -412,7 +501,7 @@ def insert_mapped_product(product_id, category_id, mapped_data):
         print(f"✅ Mapped product saved (product_id={product_id})")
         return True
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Mapped product error: {e}")
         return False
     finally:
         conn.close()
@@ -431,7 +520,7 @@ def insert_template_output(product_id, category_id, output_type,
         conn.commit()
         return True
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Template output error: {e}")
         return False
     finally:
         conn.close()
@@ -447,102 +536,10 @@ def log_processing(product_id, url, step, status, message=""):
         """, (product_id, url, step, status, message))
         conn.commit()
     except Exception as e:
-        print(f"❌ Error logging: {e}")
+        print(f"❌ Log error: {e}")
     finally:
         conn.close()
 
-
-def get_product_by_id(product_id):
-    conn   = create_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT sp.*, ca.category_name, ca.confidence
-        FROM scraped_products sp
-        LEFT JOIN category_assignments ca ON sp.product_id = ca.product_id
-        WHERE sp.product_id = ?
-    """, (product_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result
-
-
-# ─────────────────────────────────────────
-# SELLER INFO FUNCTIONS (new)
-# ─────────────────────────────────────────
-
-SELLER_FIELDS = [
-    'store_name', 'store_id', 'store_url', 'seller_id',
-    'seller_positive_rate', 'seller_rating', 'seller_communication',
-    'seller_shipping_speed', 'seller_country', 'store_open_date',
-    'seller_level', 'seller_total_reviews', 'seller_positive_num', 'is_top_rated'
-]
-
-
-def insert_seller_info(product_id: int, seller_data: dict) -> bool:
-    """
-    Store original seller info. Never modified by LLM.
-    seller_data: dict with seller/store fields from scraper.
-    """
-    conn   = create_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""
-            INSERT INTO seller_info (
-                product_id, store_name, store_id, store_url, seller_id,
-                seller_positive_rate, seller_rating, seller_communication,
-                seller_shipping_speed, seller_country, store_open_date,
-                seller_level, seller_total_reviews, seller_positive_num, is_top_rated
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            product_id,
-            seller_data.get('store_name', ''),
-            seller_data.get('store_id', ''),
-            seller_data.get('store_url', ''),
-            seller_data.get('seller_id', ''),
-            seller_data.get('seller_positive_rate', ''),
-            seller_data.get('seller_rating', ''),
-            seller_data.get('seller_communication', ''),
-            seller_data.get('seller_shipping_speed', ''),
-            seller_data.get('seller_country', ''),
-            seller_data.get('store_open_date', ''),
-            seller_data.get('seller_level', ''),
-            seller_data.get('seller_total_reviews', ''),
-            seller_data.get('seller_positive_num', ''),
-            seller_data.get('is_top_rated', ''),
-        ))
-        conn.commit()
-        print(f"✅ Seller info saved (product_id={product_id})")
-        return True
-    except sqlite3.IntegrityError:
-        print(f"⚠  Seller info already exists for product_id={product_id}")
-        return False
-    except Exception as e:
-        print(f"❌ Error saving seller info: {e}")
-        return False
-    finally:
-        conn.close()
-
-
-def get_seller_info(product_id: int) -> dict:
-    """Retrieve seller info for a product."""
-    conn   = create_connection()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            "SELECT * FROM seller_info WHERE product_id = ?", (product_id,)
-        )
-        row = cursor.fetchone()
-        return dict(row) if row else {}
-    except Exception:
-        return {}
-    finally:
-        conn.close()
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# HYBRID AUDIT TRAIL FUNCTIONS
-# ═══════════════════════════════════════════════════════════════════════
 
 SPEC_FIELDS = [
     'brand', 'color', 'dimensions', 'weight', 'material',
@@ -583,7 +580,7 @@ def insert_enhanced_content(product_id, enhanced_data):
     except sqlite3.IntegrityError:
         return False
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Enhanced content error: {e}")
         return False
     finally:
         conn.close()
@@ -615,12 +612,12 @@ def insert_original_specifications(product_id, original_specs):
             original_specs.get("gender", "")
         ))
         conn.commit()
-        print(f"✅ Original specifications saved (product_id={product_id})")
+        print(f"✅ Original specs saved (product_id={product_id})")
         return True
     except sqlite3.IntegrityError:
         return False
     except Exception as e:
-        print(f"⚠  Could not save original specs: {e}")
+        print(f"⚠️ Original specs error: {e}")
         return False
     finally:
         conn.close()
@@ -652,12 +649,12 @@ def insert_enhanced_specifications(product_id, enhanced_specs):
             enhanced_specs.get("gender", "")
         ))
         conn.commit()
-        print(f"✅ Enhanced specifications saved (product_id={product_id})")
+        print(f"✅ Enhanced specs saved (product_id={product_id})")
         return True
     except sqlite3.IntegrityError:
         return False
     except Exception as e:
-        print(f"⚠  Could not save enhanced specs: {e}")
+        print(f"⚠️ Enhanced specs error: {e}")
         return False
     finally:
         conn.close()
@@ -677,7 +674,7 @@ def log_specification_audit(product_id, spec_field, original_value,
               enhanced_value or "", template_value or "", source_used, notes))
         conn.commit()
     except Exception as e:
-        print(f"⚠  Error logging spec audit: {e}")
+        print(f"⚠️ Audit log error: {e}")
     finally:
         conn.close()
 
@@ -694,10 +691,10 @@ def log_all_spec_audits(product_id, scraped_data, specs_enhanced, enriched_data_
         source       = "enhanced" if template_val else "empty"
         log_specification_audit(product_id, field, original_val,
                                 enhanced_val, template_val, source)
-    print(f"✅ Specification audit log written for product_id={product_id}")
+    print(f"✅ Audit log written (product_id={product_id})")
 
 
-# Backward compatibility
+# Backward compat
 def create_table():
     create_all_tables()
 
