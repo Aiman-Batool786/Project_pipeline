@@ -1,16 +1,7 @@
 """
-FastAPI Server - HYBRID APPROACH v2.5
-─────────────────────────────────────
-Pipeline steps:
-  1. Scrape  → product data + seller info (via Camoufox Firefox browser)
-  2. Store   → scraped_products + seller_info tables
-  3. Enhance → OpenAI enhances product content only (NOT seller info)
-  4. Categorize
-  5. Map     → template columns
-  6. Generate Excel
-
-Seller info rule: stored as original, shown in API response,
-                  written to template as-is, never sent to LLM.
+FastAPI Server - HYBRID APPROACH v2.6
+Pipeline: Scrape → Store → Enhance → Categorize → Map → Excel
+Compliance info extracted and stored separately.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -29,11 +20,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Octopia Template Pipeline - HYBRID Approach",
-    version="2.5.0"
+    title="Octopia Template Pipeline",
+    version="2.6.0"
 )
 
-DB_NAME   = "products.db"
+DB_NAME = "products.db"
 SPEC_FIELDS = [
     'brand', 'color', 'dimensions', 'weight', 'material',
     'certifications', 'country_of_origin', 'warranty', 'product_type'
@@ -58,14 +49,20 @@ def startup_event():
 
 class ProductURLRequest(BaseModel):
     url: str
+    extract_compliance: bool = True
+
     class Config:
         json_schema_extra = {
-            "example": {"url": "https://www.aliexpress.com/item/1005010388288135.html"}
+            "example": {
+                "url": "https://www.aliexpress.com/item/1005010388288135.html",
+                "extract_compliance": True
+            }
         }
 
 
 class BulkProductRequest(BaseModel):
     urls: List[str]
+    extract_compliance: bool = False
 
 
 @app.get("/", tags=["Info"])
@@ -73,14 +70,14 @@ def root():
     return {
         "status":  "running",
         "service": "Octopia Template Pipeline",
-        "version": "2.5.0",
+        "version": "2.6.0",
         "features": [
             "Camoufox Firefox browser (API interception)",
-            "Seller info from SHOP_CARD_PC (original, not LLM-enhanced)",
-            "Content enhancement via OpenAI (product only)",
+            "Seller info stored in seller_info table",
+            "EU compliance info extracted and stored",
+            "Content enhancement via OpenAI",
             "Octopia categorization",
             "Template mapping + Excel generation",
-            "Full audit trail"
         ]
     }
 
@@ -99,13 +96,14 @@ def health_check():
 # MAIN PROCESSING FUNCTION
 # ─────────────────────────────────────────
 
-def process_product_complete(url: str) -> Dict[str, Any]:
+def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[str, Any]:
     product_id = None
 
     try:
         logger.info(f"\n🚀 Processing: {url}")
 
-        from scraper import get_product_info
+        # ── Imports ──────────────────────────────────────────────────────
+        from scraper import get_product_info, resolve_category
         from category_utils import assign_category
         from data_mapper import map_scraped_data_to_template, validate_mapped_data
         from template_filler import fill_template_for_product
@@ -114,6 +112,7 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             create_all_tables,
             insert_scraped_product,
             insert_seller_info,
+            insert_compliance_info,
             insert_category_assignment,
             insert_mapped_product,
             insert_template_output,
@@ -143,9 +142,9 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         if not TEMPLATE_PATH:
             logger.warning("⚠️  Template file not found — Excel will be skipped")
 
-        # ── STEP 1: SCRAPE ──────────────────────────────────────────────────
+        # ── STEP 1: SCRAPE ───────────────────────────────────────────────
         logger.info("📥 Scraping with Camoufox...")
-        scraped_data = get_product_info(url)
+        scraped_data = get_product_info(url, extract_compliance=extract_compliance)
 
         if not scraped_data:
             return {"success": False, "url": url, "error": "Scraping failed",
@@ -162,10 +161,7 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         logger.info(f"✅ Extracted {len(scraped_data)} attributes "
                     f"({scraped_specs_count} spec fields)")
 
-        seller_found = [k for k in SELLER_FIELDS if scraped_data.get(k)]
-        logger.info(f"   Seller fields: {seller_found}")
-
-        # ── STEP 2: STORE SCRAPED DATA ──────────────────────────────────────
+        # ── STEP 2: STORE SCRAPED DATA ───────────────────────────────────
         logger.info("💾 Storing scraped data...")
         product_id = insert_scraped_product(url, scraped_data)
 
@@ -175,22 +171,30 @@ def process_product_complete(url: str) -> Dict[str, Any]:
 
         log_processing(product_id, url, "scraping", "success")
 
-        # ── STEP 2B: STORE SELLER INFO ───────────────────────────────────────
-        logger.info("🏪 Storing seller info (original)...")
+        # ── STEP 2B: STORE SELLER INFO ───────────────────────────────────
+        logger.info("🏪 Storing seller info...")
         seller_data = {k: scraped_data.get(k, '') for k in SELLER_FIELDS}
         insert_seller_info(product_id, seller_data)
         log_processing(product_id, url, "seller_info", "success")
 
-        # ── STEP 2C: SAVE ORIGINAL SPECIFICATIONS ────────────────────────────
+        # ── STEP 2C: STORE COMPLIANCE INFO ───────────────────────────────
+        compliance_data = scraped_data.get('compliance', {})
+        if compliance_data:
+            logger.info(f"🔒 Storing compliance info: {list(compliance_data.keys())}")
+            insert_compliance_info(product_id, compliance_data)
+            log_processing(product_id, url, "compliance_info", "success")
+        else:
+            logger.info("ℹ️ No compliance info (non-EU page or not found)")
+
+        # ── STEP 2D: STORE ORIGINAL SPECS ────────────────────────────────
         logger.info("📋 Saving original specifications...")
         insert_original_specifications(product_id, scraped_data)
 
-        # ── STEP 3: ENHANCE CONTENT (product only, NOT seller) ──────────────
+        # ── STEP 3: ENHANCE CONTENT ──────────────────────────────────────
         logger.info("🤖 Enhancing product content with OpenAI...")
-
         product_data_for_llm = {
             k: v for k, v in scraped_data.items()
-            if k not in SELLER_FIELDS
+            if k not in SELLER_FIELDS and k != 'compliance'
         }
 
         try:
@@ -213,13 +217,8 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             }
 
         specs_enhanced = enhanced.get("specifications_enhanced", {})
-        logger.info(f"✅ Content enhanced — "
-                    f"{len([v for v in specs_enhanced.values() if v])} spec fields")
-
-        # ── STEP 3B: SAVE ENHANCED SPECIFICATIONS ────────────────────────────
         insert_enhanced_specifications(product_id, specs_enhanced)
 
-        # ── STEP 3C: BUILD enriched_data_for_template ────────────────────────
         enriched_data_for_template = scraped_data.copy()
         enriched_data_for_template['title']            = enhanced.get('title', title)
         enriched_data_for_template['description']      = enhanced.get('description', description)
@@ -233,22 +232,32 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         for field in SELLER_FIELDS:
             enriched_data_for_template[field] = scraped_data.get(field, '')
 
-        # ── STEP 3D: SAVE ENHANCED CONTENT + AUDIT LOG ───────────────────────
         insert_enhanced_content(product_id, enriched_data_for_template)
         log_all_spec_audits(product_id, scraped_data, specs_enhanced,
                             enriched_data_for_template)
 
-        # ── STEP 4: CATEGORIZE ───────────────────────────────────────────────
-        logger.info("\n🏷️  Categorizing...")
+        # ── STEP 4: CATEGORIZE ───────────────────────────────────────────
+        logger.info("🏷️  Categorizing...")
+
+        # First try category from scraper (from mtop API)
+        scraper_category = resolve_category(scraped_data)
+        logger.info(f"   Scraper category: {scraper_category}")
+
         try:
             category = assign_category(
                 enhanced.get("title", title),
                 enhanced.get("description", description)
             )
+            # If scraper found a category with high confidence, prefer it
+            if scraper_category['confidence'] >= 0.9 and scraper_category['category_id'] != '0':
+                category = scraper_category
+                logger.info(f"   Using scraper category: {category}")
         except Exception as e:
-            logger.warning(f"Categorization skipped: {e}")
-            category = {"category_id": "0", "category_name": "Unknown",
-                        "category_leaf": "Unknown", "confidence": 0.0}
+            logger.warning(f"Categorization fallback: {e}")
+            category = scraper_category if scraper_category['category_id'] != '0' else {
+                "category_id": "0", "category_name": "Unknown",
+                "category_leaf": "Unknown", "confidence": 0.0
+            }
 
         insert_category_assignment(
             product_id,
@@ -258,8 +267,8 @@ def process_product_complete(url: str) -> Dict[str, Any]:
         )
         log_processing(product_id, url, "categorization", "success")
 
-        # ── STEP 5: MAP ──────────────────────────────────────────────────────
-        logger.info("\n🗺️  Mapping to template columns...")
+        # ── STEP 5: MAP ──────────────────────────────────────────────────
+        logger.info("🗺️  Mapping to template columns...")
         mapped_data = {}
         is_valid    = False
 
@@ -273,8 +282,8 @@ def process_product_complete(url: str) -> Dict[str, Any]:
             logger.warning(f"Mapping error: {e}")
             log_processing(product_id, url, "mapping", "error", str(e))
 
-        # ── STEP 6: GENERATE TEMPLATE ─────────────────────────────────────────
-        logger.info("\n📋 Generating Excel template...")
+        # ── STEP 6: GENERATE TEMPLATE ─────────────────────────────────────
+        logger.info("📋 Generating Excel template...")
         template_file = None
 
         if TEMPLATE_PATH:
@@ -297,7 +306,7 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                 logger.error(f"❌ Template generation failed: {e}", exc_info=True)
                 log_processing(product_id, url, "template_fill", "error", str(e))
         else:
-            logger.warning("⚠️  Skipping template — .xlsm file not found")
+            logger.warning("⚠️  Skipping template — .xlsm not found")
 
         logger.info("✅ Processing complete\n")
 
@@ -316,6 +325,16 @@ def process_product_complete(url: str) -> Dict[str, Any]:
 
             "seller": {f: scraped_data.get(f, "") for f in SELLER_FIELDS},
 
+            "compliance": compliance_data,
+
+            "category": {
+                "id":         category.get("category_id", ""),
+                "name":       category.get("category_name", ""),
+                "leaf":       category.get("category_leaf", ""),
+                "path":       category.get("category_path", ""),
+                "confidence": round(category.get("confidence", 0.0), 2)
+            },
+
             "enhanced": {
                 "title":                   enhanced.get("title", ""),
                 "description":             (enhanced.get("description", "")[:200] + "..."
@@ -323,13 +342,6 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                 "bullet_points":           enhanced.get("bullet_points", [])[:3],
                 "has_html_description":    bool(enhanced.get("html_description", "")),
                 "specifications_enhanced": specs_enhanced
-            },
-
-            "category": {
-                "id":         category.get("category_id", ""),
-                "name":       category.get("category_name", ""),
-                "leaf":       category.get("category_leaf", ""),
-                "confidence": round(category.get("confidence", 0.0), 2)
             },
 
             "template": {
@@ -342,16 +354,8 @@ def process_product_complete(url: str) -> Dict[str, Any]:
                 "specifications": sum(1 for k in SPEC_FIELDS
                                       if enriched_data_for_template.get(k)),
                 "images":         sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}")),
-                "seller_fields":  len([k for k in SELLER_FIELDS if scraped_data.get(k)])
-            },
-
-            "audit": {
-                "original_specs_saved":        True,
-                "enhanced_specs_saved":        True,
-                "seller_info_saved":           True,
-                "seller_info_llm_enhanced":    False,
-                "audit_log_written":           True,
-                "template_uses_enhanced_only": True
+                "seller_fields":  len([k for k in SELLER_FIELDS if scraped_data.get(k)]),
+                "compliance_fields": len(compliance_data),
             },
 
             "timestamp": datetime.now().isoformat()
@@ -371,7 +375,7 @@ def process_product_complete(url: str) -> Dict[str, Any]:
 def generate_product(req: ProductURLRequest):
     if not req.url:
         raise HTTPException(status_code=400, detail="URL cannot be empty")
-    return process_product_complete(req.url)
+    return process_product_complete(req.url, extract_compliance=req.extract_compliance)
 
 
 @app.post("/generate-products", tags=["Product Processing"])
@@ -384,7 +388,7 @@ def generate_products(req: BulkProductRequest):
     results    = []
     successful = failed = 0
     for url in req.urls:
-        result = process_product_complete(url)
+        result = process_product_complete(url, extract_compliance=req.extract_compliance)
         results.append(result)
         if result.get("success"):
             successful += 1
@@ -397,7 +401,7 @@ def generate_products(req: BulkProductRequest):
 
 
 # ─────────────────────────────────────────
-# DATABASE VIEW ENDPOINTS
+# DATABASE ENDPOINTS
 # ─────────────────────────────────────────
 
 def get_db_connection():
@@ -441,6 +445,32 @@ def get_seller_info_by_product(product_id: int):
         ).fetchone()
         conn.close()
         return dict(row) if row else {"message": f"No seller info for product {product_id}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/compliance-info", tags=["Database"])
+def view_compliance_info(limit: int = 100):
+    try:
+        conn = get_db_connection()
+        rows = conn.execute(
+            f"SELECT * FROM compliance_info ORDER BY extracted_at DESC LIMIT {min(limit,1000)}"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows] if rows else {"message": "No records"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/compliance-info/{product_id}", tags=["Database"])
+def get_compliance_by_product(product_id: int):
+    try:
+        conn = get_db_connection()
+        rows = conn.execute(
+            "SELECT * FROM compliance_info WHERE product_id = ?", (product_id,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows] if rows else {"message": f"No compliance for product {product_id}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -544,7 +574,7 @@ def get_stats():
             "scraped_products", "mapped_products", "template_outputs",
             "processing_logs", "category_assignments", "enhanced_content",
             "original_specifications", "enhanced_specifications",
-            "specification_audit_log", "seller_info"
+            "specification_audit_log", "seller_info", "compliance_info"
         ]
         stats = {}
         for table in tables:
@@ -560,12 +590,8 @@ def get_stats():
         return {"error": str(e)}
 
 
-# ─────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────
-
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v2.5 — Camoufox edition")
+    logger.info("🚀 Octopia Template Pipeline v2.6 — Camoufox + Compliance edition")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
