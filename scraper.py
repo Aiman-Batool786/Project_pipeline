@@ -435,45 +435,43 @@ def _extract_compliance_info(page) -> dict:
 # SELLER INFO FROM DOM
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_seller_from_dom(page) -> dict:
-    """
-    Extract seller info visible on the page without opening any popup.
-    Covers: store ID from links, store name from DOM, ratings from page.
-    """
+def _extract_seller_from_popup(page) -> dict:
+    """Extract seller info by opening EU 'Trader' popup."""
     seller = {}
 
-    # Store ID + URL from store links
-    try:
-        for link in page.locator('a[href*="/store/"]').all()[:5]:
-            href = link.get_attribute('href') or ''
-            if '/store/' in href:
-                if href.startswith('//'):
-                    href = 'https:' + href
-                m = re.search(r'/store/(\d+)', href)
-                if m:
-                    seller['store_id']  = m.group(1)
-                    seller['store_url'] = f"https://www.aliexpress.com/store/{m.group(1)}"
-                    print(f"[scraper] ✅ DOM store ID: {m.group(1)}")
-                    break
-    except Exception:
-        pass
-
-    # Store name
-    for sel in [
-        '[class*="store-header--storeName"]', '[class*="shopName"]',
-        '[class*="shop-name"]', '[class*="sellerName"]',
-        'a[href*="/store/"] span', '[class*="store-info"] h3',
-    ]:
+    # Try clicking any Trader/Sprzedawca/Vendeur button
+    click_selectors = [
+        'span:text("Trader")', 'span:text("Sprzedawca")', 'span:text("Vendeur")',
+        '[class*="trader"]', '[class*="store-header--storeName"]'
+    ]
+    for sel in click_selectors:
         try:
             el = page.locator(sel).first
-            if el.count() > 0:
-                text = el.inner_text().strip()
-                if text and 2 < len(text) < 100:
-                    seller['store_name'] = text
-                    print(f"[scraper] ✅ DOM store name: {text}")
-                    break
+            if el.count() > 0 and el.is_visible(timeout=3000):
+                el.click(timeout=4000)
+                page.wait_for_timeout(2500)
+                print(f"[scraper] ✅ Clicked seller button: {sel}")
+                break
         except Exception:
             continue
+
+    # Parse popup modal text blocks
+    try:
+        modal = page.locator('.comet-v2-modal, .storeInfo, .traderInfo').first
+        modal.wait_for(timeout=5000)
+        text = modal.inner_text()
+        for line in text.split('\n'):
+            low = line.lower().strip()
+            if 'name' in low or 'store' in low:
+                seller['store_name'] = line.split(':', 1)[-1].strip()
+            elif 'country' in low or 'location' in low:
+                seller['seller_country'] = line.split(':', 1)[-1].strip()
+            elif 'open' in low or 'since' in low:
+                seller['store_open_date'] = line.split(':', 1)[-1].strip()
+    except Exception as e:
+        print(f"[scraper] ⚠️ Popup parse failed: {e}")
+
+    return {k: v for k, v in seller.items() if v}
 
     # Store open date, location, shop number from info blocks
     info_patterns = {
