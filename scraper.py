@@ -1,8 +1,9 @@
 """
-scraper.py v5
+scraper.py v6
 ─────────────
 Camoufox browser — intercepts mtop API + extracts compliance popup.
 Stores seller info, specs, compliance in structured format.
+UPDATED: Better API capture, direct API fallback, improved selectors
 """
 
 import re
@@ -10,6 +11,7 @@ import json
 import random
 import time
 import urllib.request
+import urllib.error
 import concurrent.futures
 from camoufox.sync_api import Camoufox
 
@@ -84,6 +86,21 @@ def _safe(d, *keys, default=None):
     return cur
 
 
+def extract_item_id(url: str) -> str | None:
+    """Extract product ID from URL"""
+    patterns = [
+        r'/item/(\d+)\.html',
+        r'itemId=(\d+)',
+        r'productId=(\d+)',
+        r'/(\d+)\.html'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SELLER PARSER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -134,45 +151,54 @@ def _parse_seller_block(store: dict) -> dict:
 
 def parse_mtop_response(text: str) -> dict | None:
     try:
+        # Remove JSONP wrapper if present
         m = re.match(r'^[a-zA-Z0-9_$]+\((.*)\);?\s*$', text.strip(), re.DOTALL)
         if m:
             text = m.group(1)
 
-        outer  = json.loads(text)
-        result = (
-            _safe(outer, 'data', 'result') or
-            _safe(outer, 'data', 'data') or
-            _safe(outer, 'data') or {}
-        )
+        outer = json.loads(text)
+        
+        # Try different response structures
+        result = None
+        if isinstance(outer, dict):
+            result = (_safe(outer, 'data', 'result') or 
+                     _safe(outer, 'data', 'data') or 
+                     _safe(outer, 'data') or 
+                     outer.get('result') or
+                     outer)
+        
         if not result or not isinstance(result, dict):
             return None
 
         print(f"[scraper] 📦 mtop result keys: {list(result.keys())[:15]}")
         extracted = {}
 
-        # Title
-        for tk in ['titleModule', 'TITLE', 'GLOBAL_DATA']:
+        # Title - try multiple paths
+        for tk in ['titleModule', 'TITLE', 'GLOBAL_DATA', 'title', 'productTitle']:
             tb = result.get(tk, {})
             if isinstance(tb, dict):
                 t = (_s(tb.get('subject')) or _s(tb.get('title')) or
-                     _s(_safe(tb, 'globalData', 'subject')))
+                     _s(_safe(tb, 'globalData', 'subject')) or
+                     _s(tb.get('productTitle')))
                 if t:
                     extracted['title'] = t
                     break
+        if not extracted.get('title') and isinstance(result.get('title'), str):
+            extracted['title'] = _s(result.get('title'))
 
         # Price
-        pm = result.get('priceModule') or result.get('PRICE') or {}
+        pm = result.get('priceModule') or result.get('PRICE') or result.get('price') or {}
         if isinstance(pm, dict):
             extracted['price'] = _s(
                 pm.get('formatedActivityPrice') or pm.get('formatedPrice') or
-                pm.get('formattedPrice') or
+                pm.get('formattedPrice') or pm.get('price') or
                 _safe(pm, 'minActivityAmount', 'formattedAmount')
             )
 
         # Images
-        im = result.get('imageModule') or result.get('IMAGE') or {}
+        im = result.get('imageModule') or result.get('IMAGE') or result.get('images') or {}
         if isinstance(im, dict):
-            for idx, url in enumerate((im.get('imagePathList') or [])[:20], 1):
+            for idx, url in enumerate((im.get('imagePathList') or im.get('imageList') or [])[:20], 1):
                 if url:
                     url = ('https:' + url) if str(url).startswith('//') else url
                     extracted[f'image_{idx}'] = url
@@ -185,11 +211,13 @@ def parse_mtop_response(text: str) -> dict | None:
 
         # Specs
         props = []
-        for sk in ['PRODUCT_PROP_PC', 'specsModule', 'productPropComponent', 'skuModule']:
+        for sk in ['PRODUCT_PROP_PC', 'specsModule', 'productPropComponent', 
+                   'skuModule', 'props', 'specifications']:
             sb = result.get(sk, {})
             if isinstance(sb, dict):
                 raw = (sb.get('props') or sb.get('showedProps') or
-                       sb.get('specsList') or sb.get('productSKUPropertyList') or [])
+                       sb.get('specsList') or sb.get('productSKUPropertyList') or
+                       sb.get('specificationList') or [])
                 if raw:
                     props = raw
                     print(f"[scraper] 📋 {len(props)} specs from '{sk}'")
@@ -200,8 +228,8 @@ def parse_mtop_response(text: str) -> dict | None:
             for prop in props:
                 if not isinstance(prop, dict):
                     continue
-                name  = _s(prop.get('attrName') or prop.get('name')).lower()
-                value = _s(prop.get('attrValue') or prop.get('value'))
+                name = _s(prop.get('attrName') or prop.get('name') or prop.get('key')).lower()
+                value = _s(prop.get('attrValue') or prop.get('value') or prop.get('val'))
                 if not name or not value:
                     continue
                 for field, keywords in SPEC_MAPPING.items():
@@ -211,7 +239,7 @@ def parse_mtop_response(text: str) -> dict | None:
                 extracted['specs_raw'][name] = value
 
         # Seller from API
-        for sk in ['storeModule', 'SHOP_CARD_PC', 'sellerModule', 'shopInfo']:
+        for sk in ['storeModule', 'SHOP_CARD_PC', 'sellerModule', 'shopInfo', 'seller']:
             sb = result.get(sk, {})
             if isinstance(sb, dict) and sb:
                 seller = _parse_seller_block(sb)
@@ -236,10 +264,10 @@ def parse_mtop_response(text: str) -> dict | None:
                     )
 
         # Rating/Reviews
-        fb = result.get('feedbackModule') or result.get('FEEDBACK') or {}
+        fb = result.get('feedbackModule') or result.get('FEEDBACK') or result.get('rating') or {}
         if isinstance(fb, dict):
-            extracted['rating']  = _s(fb.get('trialRating') or fb.get('averageStar'))
-            extracted['reviews'] = _s(fb.get('trialNum') or fb.get('totalCount'))
+            extracted['rating']  = _s(fb.get('trialRating') or fb.get('averageStar') or fb.get('score'))
+            extracted['reviews'] = _s(fb.get('trialNum') or fb.get('totalCount') or fb.get('count'))
 
         # Description URL
         dm = result.get('descriptionModule') or result.get('DESCRIPTION') or {}
@@ -252,6 +280,7 @@ def parse_mtop_response(text: str) -> dict | None:
         for path_fn in [
             lambda r: r.get('highlights') or _safe(r, 'highlightModule', 'highlightList'),
             lambda r: _safe(r, 'tradeModule', 'highlights'),
+            lambda r: r.get('bulletPoints'),
         ]:
             try:
                 items = path_fn(result)
@@ -272,6 +301,46 @@ def parse_mtop_response(text: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DIRECT API FALLBACK
+# ─────────────────────────────────────────────────────────────────────────────
+
+def direct_api_request(item_id: str) -> dict | None:
+    """Fallback: Try direct API request to AliExpress"""
+    try:
+        # Try multiple API endpoints
+        endpoints = [
+            f"https://gpservice.aliexpress.com/pcdetail/queryDetail?productId={item_id}&locale=en_US",
+            f"https://api.aliexpress.com/pcdetail/queryDetail?productId={item_id}&locale=en_US",
+            f"https://acs.aliexpress.com/pcdetail/queryDetail?productId={item_id}&locale=en_US",
+        ]
+        
+        headers = {
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.aliexpress.com/',
+            'Origin': 'https://www.aliexpress.com',
+        }
+        
+        for endpoint in endpoints:
+            try:
+                print(f"[scraper] 🔌 Trying direct API: {endpoint[:80]}...")
+                req = urllib.request.Request(endpoint, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as response:
+                    data = json.loads(response.read().decode('utf-8'))
+                    if data.get('data', {}).get('result'):
+                        result = parse_mtop_response(json.dumps(data))
+                        if result and result.get('title'):
+                            return result
+            except Exception as e:
+                continue
+                
+    except Exception as e:
+        print(f"[scraper] Direct API failed: {e}")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HTML INIT_DATA PARSER (SSR fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -279,31 +348,36 @@ def _extract_from_html_init_data(html: str) -> dict:
     if not html:
         return {}
     try:
-        start_marker = '/*!-->init-data-start--*/'
-        end_marker   = '/*!-->init-data-end--*/'
-        s = html.find(start_marker)
-        e = html.find(end_marker)
-        if s != -1 and e != -1:
-            block  = html[s + len(start_marker):e]
-            assign = block.find('window._dida_config_._init_data_=')
-            if assign != -1:
-                json_start = block.index('{', assign)
-                depth      = 0
-                json_end   = json_start
-                for i, ch in enumerate(block[json_start:], json_start):
-                    if ch == '{':
-                        depth += 1
-                    elif ch == '}':
-                        depth -= 1
-                        if depth == 0:
-                            json_end = i + 1
-                            break
-                outer = json.loads(block[json_start:json_end])
-                inner = _safe(outer, 'data', 'data') or _safe(outer, 'data') or outer
-                print(f"[scraper] 📄 init_data keys: {list(inner.keys())[:10]}")
-                return parse_mtop_response(
-                    json.dumps({'data': {'result': inner}})
-                ) or {}
+        # Try multiple init data patterns
+        patterns = [
+            (r'window\._dida_config_\._init_data_\s*=\s*({.*?});', 1),
+            (r'window\.runParams\s*=\s*({.*?});', 1),
+            (r'data:\s*({.*?}),\s*"retCode"', 1),
+            (r'__INITIAL_STATE__\s*=\s*({.*?});', 1),
+        ]
+        
+        for pattern, group in patterns:
+            match = re.search(pattern, html, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(group))
+                    if isinstance(data, dict):
+                        # Extract product data
+                        product_data = (_safe(data, 'data', 'data') or 
+                                       _safe(data, 'data', 'result') or
+                                       data.get('result') or
+                                       data.get('product') or
+                                       data)
+                        if product_data and isinstance(product_data, dict):
+                            parsed = parse_mtop_response(
+                                json.dumps({'data': {'result': product_data}})
+                            )
+                            if parsed and parsed.get('title'):
+                                print("[scraper] ✅ Extracted from init_data")
+                                return parsed
+                except json.JSONDecodeError:
+                    continue
+                    
     except Exception as e:
         print(f"[scraper] ⚠️ init_data parse error: {e}")
     return {}
@@ -315,7 +389,7 @@ def _extract_from_html_init_data(html: str) -> dict:
 
 def _parse_compliance_text(text: str) -> dict:
     result = {}
-    text   = text.replace('\r\n', '\n').replace('\r', '\n')
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
 
     def extract_field(label_patterns: list, src: str, stop_patterns: list = None) -> str:
         for pat in label_patterns:
@@ -333,31 +407,31 @@ def _parse_compliance_text(text: str) -> dict:
                 return val
         return ''
 
-    result['manufacturer_name']    = extract_field(
-        ['Name', 'Imię i nazwisko', 'Manufacturer Name'], text)
+    result['manufacturer_name'] = extract_field(
+        ['Name', 'Imię i nazwisko', 'Manufacturer Name', 'Manufacturer'], text)
     result['manufacturer_address'] = extract_field(
         ['Address', 'Adres'], text,
         stop_patterns=['Email', 'Telephone', 'Phone', 'Numer', 'Adres e-mail'])
-    result['manufacturer_email']   = extract_field(
+    result['manufacturer_email'] = extract_field(
         ['Email address', 'Adres e-mail', 'Email'], text)
-    result['manufacturer_phone']   = extract_field(
+    result['manufacturer_phone'] = extract_field(
         ['Telephone number', 'Numer telefonu', 'Phone', 'Tel'], text)
 
     eu_match = re.search(
         r'(Details of the person responsible|person responsible for compliance in the EU|'
-        r'Osoba odpowiedzialna|EU Representative|EU Responsible)',
+        r'Osoba odpowiedzialna|EU Representative|EU Responsible|Importer)',
         text, re.IGNORECASE
     )
     if eu_match:
         eu_text = text[eu_match.start():]
-        result['eu_responsible_name']    = extract_field(
+        result['eu_responsible_name'] = extract_field(
             ['Name', 'Imię i nazwisko', 'Nazwa'], eu_text)
         result['eu_responsible_address'] = extract_field(
             ['Address', 'Adres'], eu_text,
             stop_patterns=['Email', 'Telephone', 'Numer', 'Adres e-mail'])
-        result['eu_responsible_email']   = extract_field(
+        result['eu_responsible_email'] = extract_field(
             ['Email address', 'Adres e-mail', 'Email'], eu_text)
-        result['eu_responsible_phone']   = extract_field(
+        result['eu_responsible_phone'] = extract_field(
             ['Telephone number', 'Numer telefonu', 'Phone'], eu_text)
 
     pid_m = re.search(r'Product ID[^\n]*\n\s*([0-9][-0-9]+)', text, re.IGNORECASE)
@@ -379,6 +453,8 @@ def _extract_compliance_info(page) -> dict:
         'a:has-text("Product Compliance Information")',
         'text="Informacje o zgodności produktu"',
         'span:has-text("Informacje o zgodności")',
+        'button:has-text("Compliance")',
+        'a:has-text("Compliance")',
         '[data-spm-anchor-id*="i7"]',
         '[class*="compliance"]',
         '[class*="Compliance"]',
@@ -402,9 +478,9 @@ def _extract_compliance_info(page) -> dict:
         return {}
 
     try:
-        page.wait_for_selector('.comet-v2-modal, .comet-modal', timeout=6000)
-        page.wait_for_timeout(1000)
-        modal = page.locator('.comet-v2-modal, .comet-modal').first
+        page.wait_for_selector('.comet-v2-modal, .comet-modal, [role="dialog"]', timeout=8000)
+        page.wait_for_timeout(1500)
+        modal = page.locator('.comet-v2-modal, .comet-modal, [role="dialog"]').first
         if modal.count() == 0:
             return {}
         modal_text = modal.inner_text()
@@ -416,7 +492,7 @@ def _extract_compliance_info(page) -> dict:
 
     try:
         page.locator(
-            '.comet-v2-modal-close, .comet-modal-close, button[aria-label="Close"]'
+            '.comet-v2-modal-close, .comet-modal-close, button[aria-label="Close"], [class*="close"]'
         ).first.click(timeout=2000)
     except Exception:
         pass
@@ -441,7 +517,7 @@ def _extract_seller_from_dom(page) -> dict:
                     href = 'https:' + href
                 m = re.search(r'/store/(\d+)', href)
                 if m:
-                    seller['store_id']  = m.group(1)
+                    seller['store_id'] = m.group(1)
                     seller['store_url'] = f"https://www.aliexpress.com/store/{m.group(1)}"
                     print(f"[scraper] ✅ DOM store ID: {m.group(1)}")
                     break
@@ -453,6 +529,7 @@ def _extract_seller_from_dom(page) -> dict:
         '[class*="store-header--storeName"]', '[class*="shopName"]',
         '[class*="shop-name"]', '[class*="sellerName"]',
         'a[href*="/store/"] span', '[class*="store-info"] h3',
+        '[data-spm="seller"]',
     ]:
         try:
             el = page.locator(sel).first
@@ -471,7 +548,7 @@ def _extract_seller_from_dom(page) -> dict:
             r'(?:Opening date|Opened|Since|Data otwarcia)[:\s]+([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})',
         ],
         'seller_country': [
-            r'(?:Location|Country|Kraj)[:\s]+([A-Za-z\s]{2,30})',
+            r'(?:Location|Country|Kraj|From)[:\s]+([A-Za-z\s]{2,30})',
         ],
         'store_id': [
             r'(?:Shop No\.|Store No\.|No\.)[:\s]+(\d+)',
@@ -508,7 +585,9 @@ def _extract_seller_from_popup(page) -> dict:
     # Click Trader/Sprzedawca button to open popup
     click_selectors = [
         'span:text("Trader")', 'span:text("Sprzedawca")', 'span:text("Vendeur")',
+        'button:text("Trader")', 'a:text("Trader")',
         '[class*="trader"]', '[class*="store-header--storeName"]',
+        '[data-spm="seller"]',
     ]
     for sel in click_selectors:
         try:
@@ -523,27 +602,28 @@ def _extract_seller_from_popup(page) -> dict:
 
     # Parse popup modal text
     try:
-        modal = page.locator('.comet-v2-modal, .storeInfo, .traderInfo').first
-        modal.wait_for(timeout=5000)
+        modal = page.locator('.comet-v2-modal, .storeInfo, .traderInfo, [role="dialog"]').first
+        modal.wait_for(timeout=8000)
         text = modal.inner_text()
         for line in text.split('\n'):
             low = line.lower().strip()
-            val = line.split(':', 1)[-1].strip() if ':' in line else ''
-            if not val:
-                continue
-            if 'name' in low or 'store' in low:
-                seller.setdefault('store_name', val)
-            elif 'country' in low or 'location' in low:
-                seller.setdefault('seller_country', val)
-            elif 'open' in low or 'since' in low:
-                seller.setdefault('store_open_date', val)
-            elif 'no.' in low or 'number' in low:
-                if re.match(r'^\d+$', val):
-                    seller.setdefault('store_id', val)
-                    seller.setdefault(
-                        'store_url',
-                        f"https://www.aliexpress.com/store/{val}"
-                    )
+            if ':' in line:
+                val = line.split(':', 1)[-1].strip()
+                if not val:
+                    continue
+                if 'name' in low or 'store' in low:
+                    seller.setdefault('store_name', val)
+                elif 'country' in low or 'location' in low:
+                    seller.setdefault('seller_country', val)
+                elif 'open' in low or 'since' in low:
+                    seller.setdefault('store_open_date', val)
+                elif 'no.' in low or 'number' in low:
+                    if re.match(r'^\d+$', val):
+                        seller.setdefault('store_id', val)
+                        seller.setdefault(
+                            'store_url',
+                            f"https://www.aliexpress.com/store/{val}"
+                        )
     except Exception as e:
         print(f"[scraper] ⚠️ Popup parse failed: {e}")
 
@@ -613,12 +693,12 @@ def fetch_description(url: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
-    captured   = []
-    html       = ''
+    captured = []
+    html = ''
     dom_seller = {}
     compliance = {}
 
-    ua    = random.choice(USER_AGENTS)
+    ua = random.choice(USER_AGENTS)
     is_eu = _is_eu_url(url)
     print(f"[scraper] 🌐 EU={is_eu} | {url[:80]}")
 
@@ -635,37 +715,46 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
             def handle_response(response):
                 try:
                     resp_url = response.url
-                    if (('mtop.aliexpress.pdp.pc.query' in resp_url or
-                         'mtop.aliexpress.itemdetail' in resp_url or
-                         'pdp.pc.query' in resp_url) and
-                            response.status == 200):
+                    # Expanded API patterns
+                    if any(pattern in resp_url for pattern in [
+                        'mtop.aliexpress.pdp.pc.query',
+                        'mtop.aliexpress.itemdetail',
+                        'pdp.pc.query',
+                        'mtop.aliexpress.pcdetail',
+                        'mtop.taobao.pcdetail.data',
+                        'detail.getDetail',
+                        'queryDetail',
+                        'getProductDetail'
+                    ]):
                         body = response.body()
-                        if len(body) < 1000:
+                        if len(body) < 500:
                             return
                         text = body.decode('utf-8', errors='replace')
+                        # Look for product data indicators
                         if any(x in text for x in [
                             'titleModule', 'storeModule', 'SHOP_CARD_PC',
-                            'imageModule', 'priceModule', '"subject"', '"storeName"'
+                            'imageModule', 'priceModule', '"subject"', '"storeName"',
+                            '"title"', '"productTitle"', 'result'
                         ]):
                             captured.append(text)
-                            print(f"[scraper] 📡 Captured API ({len(text):,} bytes)")
+                            print(f"[scraper] 📡 Captured API ({len(text):,} bytes) from {resp_url[:80]}")
                 except Exception:
                     pass
 
             page.on('response', handle_response)
-            page.goto(url, timeout=90_000, wait_until='domcontentloaded')
+            page.goto(url, timeout=120000, wait_until='networkidle')
+            page.wait_for_timeout(5000)
 
             if is_eu:
                 page.wait_for_timeout(2000)
                 _dismiss_gdpr_banner(page)
                 page.wait_for_timeout(1000)
 
-            page.wait_for_timeout(random.randint(5000, 7000))
-
-            for _ in range(4):
+            # Scroll to trigger lazy loading
+            for _ in range(6):
                 page.mouse.wheel(0, random.randint(400, 800))
                 page.wait_for_timeout(random.randint(500, 900))
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(3000)
 
             # Always extract seller from DOM first
             dom_seller = _extract_seller_from_dom(page)
@@ -692,8 +781,8 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
         traceback.print_exc()
 
     return {
-        'captured':   captured,
-        'html':       html,
+        'captured': captured,
+        'html': html,
         'dom_seller': dom_seller,
         'compliance': compliance,
     }
@@ -705,12 +794,22 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
 
 def _scrape_with_retry(url: str, try_compliance: bool = False) -> dict:
     best = {'captured': [], 'html': '', 'dom_seller': {}, 'compliance': {}}
+    
+    # Try direct API first (fastest)
+    item_id = extract_item_id(url)
+    if item_id:
+        print(f"[scraper] 🔍 Trying direct API for item {item_id}")
+        direct_result = direct_api_request(item_id)
+        if direct_result and direct_result.get('title'):
+            print("[scraper] ✅ Direct API succeeded")
+            best['best_parsed'] = direct_result
+            return best
 
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n[scraper] 🔄 Attempt {attempt}/{MAX_RETRIES}")
 
         if attempt > 1:
-            delay = random.uniform(4, 9)
+            delay = random.uniform(8, 15)
             print(f"[scraper] ⏳ Back-off {delay:.1f}s...")
             time.sleep(delay)
 
@@ -720,11 +819,12 @@ def _scrape_with_retry(url: str, try_compliance: bool = False) -> dict:
                     _scrape_in_thread, url,
                     try_compliance and attempt == 1
                 )
-                result = future.result(timeout=200)
+                result = future.result(timeout=300)
         except Exception as e:
             print(f"[scraper] ❌ Attempt {attempt} error: {e}")
             continue
 
+        # Try to parse captured responses
         for text in sorted(result['captured'], key=len, reverse=True):
             parsed = parse_mtop_response(text)
             if parsed and parsed.get('title'):
@@ -736,162 +836,4 @@ def _scrape_with_retry(url: str, try_compliance: bool = False) -> dict:
             best = result
         print(f"[scraper] ⚠️ Attempt {attempt}: no title in API response")
 
-    print(f"[scraper] ⚠️ All {MAX_RETRIES} attempts done")
-    return best
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CATEGORY RESOLVER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def resolve_category(extracted: dict) -> dict:
-    cat_id   = extracted.get('category_id', '').split(',')[-1].strip()
-    cat_name = extracted.get('category_name', '')
-    cat_path = extracted.get('category_path', '')
-    resolved = CATEGORY_ID_MAP.get(cat_id, '') or cat_name
-    if not resolved and cat_path:
-        resolved = cat_path.split(' > ')[-1].strip()
-    return {
-        'category_id':   cat_id or '0',
-        'category_name': resolved or 'Uncategorized',
-        'category_leaf': cat_name or (cat_path.split(' > ')[-1] if cat_path else 'Uncategorized'),
-        'category_path': cat_path,
-        'confidence':    0.95 if cat_id and cat_id != '0' else (0.7 if cat_name else 0.3),
-    }
-
-
-resolve_category_from_init_data = resolve_category
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN PUBLIC FUNCTION
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
-    print(f"\n[scraper] ══════════════════════════")
-    print(f"[scraper] Starting: {url}")
-    print(f"[scraper] ══════════════════════════")
-
-    data      = _scrape_with_retry(url, try_compliance=extract_compliance)
-    extracted = {}
-
-    if data.get('best_parsed'):
-        extracted = data['best_parsed']
-        print("[scraper] ✅ Using pre-parsed mtop result")
-    else:
-        for text in sorted(data['captured'], key=len, reverse=True):
-            parsed = parse_mtop_response(text)
-            if parsed:
-                for k, v in parsed.items():
-                    if v and k not in extracted:
-                        extracted[k] = v
-                if extracted.get('title'):
-                    break
-
-    # Fallback: init_data from HTML
-    if not extracted.get('title') and data.get('html'):
-        print("[scraper] 🔍 Trying HTML init_data fallback...")
-        for k, v in _extract_from_html_init_data(data['html']).items():
-            if v and k not in extracted:
-                extracted[k] = v
-
-    # Fallback: og:title
-    if not extracted.get('title') and data.get('html'):
-        m = re.search(
-            r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']{5,300})["\']',
-            data['html']
-        )
-        if m:
-            extracted['title'] = m.group(1).strip()
-
-    # Fallback: images from HTML
-    if not extracted.get('image_1') and data.get('html'):
-        m = re.search(r'"imagePathList"\s*:\s*(\[[^\]]+\])', data['html'])
-        if m:
-            try:
-                urls = json.loads(m.group(1))
-                for idx, img_url in enumerate(urls[:20], 1):
-                    if img_url and not extracted.get(f'image_{idx}'):
-                        extracted[f'image_{idx}'] = str(img_url)
-            except Exception:
-                pass
-
-    if not extracted.get('title'):
-        print("[scraper] ❌ No product title after all attempts")
-        return None
-
-    # Merge DOM seller (fills gaps only)
-    for k, v in data.get('dom_seller', {}).items():
-        if v and not extracted.get(k):
-            extracted[k] = v
-            print(f"[scraper] ✅ Seller from DOM: {k} = {v}")
-
-    # Attach compliance
-    compliance = data.get('compliance', {})
-    if compliance:
-        extracted['compliance'] = compliance
-        print(f"[scraper] ✅ Compliance: {list(compliance.keys())}")
-
-    # Fetch description
-    desc_url = extracted.pop('_description_url', '')
-    if desc_url and not extracted.get('description'):
-        print("[scraper] 📄 Fetching description...")
-        extracted['description'] = fetch_description(desc_url)
-
-    # Apply defaults
-    defaults = {
-        'description': '', 'brand': '', 'color': '', 'dimensions': '',
-        'weight': '', 'material': '', 'certifications': '',
-        'country_of_origin': '', 'warranty': '', 'product_type': '',
-        'shipping': '', 'price': '', 'rating': '', 'reviews': '',
-        'bullet_points': [], 'age_from': '', 'age_to': '',
-        'gender': '', 'safety_warning': '',
-        'store_name': '', 'store_id': '', 'store_url': '',
-        'seller_id': '', 'seller_positive_rate': '', 'seller_rating': '',
-        'seller_communication': '', 'seller_shipping_speed': '',
-        'seller_country': '', 'store_open_date': '', 'seller_level': '',
-        'seller_total_reviews': '', 'seller_positive_num': '', 'is_top_rated': '',
-        'category_id': '', 'category_name': '', 'category_path': '',
-        'compliance': {},
-    }
-    for key, default in defaults.items():
-        extracted.setdefault(key, default)
-    for i in range(1, 21):
-        extracted.setdefault(f'image_{i}', '')
-
-    print(f"\n[scraper] ── Summary ──────────────")
-    print(f"  Title:      {extracted['title'][:70]}")
-    print(f"  Seller:     {[k for k in ['store_name','store_id','seller_rating','seller_country'] if extracted.get(k)]}")
-    print(f"  Specs:      {[k for k in SPEC_MAPPING if extracted.get(k)]}")
-    print(f"  Images:     {sum(1 for i in range(1,21) if extracted.get(f'image_{i}'))}")
-    print(f"  Compliance: {list(extracted.get('compliance', {}).keys())}")
-    print(f"[scraper] ────────────────────────")
-
-    return extracted
-
-
-if __name__ == '__main__':
-    import sys
-    test_url = sys.argv[1] if len(sys.argv) > 1 else \
-        "https://www.aliexpress.com/item/1005010089125608.html"
-    result = get_product_info(test_url, extract_compliance=True)
-    if result:
-        print("\n" + "=" * 70)
-        for k, v in sorted(result.items()):
-            if k.startswith('image_') and not v:
-                continue
-            if k == 'specs_raw':
-                print(f"  specs_raw ({len(v)} items):")
-                for sk, sv in list(v.items())[:10]:
-                    print(f"    {sk:30}: {sv}")
-                continue
-            if k == 'compliance' and v:
-                print(f"  compliance:")
-                for ck, cv in v.items():
-                    print(f"    {ck:35}: {cv}")
-                continue
-            print(f"  {k:30}: {str(v)[:100]}")
-        cat = resolve_category(result)
-        print(f"\n  CATEGORY: {cat}")
-    else:
-        print("❌ FAILED")
+    print(f"[scraper]
