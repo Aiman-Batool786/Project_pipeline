@@ -45,7 +45,7 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
-MAX_RETRIES  = 3
+MAX_RETRIES = 3
 
 CATEGORY_ID_MAP = {
     '5090301':   'Cell Phones',
@@ -284,12 +284,12 @@ def _extract_from_html_init_data(html: str) -> dict:
         s = html.find(start_marker)
         e = html.find(end_marker)
         if s != -1 and e != -1:
-            block    = html[s + len(start_marker):e]
-            assign   = block.find('window._dida_config_._init_data_=')
+            block  = html[s + len(start_marker):e]
+            assign = block.find('window._dida_config_._init_data_=')
             if assign != -1:
                 json_start = block.index('{', assign)
-                depth = 0
-                json_end = json_start
+                depth      = 0
+                json_end   = json_start
                 for i, ch in enumerate(block[json_start:], json_start):
                     if ch == '{':
                         depth += 1
@@ -314,7 +314,6 @@ def _extract_from_html_init_data(html: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_compliance_text(text: str) -> dict:
-    """Parse raw compliance modal text into structured fields."""
     result = {}
     text   = text.replace('\r\n', '\n').replace('\r', '\n')
 
@@ -334,7 +333,6 @@ def _parse_compliance_text(text: str) -> dict:
                 return val
         return ''
 
-    # Manufacturer
     result['manufacturer_name']    = extract_field(
         ['Name', 'Imię i nazwisko', 'Manufacturer Name'], text)
     result['manufacturer_address'] = extract_field(
@@ -345,7 +343,6 @@ def _parse_compliance_text(text: str) -> dict:
     result['manufacturer_phone']   = extract_field(
         ['Telephone number', 'Numer telefonu', 'Phone', 'Tel'], text)
 
-    # EU Responsible Person
     eu_match = re.search(
         r'(Details of the person responsible|person responsible for compliance in the EU|'
         r'Osoba odpowiedzialna|EU Representative|EU Responsible)',
@@ -363,7 +360,6 @@ def _parse_compliance_text(text: str) -> dict:
         result['eu_responsible_phone']   = extract_field(
             ['Telephone number', 'Numer telefonu', 'Phone'], eu_text)
 
-    # Product ID
     pid_m = re.search(r'Product ID[^\n]*\n\s*([0-9][-0-9]+)', text, re.IGNORECASE)
     if pid_m:
         result['compliance_product_id'] = pid_m.group(1).strip()
@@ -376,9 +372,7 @@ def _parse_compliance_text(text: str) -> dict:
 
 
 def _extract_compliance_info(page) -> dict:
-    """Click compliance link and parse the modal."""
     compliance = {}
-
     selectors = [
         'text="Product Compliance Information"',
         'span:has-text("Product Compliance Information")',
@@ -420,7 +414,6 @@ def _extract_compliance_info(page) -> dict:
     except Exception as e:
         print(f"[scraper] ⚠️ Compliance modal error: {e}")
 
-    # Close modal
     try:
         page.locator(
             '.comet-v2-modal-close, .comet-modal-close, button[aria-label="Close"]'
@@ -432,54 +425,53 @@ def _extract_compliance_info(page) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SELLER INFO FROM DOM
+# SELLER INFO FROM DOM (always runs — no popup needed)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_seller_from_popup(page) -> dict:
-    """Extract seller info by opening EU 'Trader' popup."""
+def _extract_seller_from_dom(page) -> dict:
+    """Extract seller info visible on the page without opening any popup."""
     seller = {}
 
-    # Try clicking any Trader/Sprzedawca/Vendeur button
-    click_selectors = [
-        'span:text("Trader")', 'span:text("Sprzedawca")', 'span:text("Vendeur")',
-        '[class*="trader"]', '[class*="store-header--storeName"]'
-    ]
-    for sel in click_selectors:
+    # Store ID + URL from store links
+    try:
+        for link in page.locator('a[href*="/store/"]').all()[:5]:
+            href = link.get_attribute('href') or ''
+            if '/store/' in href:
+                if href.startswith('//'):
+                    href = 'https:' + href
+                m = re.search(r'/store/(\d+)', href)
+                if m:
+                    seller['store_id']  = m.group(1)
+                    seller['store_url'] = f"https://www.aliexpress.com/store/{m.group(1)}"
+                    print(f"[scraper] ✅ DOM store ID: {m.group(1)}")
+                    break
+    except Exception:
+        pass
+
+    # Store name
+    for sel in [
+        '[class*="store-header--storeName"]', '[class*="shopName"]',
+        '[class*="shop-name"]', '[class*="sellerName"]',
+        'a[href*="/store/"] span', '[class*="store-info"] h3',
+    ]:
         try:
             el = page.locator(sel).first
-            if el.count() > 0 and el.is_visible(timeout=3000):
-                el.click(timeout=4000)
-                page.wait_for_timeout(2500)
-                print(f"[scraper] ✅ Clicked seller button: {sel}")
-                break
+            if el.count() > 0:
+                text = el.inner_text().strip()
+                if text and 2 < len(text) < 100:
+                    seller['store_name'] = text
+                    print(f"[scraper] ✅ DOM store name: {text}")
+                    break
         except Exception:
             continue
 
-    # Parse popup modal text blocks
-    try:
-        modal = page.locator('.comet-v2-modal, .storeInfo, .traderInfo').first
-        modal.wait_for(timeout=5000)
-        text = modal.inner_text()
-        for line in text.split('\n'):
-            low = line.lower().strip()
-            if 'name' in low or 'store' in low:
-                seller['store_name'] = line.split(':', 1)[-1].strip()
-            elif 'country' in low or 'location' in low:
-                seller['seller_country'] = line.split(':', 1)[-1].strip()
-            elif 'open' in low or 'since' in low:
-                seller['store_open_date'] = line.split(':', 1)[-1].strip()
-    except Exception as e:
-        print(f"[scraper] ⚠️ Popup parse failed: {e}")
-
-    return {k: v for k, v in seller.items() if v}
-
-    # Store open date, location, shop number from info blocks
+    # Regex patterns against full page text for open date, country, shop number
     info_patterns = {
         'store_open_date': [
             r'(?:Opening date|Opened|Since|Data otwarcia)[:\s]+([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})',
         ],
         'seller_country': [
-            r'(?:Location|Country|Kraj)[:\s]+([A-Za-z\s]+)',
+            r'(?:Location|Country|Kraj)[:\s]+([A-Za-z\s]{2,30})',
         ],
         'store_id': [
             r'(?:Shop No\.|Store No\.|No\.)[:\s]+(\d+)',
@@ -501,6 +493,59 @@ def _extract_seller_from_popup(page) -> dict:
                         break
     except Exception:
         pass
+
+    return {k: v for k, v in seller.items() if v}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SELLER INFO FROM EU TRADER POPUP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_seller_from_popup(page) -> dict:
+    """Extract seller info by opening EU Trader popup modal."""
+    seller = {}
+
+    # Click Trader/Sprzedawca button to open popup
+    click_selectors = [
+        'span:text("Trader")', 'span:text("Sprzedawca")', 'span:text("Vendeur")',
+        '[class*="trader"]', '[class*="store-header--storeName"]',
+    ]
+    for sel in click_selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0 and el.is_visible(timeout=3000):
+                el.click(timeout=4000)
+                page.wait_for_timeout(2500)
+                print(f"[scraper] ✅ Clicked seller button: {sel}")
+                break
+        except Exception:
+            continue
+
+    # Parse popup modal text
+    try:
+        modal = page.locator('.comet-v2-modal, .storeInfo, .traderInfo').first
+        modal.wait_for(timeout=5000)
+        text = modal.inner_text()
+        for line in text.split('\n'):
+            low = line.lower().strip()
+            val = line.split(':', 1)[-1].strip() if ':' in line else ''
+            if not val:
+                continue
+            if 'name' in low or 'store' in low:
+                seller.setdefault('store_name', val)
+            elif 'country' in low or 'location' in low:
+                seller.setdefault('seller_country', val)
+            elif 'open' in low or 'since' in low:
+                seller.setdefault('store_open_date', val)
+            elif 'no.' in low or 'number' in low:
+                if re.match(r'^\d+$', val):
+                    seller.setdefault('store_id', val)
+                    seller.setdefault(
+                        'store_url',
+                        f"https://www.aliexpress.com/store/{val}"
+                    )
+    except Exception as e:
+        print(f"[scraper] ⚠️ Popup parse failed: {e}")
 
     return {k: v for k, v in seller.items() if v}
 
@@ -622,20 +667,17 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
                 page.wait_for_timeout(random.randint(500, 900))
             page.wait_for_timeout(2000)
 
-            # Extract seller from DOM (always)
+            # Always extract seller from DOM first
             dom_seller = _extract_seller_from_dom(page)
 
-            # EU trader popup (if not found in DOM)
-           if not dom_seller.get('store_name'):
-           print("[scraper] 🏪 Trying Trader popup mode...")
-           popup_seller = _extract_seller_from_popup(page)
-           if popup_seller:
-         # Merge without overwriting DOM fields
-          for k, v in popup_seller.items():
-            dom_seller.setdefault(k, v)
+            # If DOM didn't get store name, try EU Trader popup
+            if not dom_seller.get('store_name'):
+                print("[scraper] 🏪 Trying Trader popup mode...")
+                popup_seller = _extract_seller_from_popup(page)
+                for k, v in popup_seller.items():
+                    dom_seller.setdefault(k, v)
 
-
-            # Extract compliance (EU only)
+            # Extract compliance info
             if try_compliance:
                 print("[scraper] 🔒 Extracting compliance info...")
                 compliance = _extract_compliance_info(page)
@@ -718,7 +760,6 @@ def resolve_category(extracted: dict) -> dict:
     }
 
 
-# Backward compatibility alias
 resolve_category_from_init_data = resolve_category
 
 
@@ -734,7 +775,6 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
     data      = _scrape_with_retry(url, try_compliance=extract_compliance)
     extracted = {}
 
-    # Primary: pre-parsed mtop result
     if data.get('best_parsed'):
         extracted = data['best_parsed']
         print("[scraper] ✅ Using pre-parsed mtop result")
@@ -764,7 +804,7 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
         if m:
             extracted['title'] = m.group(1).strip()
 
-    # Fallback: images from HTML DCData
+    # Fallback: images from HTML
     if not extracted.get('image_1') and data.get('html'):
         m = re.search(r'"imagePathList"\s*:\s*(\[[^\]]+\])', data['html'])
         if m:
@@ -819,7 +859,6 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
     for i in range(1, 21):
         extracted.setdefault(f'image_{i}', '')
 
-    # Summary
     print(f"\n[scraper] ── Summary ──────────────")
     print(f"  Title:      {extracted['title'][:70]}")
     print(f"  Seller:     {[k for k in ['store_name','store_id','seller_rating','seller_country'] if extracted.get(k)]}")
