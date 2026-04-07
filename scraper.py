@@ -836,4 +836,4 @@ def _scrape_with_retry(url: str, try_compliance: bool = False) -> dict:
             best = result
         print(f"[scraper] ⚠️ Attempt {attempt}: no title in API response")
 
-    print(f"[scraper]
+    print(f"[scraper] ⚠️ All {MAX_RETRIES}
