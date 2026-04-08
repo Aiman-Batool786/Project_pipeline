@@ -6,6 +6,7 @@ Added: Search results scraping endpoint
 """
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware  # Add this
 from pydantic import BaseModel
 import os
 import sqlite3
@@ -26,6 +27,15 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Octopia Template Pipeline",
     version="2.7.0"
+)
+
+# Add CORS middleware to allow testing from browsers
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 DB_NAME = "products.db"
@@ -66,14 +76,14 @@ class BulkProductRequest(BaseModel):
 class SearchScrapeRequest(BaseModel):
     """Request model for search scraping endpoint"""
     search_url: str
-    max_pages: Optional[int] = None  # None = scrape all pages
+    max_pages: Optional[int] = None
     delay_between_requests: float = 1.0
 
     class Config:
         json_schema_extra = {
             "example": {
                 "search_url": "https://www.aliexpress.com/w/wholesale-enter-keywords.html?SearchText=enter-keywords&catId=0&g=y&shipFromCountry=enter_ship_from_country&trafficChannel=main",
-                "max_pages": 5,
+                "max_pages": 2,
                 "delay_between_requests": 1.0
             }
         }
@@ -87,7 +97,7 @@ class SearchProductInfo(BaseModel):
 
 
 # =============================================================================
-# DATABASE FUNCTIONS (Existing - keep all)
+# DATABASE FUNCTIONS
 # =============================================================================
 
 def get_db_connection():
@@ -97,7 +107,7 @@ def get_db_connection():
 
 
 # =============================================================================
-# STARTUP EVENT (Existing)
+# STARTUP EVENT
 # =============================================================================
 
 @app.on_event("startup")
@@ -106,20 +116,35 @@ def startup_event():
         from db import create_all_tables
         create_all_tables()
         logger.info("✅ API Ready")
+        logger.info("📋 Available endpoints:")
+        logger.info("   POST /scrape-products - Search results scraping")
+        logger.info("   POST /generate-product - Single product scraping")
+        logger.info("   POST /generate-products - Bulk product scraping")
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
 
 # =============================================================================
-# INFO ENDPOINTS (Existing)
+# INFO ENDPOINTS
 # =============================================================================
 
 @app.get("/", tags=["Info"])
 def root():
     return {
-        "status":  "running",
+        "status": "running",
         "service": "Octopia Template Pipeline",
         "version": "2.7.0",
+        "endpoints": {
+            "GET /": "This info",
+            "GET /health": "Health check",
+            "POST /scrape-products": "Scrape search results with pagination",
+            "POST /generate-product": "Scrape single product page",
+            "POST /generate-products": "Scrape multiple product pages",
+            "GET /scraped-products": "View scraped products",
+            "GET /seller-info": "View seller information",
+            "GET /compliance-info": "View compliance information",
+            "GET /stats": "Database statistics"
+        },
         "features": [
             "Camoufox Firefox browser (API interception)",
             "Seller info stored in seller_info table",
@@ -137,9 +162,9 @@ def health_check():
     try:
         conn = sqlite3.connect(DB_NAME)
         conn.close()
-        return {"status": "healthy"}
-    except Exception:
-        return {"status": "error"}
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        return {"status": "error", "database": str(e)}
 
 
 # =============================================================================
@@ -289,7 +314,6 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
         # ── STEP 4: CATEGORIZE ───────────────────────────────────────────
         logger.info("🏷️  Categorizing...")
 
-        # First try category from scraper (from mtop API)
         scraper_category = resolve_category(scraped_data)
         logger.info(f"   Scraper category: {scraper_category}")
 
@@ -298,7 +322,6 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
                 enhanced.get("title", title),
                 enhanced.get("description", description)
             )
-            # If scraper found a category with high confidence, prefer it
             if scraper_category['confidence'] >= 0.9 and scraper_category['category_id'] != '0':
                 category = scraper_category
                 logger.info(f"   Using scraper category: {category}")
@@ -364,50 +387,39 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
             "success":    True,
             "product_id": product_id,
             "url":        url,
-
             "original": {
-                "title":       title,
-                "description": (description[:200] + "..." if len(description) > 200
-                                else description),
+                "title": title,
+                "description": (description[:200] + "..." if len(description) > 200 else description),
                 **{f: scraped_data.get(f, "") for f in SPEC_FIELDS},
                 "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}"))
             },
-
             "seller": {f: scraped_data.get(f, "") for f in SELLER_FIELDS},
-
             "compliance": compliance_data,
-
             "category": {
-                "id":         category.get("category_id", ""),
-                "name":       category.get("category_name", ""),
-                "leaf":       category.get("category_leaf", ""),
-                "path":       category.get("category_path", ""),
+                "id": category.get("category_id", ""),
+                "name": category.get("category_name", ""),
+                "leaf": category.get("category_leaf", ""),
+                "path": category.get("category_path", ""),
                 "confidence": round(category.get("confidence", 0.0), 2)
             },
-
             "enhanced": {
-                "title":                   enhanced.get("title", ""),
-                "description":             (enhanced.get("description", "")[:200] + "..."
-                                            if enhanced.get("description") else ""),
-                "bullet_points":           enhanced.get("bullet_points", [])[:3],
-                "has_html_description":    bool(enhanced.get("html_description", "")),
+                "title": enhanced.get("title", ""),
+                "description": (enhanced.get("description", "")[:200] + "..." if enhanced.get("description") else ""),
+                "bullet_points": enhanced.get("bullet_points", [])[:3],
+                "has_html_description": bool(enhanced.get("html_description", "")),
                 "specifications_enhanced": specs_enhanced
             },
-
             "template": {
-                "file":           os.path.basename(template_file) if template_file else None,
+                "file": os.path.basename(template_file) if template_file else None,
                 "columns_mapped": len(mapped_data),
-                "fields_valid":   is_valid,
+                "fields_valid": is_valid,
             },
-
             "extracted": {
-                "specifications": sum(1 for k in SPEC_FIELDS
-                                      if enriched_data_for_template.get(k)),
-                "images":         sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}")),
-                "seller_fields":  len([k for k in SELLER_FIELDS if scraped_data.get(k)]),
+                "specifications": sum(1 for k in SPEC_FIELDS if enriched_data_for_template.get(k)),
+                "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}")),
+                "seller_fields": len([k for k in SELLER_FIELDS if scraped_data.get(k)]),
                 "compliance_fields": len(compliance_data),
             },
-
             "timestamp": datetime.now().isoformat()
         }
 
@@ -418,7 +430,7 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
 
 
 # =============================================================================
-# PRODUCT PROCESSING ENDPOINTS (Existing)
+# PRODUCT PROCESSING ENDPOINTS
 # =============================================================================
 
 @app.post("/generate-product", tags=["Product Processing"])
@@ -435,7 +447,7 @@ def generate_products(req: BulkProductRequest):
     if len(req.urls) > 20:
         raise HTTPException(status_code=400, detail="Maximum 20 URLs per request")
 
-    results    = []
+    results = []
     successful = failed = 0
     for url in req.urls:
         result = process_product_complete(url, extract_compliance=req.extract_compliance)
@@ -451,7 +463,7 @@ def generate_products(req: BulkProductRequest):
 
 
 # =============================================================================
-# NEW SEARCH SCRAPING ENDPOINT
+# SEARCH SCRAPING ENDPOINT (MAKE SURE THIS IS HERE)
 # =============================================================================
 
 @app.post("/scrape-products", response_model=List[SearchProductInfo], tags=["Product Processing"])
@@ -461,15 +473,6 @@ def scrape_search_products(request: SearchScrapeRequest):
     
     Extracts only product URLs in format: https://pl.aliexpress.com/item/<PRODUCT_ID>.html
     Rejects /srs/ redirect URLs automatically.
-    
-    Input format:
-    {
-        "search_url": "https://www.aliexpress.com/w/wholesale-enter-keywords.html?SearchText=enter-keywords&catId=0&g=y&shipFromCountry=enter_ship_from_country&trafficChannel=main",
-        "max_pages": 5,  # optional, defaults to all pages
-        "delay_between_requests": 1.0  # optional, seconds between page requests
-    }
-    
-    Returns list of products with product_id, product_url, and title.
     """
     if not request.search_url:
         raise HTTPException(status_code=400, detail="search_url is required")
@@ -508,7 +511,7 @@ def scrape_search_products(request: SearchScrapeRequest):
 
 
 # =============================================================================
-# DATABASE VIEW ENDPOINTS (Existing - all preserved)
+# DATABASE VIEW ENDPOINTS
 # =============================================================================
 
 @app.get("/scraped-products", tags=["Database"])
@@ -541,7 +544,7 @@ def view_seller_info(limit: int = 100):
 def get_seller_info_by_product(product_id: int):
     try:
         conn = get_db_connection()
-        row  = conn.execute(
+        row = conn.execute(
             "SELECT * FROM seller_info WHERE product_id = ?", (product_id,)
         ).fetchone()
         conn.close()
@@ -670,7 +673,7 @@ def view_specification_audit(limit: int = 200):
 @app.get("/stats", tags=["Database"])
 def get_stats():
     try:
-        conn   = get_db_connection()
+        conn = get_db_connection()
         tables = [
             "scraped_products", "mapped_products", "template_outputs",
             "processing_logs", "category_assignments", "enhanced_content",
@@ -680,9 +683,7 @@ def get_stats():
         stats = {}
         for table in tables:
             try:
-                stats[table] = conn.execute(
-                    f"SELECT COUNT(*) FROM {table}"
-                ).fetchone()[0]
+                stats[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             except Exception:
                 stats[table] = 0
         conn.close()
@@ -699,4 +700,9 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
     logger.info("🚀 Octopia Template Pipeline v2.7 — Camoufox + Compliance + Search Scraper")
+    logger.info(f"📡 Server running on http://0.0.0.0:{port}")
+    logger.info("📋 Available endpoints:")
+    logger.info(f"   POST http://localhost:{port}/scrape-products")
+    logger.info(f"   POST http://localhost:{port}/generate-product")
+    logger.info(f"   POST http://localhost:{port}/generate-products")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
