@@ -2,20 +2,20 @@
 FastAPI Server - HYBRID APPROACH v2.7
 Pipeline: Scrape → Store → Enhance → Categorize → Map → Excel
 Compliance info extracted and stored separately.
-
-NEW in v2.7:
-  - /scrape-search  : Scrape product URLs/IDs from AliExpress search pages
-  - /scrape-search-and-process : Scrape search + auto-process each product
+Added: Search results scraping endpoint
 """
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import os
 import sqlite3
 import logging
 import json
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+
+# Import the new search scraper
+from search_scraper import scrape_search_results
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,19 +41,9 @@ SELLER_FIELDS = [
 ]
 
 
-@app.on_event("startup")
-def startup_event():
-    try:
-        from db import create_all_tables
-        create_all_tables()
-        logger.info("✅ API Ready — v2.7.0")
-    except Exception as e:
-        logger.error(f"Startup error: {e}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# REQUEST MODELS
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# PYDANTIC MODELS (Existing + New)
+# =============================================================================
 
 class ProductURLRequest(BaseModel):
     url: str
@@ -74,64 +64,55 @@ class BulkProductRequest(BaseModel):
 
 
 class SearchScrapeRequest(BaseModel):
-    """Request model for scraping AliExpress search results."""
-    search_url: str = Field(
-        ...,
-        description="Full AliExpress search URL",
-        example=(
-            "https://www.aliexpress.com/w/wholesale-usb-enter-key.html"
-            "?SearchText=usb+enter+key&catId=0&g=y"
-            "&shipFromCountry=enter_ship_from_country&trafficChannel=main"
-        )
-    )
-    max_pages: int = Field(
-        default=5,
-        ge=1,
-        le=50,
-        description="Maximum number of pages to scrape (1–50)"
-    )
-    max_products: int = Field(
-        default=0,
-        ge=0,
-        description="Stop after N products. 0 = unlimited"
-    )
-    deduplicate: bool = Field(
-        default=True,
-        description="Remove duplicate product IDs"
-    )
+    """Request model for search scraping endpoint"""
+    search_url: str
+    max_pages: Optional[int] = None  # None = scrape all pages
+    delay_between_requests: float = 1.0
 
     class Config:
         json_schema_extra = {
             "example": {
-                "search_url": (
-                    "https://www.aliexpress.com/w/wholesale-usb-enter-key.html"
-                    "?SearchText=usb+enter+key&catId=0&g=y&trafficChannel=main"
-                ),
-                "max_pages": 3,
-                "max_products": 0,
-                "deduplicate": True
+                "search_url": "https://www.aliexpress.com/w/wholesale-enter-keywords.html?SearchText=enter-keywords&catId=0&g=y&shipFromCountry=enter_ship_from_country&trafficChannel=main",
+                "max_pages": 5,
+                "delay_between_requests": 1.0
             }
         }
 
 
-class SearchScrapeAndProcessRequest(BaseModel):
-    """Scrape search results, then process each product through the full pipeline."""
-    search_url: str = Field(..., description="AliExpress search URL")
-    max_pages: int = Field(default=1, ge=1, le=10)
-    max_products: int = Field(
-        default=10, ge=1, le=50,
-        description="Max products to process (keep low to avoid long runs)"
-    )
-    extract_compliance: bool = Field(
-        default=False,
-        description="Whether to extract EU compliance info for each product"
-    )
-    deduplicate: bool = Field(default=True)
+class SearchProductInfo(BaseModel):
+    """Product info from search results"""
+    product_id: str
+    product_url: str
+    title: str
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ROOT / HEALTH
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# DATABASE FUNCTIONS (Existing - keep all)
+# =============================================================================
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# =============================================================================
+# STARTUP EVENT (Existing)
+# =============================================================================
+
+@app.on_event("startup")
+def startup_event():
+    try:
+        from db import create_all_tables
+        create_all_tables()
+        logger.info("✅ API Ready")
+    except Exception as e:
+        logger.error(f"Startup error: {e}")
+
+
+# =============================================================================
+# INFO ENDPOINTS (Existing)
+# =============================================================================
 
 @app.get("/", tags=["Info"])
 def root():
@@ -139,20 +120,14 @@ def root():
         "status":  "running",
         "service": "Octopia Template Pipeline",
         "version": "2.7.0",
-        "endpoints": {
-            "/scrape-search":              "Scrape product URLs & IDs from search pages",
-            "/scrape-search-and-process":  "Scrape search then run full pipeline on each product",
-            "/generate-product":           "Full pipeline for a single product URL",
-            "/generate-products":          "Bulk pipeline (up to 20 URLs)",
-        },
         "features": [
             "Camoufox Firefox browser (API interception)",
-            "Search result scraping with pagination",
             "Seller info stored in seller_info table",
             "EU compliance info extracted and stored",
             "Content enhancement via OpenAI",
             "Octopia categorization",
             "Template mapping + Excel generation",
+            "Search results scraping with pagination",
         ]
     }
 
@@ -162,143 +137,14 @@ def health_check():
     try:
         conn = sqlite3.connect(DB_NAME)
         conn.close()
-        return {"status": "healthy", "version": "2.7.0"}
+        return {"status": "healthy"}
     except Exception:
         return {"status": "error"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ★★★  NEW ENDPOINT: SCRAPE SEARCH RESULTS  ★★★
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.post("/scrape-search", tags=["Search Scraping"])
-def scrape_search(req: SearchScrapeRequest):
-    """
-    Scrape AliExpress search result pages and return product URLs, IDs, and titles.
-
-    - Handles pagination automatically (up to max_pages)
-    - Only returns /item/<id>.html URLs (not /srs/ or redirect URLs)
-    - Deduplicates product IDs by default
-    - Scrolls to trigger lazy-loaded products
-
-    Example search URL:
-    ```
-    https://www.aliexpress.com/w/wholesale-usb-enter-key.html
-      ?SearchText=usb+enter+key&catId=0&g=y&trafficChannel=main
-    ```
-    """
-    if not req.search_url or not req.search_url.strip():
-        raise HTTPException(status_code=400, detail="search_url cannot be empty")
-
-    url = req.search_url.strip()
-    if 'aliexpress.com' not in url:
-        raise HTTPException(
-            status_code=400,
-            detail="search_url must be an AliExpress URL"
-        )
-
-    logger.info(f"\n🔍 Search scrape: {url[:100]}")
-    logger.info(f"   max_pages={req.max_pages} | max_products={req.max_products or '∞'}")
-
-    try:
-        from search_scraper import scrape_search_results
-
-        result = scrape_search_results(
-            search_url=url,
-            max_pages=req.max_pages,
-            max_products=req.max_products,
-            deduplicate=req.deduplicate,
-        )
-
-        return {
-            "success":        True,
-            "search_url":     url,
-            "pages_scraped":  result["pages_scraped"],
-            "total_products": result["total_products"],
-            "products":       result["products"],
-            "timestamp":      datetime.now().isoformat(),
-        }
-
-    except ImportError:
-        raise HTTPException(
-            status_code=500,
-            detail="search_scraper module not found. Ensure search_scraper.py is present."
-        )
-    except Exception as e:
-        logger.error(f"Search scrape error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/scrape-search-and-process", tags=["Search Scraping"])
-def scrape_search_and_process(req: SearchScrapeAndProcessRequest):
-    """
-    Two-stage pipeline:
-    1. Scrape search results to collect product URLs
-    2. Run the full product pipeline on each collected URL
-
-    ⚠️  Can be slow — each product takes 60–120s to process.
-        Keep max_products ≤ 5 for quick testing.
-    """
-    if not req.search_url or not req.search_url.strip():
-        raise HTTPException(status_code=400, detail="search_url cannot be empty")
-
-    url = req.search_url.strip()
-    logger.info(f"\n🔍 Search + Process: {url[:100]}")
-
-    try:
-        from search_scraper import scrape_search_results
-
-        # Stage 1: collect URLs
-        search_result = scrape_search_results(
-            search_url=url,
-            max_pages=req.max_pages,
-            max_products=req.max_products,
-            deduplicate=req.deduplicate,
-        )
-
-        product_urls = [p["product_url"] for p in search_result["products"]]
-        logger.info(f"✅ Collected {len(product_urls)} URLs — starting pipeline...")
-
-        # Stage 2: process each product
-        pipeline_results = []
-        successful = failed = 0
-        for i, product_url in enumerate(product_urls, 1):
-            logger.info(f"\n[{i}/{len(product_urls)}] Processing: {product_url}")
-            result = process_product_complete(
-                product_url,
-                extract_compliance=req.extract_compliance
-            )
-            pipeline_results.append(result)
-            if result.get("success"):
-                successful += 1
-            else:
-                failed += 1
-
-        return {
-            "success":           True,
-            "search_url":        url,
-            "search_pages":      search_result["pages_scraped"],
-            "search_products":   search_result["total_products"],
-            "pipeline_total":    len(pipeline_results),
-            "pipeline_success":  successful,
-            "pipeline_failed":   failed,
-            "results":           pipeline_results,
-            "timestamp":         datetime.now().isoformat(),
-        }
-
-    except ImportError:
-        raise HTTPException(
-            status_code=500,
-            detail="search_scraper module not found."
-        )
-    except Exception as e:
-        logger.error(f"Search + process error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PRODUCT PIPELINE
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# MAIN PROCESSING FUNCTION (Existing - keep as is)
+# =============================================================================
 
 def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[str, Any]:
     product_id = None
@@ -443,6 +289,7 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
         # ── STEP 4: CATEGORIZE ───────────────────────────────────────────
         logger.info("🏷️  Categorizing...")
 
+        # First try category from scraper (from mtop API)
         scraper_category = resolve_category(scraped_data)
         logger.info(f"   Scraper category: {scraper_category}")
 
@@ -451,6 +298,7 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
                 enhanced.get("title", title),
                 enhanced.get("description", description)
             )
+            # If scraper found a category with high confidence, prefer it
             if scraper_category['confidence'] >= 0.9 and scraper_category['category_id'] != '0':
                 category = scraper_category
                 logger.info(f"   Using scraper category: {category}")
@@ -569,9 +417,9 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
                 "error": str(e), "timestamp": datetime.now().isoformat()}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SINGLE / BULK PRODUCT ENDPOINTS
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# PRODUCT PROCESSING ENDPOINTS (Existing)
+# =============================================================================
 
 @app.post("/generate-product", tags=["Product Processing"])
 def generate_product(req: ProductURLRequest):
@@ -602,15 +450,66 @@ def generate_products(req: BulkProductRequest):
             "timestamp": datetime.now().isoformat()}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DATABASE ENDPOINTS
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# NEW SEARCH SCRAPING ENDPOINT
+# =============================================================================
 
-def get_db_connection():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+@app.post("/scrape-products", response_model=List[SearchProductInfo], tags=["Product Processing"])
+def scrape_search_products(request: SearchScrapeRequest):
+    """
+    Scrape product URLs and IDs from AliExpress search results with pagination.
+    
+    Extracts only product URLs in format: https://pl.aliexpress.com/item/<PRODUCT_ID>.html
+    Rejects /srs/ redirect URLs automatically.
+    
+    Input format:
+    {
+        "search_url": "https://www.aliexpress.com/w/wholesale-enter-keywords.html?SearchText=enter-keywords&catId=0&g=y&shipFromCountry=enter_ship_from_country&trafficChannel=main",
+        "max_pages": 5,  # optional, defaults to all pages
+        "delay_between_requests": 1.0  # optional, seconds between page requests
+    }
+    
+    Returns list of products with product_id, product_url, and title.
+    """
+    if not request.search_url:
+        raise HTTPException(status_code=400, detail="search_url is required")
+    
+    if 'aliexpress.com' not in request.search_url.lower():
+        raise HTTPException(status_code=400, detail="Invalid AliExpress URL")
+    
+    try:
+        logger.info(f"🔍 Starting search scrape: {request.search_url}")
+        logger.info(f"   Max pages: {request.max_pages if request.max_pages else 'unlimited'}")
+        
+        products = scrape_search_results(
+            search_url=request.search_url,
+            max_pages=request.max_pages,
+            delay=request.delay_between_requests
+        )
+        
+        if not products:
+            logger.info("No products found")
+            return []
+        
+        logger.info(f"✅ Search scrape complete: {len(products)} products found")
+        
+        return [
+            SearchProductInfo(
+                product_id=p['product_id'],
+                product_url=p['product_url'],
+                title=p['title']
+            )
+            for p in products
+        ]
+        
+    except Exception as e:
+        logger.error(f"❌ Search scrape failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Scraping failed: {str(e)}")
 
+
+# =============================================================================
+# DATABASE VIEW ENDPOINTS (Existing - all preserved)
+# =============================================================================
 
 @app.get("/scraped-products", tags=["Database"])
 def view_scraped_products(limit: int = 100):
@@ -792,8 +691,12 @@ def get_stats():
         return {"error": str(e)}
 
 
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v2.7 — Search Scraping Edition")
+    logger.info("🚀 Octopia Template Pipeline v2.7 — Camoufox + Compliance + Search Scraper")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
