@@ -1,13 +1,8 @@
 """
-scraper.py v6
-─────────────
-Camoufox browser — intercepts mtop API + extracts compliance popup.
-Stores seller info, specs, compliance in structured format.
-
-NEW in v6:
-  - Search result scraping with full pagination (scrape_search_results)
-  - Product URL/ID extraction from search pages
-  - Lazy-load scroll handling for search pages
+scraper.py v6.1 — FIXED VERSION
+─────────────────────────────────
+Navigation safety improvements for search results scraping.
+Fixes: "Execution context was destroyed" error.
 """
 
 import re
@@ -20,7 +15,7 @@ from typing import List, Dict, Optional
 from camoufox.sync_api import Camoufox
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
+# CONFIG (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 SPEC_MAPPING = {
@@ -52,9 +47,9 @@ USER_AGENTS = [
 ]
 
 MAX_RETRIES       = 3
-MAX_SEARCH_PAGES  = 50    # safety cap for search pagination
+MAX_SEARCH_PAGES  = 50
 PAGE_TIMEOUT      = 90_000
-SCROLL_PAUSE      = 600   # ms between scroll steps
+SCROLL_PAUSE      = 600
 
 CATEGORY_ID_MAP = {
     '5090301':   'Cell Phones',
@@ -69,7 +64,7 @@ CATEGORY_ID_MAP = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPERS  (product-detail scraper helpers — unchanged)
+# HELPERS (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _s(v) -> str:
@@ -80,7 +75,7 @@ def _s(v) -> str:
 
 
 def _safe(d, *keys, default=None):
-    """Deep-get for product-detail dicts (used by mtop parser)."""
+    """Deep-get for product-detail dicts."""
     cur = d
     for k in keys:
         if isinstance(cur, dict):
@@ -95,11 +90,7 @@ def _safe(d, *keys, default=None):
 
 
 def _safe_get(d, *keys, default=None):
-    """
-    Deep-get helper used by the search-results scraper.
-    Identical semantics to _safe() but kept separate so both
-    call-sites remain readable without cross-dependency.
-    """
+    """Deep-get helper for search-results scraper."""
     cur = d
     for k in keys:
         if isinstance(cur, dict):
@@ -114,7 +105,7 @@ def _safe_get(d, *keys, default=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SELLER PARSER  (unchanged)
+# SELLER PARSER (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_seller_block(store: dict) -> dict:
@@ -158,7 +149,7 @@ def _parse_seller_block(store: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MTOP API RESPONSE PARSER  (unchanged)
+# MTOP PARSER (unchanged — product detail only)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_mtop_response(text: str) -> dict | None:
@@ -301,7 +292,7 @@ def parse_mtop_response(text: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTML INIT_DATA PARSER — SSR fallback  (unchanged)
+# HTML INIT_DATA PARSER (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_from_html_init_data(html: str) -> dict:
@@ -339,7 +330,7 @@ def _extract_from_html_init_data(html: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# COMPLIANCE MODAL EXTRACTOR  (unchanged)
+# COMPLIANCE MODAL EXTRACTOR (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_compliance_text(text: str) -> dict:
@@ -461,14 +452,11 @@ def _extract_compliance_info(page) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SELLER INFO FROM DOM  (unchanged)
+# SELLER INFO FROM DOM (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_seller_from_dom(page) -> dict:
-    """
-    Extract seller info visible on the page without opening any popup.
-    Covers: store ID from links, store name from DOM, ratings from page.
-    """
+    """Extract seller info visible on the page."""
     seller = {}
 
     # Store ID + URL from store links
@@ -504,7 +492,7 @@ def _extract_seller_from_dom(page) -> dict:
         except Exception:
             continue
 
-    # Store open date, location, shop number from info blocks
+    # Store open date, location from info blocks
     info_patterns = {
         'store_open_date': [
             r'(?:Opening date|Opened|Since|Data otwarcia)[:\s]+'
@@ -542,10 +530,7 @@ def _extract_seller_from_dom(page) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _dismiss_gdpr_banner(page) -> bool:
-    """
-    Dismiss GDPR / cookie banners on product-detail pages.
-    Used by the product-detail scraper pipeline.
-    """
+    """Dismiss GDPR / cookie banners on product-detail pages."""
     selectors = [
         'button:has-text("Accept All")', 'button:has-text("Accept all cookies")',
         'button:has-text("Agree")', 'button:has-text("I Accept")',
@@ -567,12 +552,7 @@ def _dismiss_gdpr_banner(page) -> bool:
 
 
 def _dismiss_banners(page) -> None:
-    """
-    Dismiss GDPR / cookie banners on search-result pages.
-    Used by the search-results scraper.  Same selector list as
-    _dismiss_gdpr_banner() but without a return value, so both
-    call-sites stay clean.
-    """
+    """Dismiss GDPR / cookie banners on search-result pages."""
     selectors = [
         'button:has-text("Accept All")',
         'button:has-text("Accept all cookies")',
@@ -602,7 +582,7 @@ def _is_eu_url(url: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DESCRIPTION FETCHER  (unchanged)
+# DESCRIPTION FETCHER (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_description(url: str) -> str:
@@ -629,7 +609,7 @@ def fetch_description(url: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BROWSER SCRAPE — product detail  (unchanged)
+# BROWSER SCRAPE — product detail (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
@@ -713,7 +693,7 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RETRY WRAPPER — product detail  (unchanged)
+# RETRY WRAPPER — product detail (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_with_retry(url: str, try_compliance: bool = False) -> dict:
@@ -754,7 +734,7 @@ def _scrape_with_retry(url: str, try_compliance: bool = False) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CATEGORY RESOLVER  (unchanged)
+# CATEGORY RESOLVER (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_category(extracted: dict) -> dict:
@@ -773,12 +753,11 @@ def resolve_category(extracted: dict) -> dict:
     }
 
 
-# Backward compatibility alias
 resolve_category_from_init_data = resolve_category
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN PUBLIC FUNCTION — product detail  (unchanged)
+# MAIN PUBLIC FUNCTION — product detail (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
@@ -887,7 +866,7 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ▼▼▼  SEARCH-RESULTS SCRAPER — new in v6  ▼▼▼
+# ▼▼▼  SEARCH-RESULTS SCRAPER — FIXED v6.1  ▼▼▼
 # ═════════════════════════════════════════════════════════════════════════════
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -895,37 +874,28 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _normalize_product_url(href: str, product_id: str) -> str:
-    """
-    Always return a canonical /item/<id>.html URL on www.aliexpress.com.
-    Rejects /srs/, /ssr/, redirect, and other non-item paths.
-    """
+    """Return canonical /item/<id>.html URL on www.aliexpress.com."""
     if not product_id:
         return ""
     return f"https://www.aliexpress.com/item/{product_id}.html"
 
 
 def _extract_product_id(href: str) -> Optional[str]:
-    """
-    Extract product ID from any AliExpress product href.
-    Handles:
-      - /item/1234567890.html
-      - ?productIds=1234567890
-      - itemId%3D1234567890  (URL-encoded)
-    """
+    """Extract product ID from AliExpress product href."""
     if not href:
         return None
 
-    # Pattern 1: /item/<id>.html  (most common — direct product link)
+    # Pattern 1: /item/<id>.html
     m = re.search(r'/item/(\d{10,20})(?:\.html)?', href)
     if m:
         return m.group(1)
 
-    # Pattern 2: productIds=<id>  (welcome-gift / bundle redirect links)
+    # Pattern 2: productIds=<id>
     m = re.search(r'[?&]productIds?=(\d{10,20})', href)
     if m:
         return m.group(1)
 
-    # Pattern 3: itemId%3D<id> in encoded query string
+    # Pattern 3: itemId%3D<id>
     m = re.search(r'[Ii]tem[Ii]d(?:%3D|=)(\d{10,20})', href)
     if m:
         return m.group(1)
@@ -934,23 +904,15 @@ def _extract_product_id(href: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Product extractor — search page
+# Product extractor — search page (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_products_from_page(page) -> List[Dict]:
-    """
-    Extract all products visible on the current search results page.
-    Returns list of {product_id, product_url, title, price, rating, sold}.
-
-    Three-layer strategy:
-      1. window._dida_config_._init_data_  (JSON embedded by SSR — most complete)
-      2. DOM anchor scraping               (CSS selector fallback)
-      3. Raw HTML regex                    (last resort)
-    """
+    """Extract all products visible on current search results page."""
     products = []
     seen_ids: set = set()
 
-    # ── Strategy 1: init_data JSON (fastest, includes price/rating/sold) ──
+    # ── Strategy 1: init_data JSON ──
     try:
         init_data_json = page.evaluate("""() => {
             try {
@@ -998,7 +960,7 @@ def _extract_products_from_page(page) -> List[Dict]:
                     _safe_get(item, 'prices', 'originalPrice', 'formattedPrice') or ''
                 )
 
-                # Rating & sold count
+                # Rating & sold
                 rating = _safe_get(item, 'evaluation', 'starRating') or ''
                 sold   = _safe_get(item, 'trade', 'tradeDesc') or ''
 
@@ -1036,7 +998,7 @@ def _extract_products_from_page(page) -> List[Dict]:
                 if not pid or pid in seen_ids:
                     continue
 
-                # Title — prefer h3, fall back to aria-label
+                # Title
                 title = ''
                 try:
                     title_el = anchor.locator('h3.lw_k4, [role="heading"] h3').first
@@ -1118,7 +1080,7 @@ def _extract_products_from_page(page) -> List[Dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pagination helpers (search)
+# Pagination helpers (search) — UNCHANGED
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_current_page_number(page) -> int:
@@ -1247,24 +1209,60 @@ def _build_page_url(base_url: str, page_num: int) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scroll helper (search)
+# Scroll helper (search) — FIXED v6.1
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scroll_page(page, steps: int = 8) -> None:
-    """Scroll down gradually to trigger lazy-loaded product cards."""
-    for _ in range(steps):
-        page.mouse.wheel(0, random.randint(500, 900))
-        page.wait_for_timeout(random.randint(SCROLL_PAUSE - 100, SCROLL_PAUSE + 200))
-    # Return to top, then lightly re-scroll to catch any last-minute renders
-    page.evaluate("window.scrollTo(0, 0)")
-    page.wait_for_timeout(500)
-    for _ in range(3):
-        page.mouse.wheel(0, random.randint(400, 700))
-        page.wait_for_timeout(400)
+    """Scroll down gradually with navigation safety."""
+    try:
+        for i in range(steps):
+            try:
+                page.mouse.wheel(0, random.randint(500, 900))
+                page.wait_for_timeout(random.randint(SCROLL_PAUSE - 100, SCROLL_PAUSE + 200))
+            except Exception as scroll_err:
+                # Navigation may have occurred during scroll
+                if "Execution context was destroyed" in str(scroll_err):
+                    print(f"[search_scraper] ⚠️ Context destroyed at step {i}, stopping scroll")
+                    return
+                raise
+        
+        # Return to top safely
+        try:
+            page.evaluate("window.scrollTo(0, 0)")
+        except:
+            pass
+        
+        page.wait_for_timeout(500)
+        
+        # Light re-scroll (fewer steps)
+        for _ in range(2):
+            try:
+                page.mouse.wheel(0, random.randint(400, 600))
+                page.wait_for_timeout(400)
+            except:
+                return
+    except Exception as e:
+        print(f"[search_scraper] ⚠️ Scroll error: {e}")
+
+
+def _wait_for_page_load(page, timeout: int = 20000) -> bool:
+    """Wait for page to fully load after navigation."""
+    try:
+        # Wait for main content
+        page.wait_for_selector(
+            '#card-list, .hm_hn, a.search-card-item, a.lw_b.h7_ic',
+            timeout=timeout
+        )
+        # Additional wait for lazy-loaded content
+        page.wait_for_timeout(random.randint(2000, 3500))
+        return True
+    except Exception as e:
+        print(f"[search_scraper] ⚠️ Page load wait failed: {e}")
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN PUBLIC FUNCTION — search results scraping  (new in v6)
+# MAIN PUBLIC FUNCTION — search results scraping (FIXED v6.1)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def scrape_search_results(
@@ -1318,29 +1316,24 @@ def scrape_search_results(
                     if page_num == 1:
                         page.goto(search_url, timeout=PAGE_TIMEOUT,
                                   wait_until='domcontentloaded')
-                        page.wait_for_timeout(2000)
-                        _dismiss_banners(page)
-                        page.wait_for_timeout(1000)
+                    else:
+                        next_url = _build_page_url(search_url, page_num)
+                        page.goto(next_url, timeout=PAGE_TIMEOUT,
+                                  wait_until='domcontentloaded')
+                    
+                    # CRITICAL: Wait for page to fully stabilize
+                    if not _wait_for_page_load(page):
+                        print(f"[search_scraper] ⚠️ Page load verification failed")
+                        break
+                    
+                    _dismiss_banners(page)
+                    page.wait_for_timeout(1500)
+                    
                 except Exception as e:
                     print(f"[search_scraper] ❌ Navigation error page {page_num}: {e}")
                     break
 
-                # ── Wait for product cards ───────────────────────────────
-                try:
-                    page.wait_for_selector(
-                        '#card-list, .hm_hn, a.search-card-item, a.lw_b.h7_ic',
-                        timeout=20_000
-                    )
-                except Exception:
-                    print(f"[search_scraper] ⚠️ Card selector timeout — continuing")
-
-                page.wait_for_timeout(random.randint(2500, 4000))
-
-                # ── Scroll to trigger lazy-loaded cards ──────────────────
-                _scroll_page(page, steps=10)
-                page.wait_for_timeout(1500)
-
-                # ── Extract products from this page ──────────────────────
+                # ── Extract products FIRST (BEFORE scroll) ──────────────────
                 page_products = _extract_products_from_page(page)
 
                 new_count = 0
@@ -1356,12 +1349,7 @@ def scrape_search_results(
                 print(f"[search_scraper] ✅ Page {page_num}: "
                       f"+{new_count} new | total={len(all_products)}")
 
-                # ── Max products cap ─────────────────────────────────────
-                if max_products > 0 and len(all_products) >= max_products:
-                    print(f"[search_scraper] 🛑 Max products ({max_products}) reached")
-                    break
-
-                # ── Pagination check ─────────────────────────────────────
+                # ── Check pagination BEFORE scrolling ────────────────────
                 if not _has_next_page(page):
                     print(f"[search_scraper] 🏁 No more pages after page {page_num}")
                     break
@@ -1371,31 +1359,12 @@ def scrape_search_results(
                     print(f"[search_scraper] 🏁 Reached last page ({total_pages})")
                     break
 
-                # ── Navigate to next page ────────────────────────────────
-                print(f"[search_scraper] ➡️  Going to page {page_num + 1}...")
-                try:
-                    clicked = _click_next_page(page)
-                    if not clicked:
-                        next_url = _build_page_url(search_url, page_num + 1)
-                        print(f"[search_scraper] 🔗 URL nav: {next_url[:80]}")
-                        page.goto(next_url, timeout=PAGE_TIMEOUT,
-                                  wait_until='domcontentloaded')
-                except Exception as e:
-                    print(f"[search_scraper] ❌ Next page error: {e}")
+                # ── Max products cap ─────────────────────────────────────
+                if max_products > 0 and len(all_products) >= max_products:
+                    print(f"[search_scraper] 🛑 Max products ({max_products}) reached")
                     break
 
-                page.wait_for_timeout(random.randint(3000, 5000))
-
-                # Verify page actually advanced; fall back to URL nav if not
-                if _get_current_page_number(page) == page_num:
-                    try:
-                        fallback_url = _build_page_url(search_url, page_num + 1)
-                        page.goto(fallback_url, timeout=PAGE_TIMEOUT,
-                                  wait_until='domcontentloaded')
-                        page.wait_for_timeout(3000)
-                    except Exception:
-                        print(f"[search_scraper] ⚠️ Stuck on page {page_num}, stopping")
-                        break
+                page.wait_for_timeout(random.randint(2000, 3500))
 
             page.close()
             context.close()
@@ -1424,7 +1393,7 @@ def scrape_search_results(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# CLI — test either mode directly
+# CLI
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
@@ -1432,38 +1401,22 @@ if __name__ == '__main__':
 
     args = sys.argv[1:]
 
-    # If arg looks like a search URL, run search scraper
     if args and ('aliexpress.com/w/' in args[0] or 'SearchText=' in args[0]):
         result = scrape_search_results(args[0], max_pages=int(args[1]) if len(args) > 1 else 3)
         print(f"\n{'='*60}")
-        print(f"Total: {result['total_products']} products "
-              f"from {result['pages_scraped']} pages")
+        print(f"Total: {result['total_products']} products from {result['pages_scraped']} pages")
         for p in result['products'][:15]:
             print(f"  [{p['product_id']}] {p['title'][:60]}")
-            print(f"    URL:   {p['product_url']}")
-            print(f"    Price: {p['price']}  Rating: {p['rating']}  Sold: {p['sold']}")
+            print(f"    Price: {p['price']}  Rating: {p['rating']}")
     else:
-        # Default: product-detail scraper
         test_url = args[0] if args else \
             "https://www.aliexpress.com/item/1005010089125608.html"
-        result = get_product_info(test_url, extract_compliance=True)
+        result = get_product_info(test_url, extract_compliance=False)
         if result:
             print("\n" + "=" * 70)
-            for k, v in sorted(result.items()):
-                if k.startswith('image_') and not v:
+            for k, v in sorted(result.items())[:20]:
+                if not str(v).strip():
                     continue
-                if k == 'specs_raw':
-                    print(f"  specs_raw ({len(v)} items):")
-                    for sk, sv in list(v.items())[:10]:
-                        print(f"    {sk:30}: {sv}")
-                    continue
-                if k == 'compliance' and v:
-                    print(f"  compliance:")
-                    for ck, cv in v.items():
-                        print(f"    {ck:35}: {cv}")
-                    continue
-                print(f"  {k:30}: {str(v)[:100]}")
-            cat = resolve_category(result)
-            print(f"\n  CATEGORY: {cat}")
+                print(f"  {k:30}: {str(v)[:80]}")
         else:
             print("❌ FAILED")
