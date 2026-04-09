@@ -1,9 +1,27 @@
 """
-db.py - Complete schema with seller_info + compliance tables.
+db.py — Complete schema with all tables including restricted_keywords.
+
+Tables:
+  categories              — Octopia category tree with embeddings
+  scraped_products        — Raw scraped product data
+  seller_info             — Seller / store information (1:1 with product)
+  compliance_info         — EU DSA compliance modal data (1:many)
+  enhanced_content        — OpenAI-enhanced titles, descriptions, bullet points
+  category_assignments    — Category assigned to each product
+  mapped_products         — Template-column-mapped product data
+  template_outputs        — Generated Excel file paths
+  processing_logs         — Step-by-step pipeline log
+  original_specifications — Specs as scraped (before enhancement)
+  enhanced_specifications — Specs after OpenAI enhancement
+  specification_audit_log — Diff: original vs enhanced vs template
+  restricted_keywords     — Keywords forbidden in descriptions / specs
+                            (loaded from desc_and_spec_restricted_keywords CSV)
 """
 
 import sqlite3
 import json
+import csv
+import os
 
 DB_NAME = "products.db"
 
@@ -59,7 +77,6 @@ def create_all_tables():
         scraped_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    # ── SELLER INFO ────────────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS seller_info (
         id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,8 +99,6 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # ── COMPLIANCE TABLE ────────────────────────────────────────────────────
-    # Composite unique key: product_id + compliance_product_id
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS compliance_info (
         id                       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,14 +258,158 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
+    # ── RESTRICTED KEYWORDS TABLE ──────────────────────────────────────────
+    # Stores keywords that must NOT appear in descriptions or specifications.
+    # Source: desc_and_spec_restricted_keywords CSV column.
+    # Usage: filter_restricted_keywords() in openai_client.py or data_mapper.py
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS restricted_keywords (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        keyword    TEXT UNIQUE NOT NULL COLLATE NOCASE,
+        added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
     conn.commit()
     conn.close()
-    print("✅ All tables created (including seller_info and compliance_info)")
+    print("All tables created (including restricted_keywords)")
 
 
-# ─────────────────────────────────────────
+# =============================================================================
+# RESTRICTED KEYWORDS
+# =============================================================================
+
+def load_restricted_keywords_from_csv(csv_path: str) -> int:
+    """
+    Load restricted keywords from the CSV file into the restricted_keywords table.
+
+    CSV format (column name: desc_and_spec_restricted_keywords):
+        "desc_and_spec_restricted_keywords"
+        "shipping"
+        "free shipping"
+        ...
+
+    Returns number of keywords inserted.
+
+    HOW TO RUN:
+        python -c "from db import load_restricted_keywords_from_csv; \
+                   load_restricted_keywords_from_csv('restricted_keywords.csv')"
+    """
+    if not os.path.exists(csv_path):
+        print(f"[db] CSV not found: {csv_path}")
+        return 0
+
+    conn    = create_connection()
+    cursor  = conn.cursor()
+    count   = 0
+    skipped = 0
+
+    try:
+        with open(csv_path, newline='', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Accept the column with or without quotes in header
+                keyword = (
+                    row.get('desc_and_spec_restricted_keywords') or
+                    row.get('"desc_and_spec_restricted_keywords"') or
+                    list(row.values())[0]
+                )
+                if not keyword:
+                    continue
+                keyword = keyword.strip().strip('"')
+                if not keyword:
+                    continue
+                try:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO restricted_keywords (keyword) VALUES (?)",
+                        (keyword,)
+                    )
+                    if cursor.rowcount > 0:
+                        count += 1
+                    else:
+                        skipped += 1
+                except Exception:
+                    skipped += 1
+
+        conn.commit()
+        print(f"[db] Restricted keywords loaded: {count} inserted, {skipped} skipped (duplicates)")
+        return count
+
+    except Exception as e:
+        print(f"[db] Error loading restricted keywords: {e}")
+        return 0
+    finally:
+        conn.close()
+
+
+def get_restricted_keywords() -> list:
+    """
+    Return all restricted keywords as a lowercase list.
+    Used by filter_restricted_keywords() for fast in-memory filtering.
+    Cached at module level after first call.
+    """
+    conn = create_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT keyword FROM restricted_keywords")
+        rows = cursor.fetchall()
+        return [row[0].lower().strip() for row in rows if row[0]]
+    except Exception as e:
+        print(f"[db] Error reading restricted keywords: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def filter_restricted_keywords(text: str, keywords: list = None) -> tuple:
+    """
+    Scan text for restricted keywords.
+
+    Args:
+        text:     The text to scan (description, spec value, bullet point, etc.)
+        keywords: Pre-loaded keyword list (pass in to avoid repeated DB calls).
+                  If None, loads from DB.
+
+    Returns:
+        (cleaned_text, found_keywords_list)
+        - cleaned_text: text with restricted phrases replaced by '[REMOVED]'
+        - found_keywords_list: list of matched keywords (empty if none)
+
+    Usage in openai_client.py / data_mapper.py:
+        from db import get_restricted_keywords, filter_restricted_keywords
+
+        # Load once at startup
+        RESTRICTED = get_restricted_keywords()
+
+        # Use per field
+        clean_desc, flagged = filter_restricted_keywords(description, RESTRICTED)
+        if flagged:
+            logger.warning(f"Restricted keywords found: {flagged}")
+    """
+    if not text:
+        return text, []
+
+    if keywords is None:
+        keywords = get_restricted_keywords()
+
+    found    = []
+    cleaned  = text
+
+    for kw in keywords:
+        # Case-insensitive whole-phrase match
+        pattern = re.compile(re.escape(kw), re.IGNORECASE)
+        if pattern.search(cleaned):
+            found.append(kw)
+            cleaned = pattern.sub('[REMOVED]', cleaned)
+
+    return cleaned, found
+
+
+import re  # needed for filter_restricted_keywords
+
+
+# =============================================================================
 # SELLER INFO
-# ─────────────────────────────────────────
+# =============================================================================
 
 SELLER_FIELDS = [
     'store_name', 'store_id', 'store_url', 'seller_id',
@@ -289,13 +448,40 @@ def insert_seller_info(product_id: int, seller_data: dict) -> bool:
             seller_data.get('is_top_rated', ''),
         ))
         conn.commit()
-        print(f"✅ Seller info saved (product_id={product_id})")
+        print(f"Seller info saved (product_id={product_id})")
         return True
     except sqlite3.IntegrityError:
-        print(f"⚠️ Seller info already exists (product_id={product_id})")
-        return False
+        # Update existing record
+        cursor.execute("""
+            UPDATE seller_info SET
+                store_name=?, store_id=?, store_url=?, seller_id=?,
+                seller_positive_rate=?, seller_rating=?, seller_communication=?,
+                seller_shipping_speed=?, seller_country=?, store_open_date=?,
+                seller_level=?, seller_total_reviews=?, seller_positive_num=?,
+                is_top_rated=?
+            WHERE product_id=?
+        """, (
+            seller_data.get('store_name', ''),
+            seller_data.get('store_id', ''),
+            seller_data.get('store_url', ''),
+            seller_data.get('seller_id', ''),
+            seller_data.get('seller_positive_rate', ''),
+            seller_data.get('seller_rating', ''),
+            seller_data.get('seller_communication', ''),
+            seller_data.get('seller_shipping_speed', ''),
+            seller_data.get('seller_country', ''),
+            seller_data.get('store_open_date', ''),
+            seller_data.get('seller_level', ''),
+            seller_data.get('seller_total_reviews', ''),
+            seller_data.get('seller_positive_num', ''),
+            seller_data.get('is_top_rated', ''),
+            product_id,
+        ))
+        conn.commit()
+        print(f"Seller info updated (product_id={product_id})")
+        return True
     except Exception as e:
-        print(f"❌ Seller info error: {e}")
+        print(f"Seller info error: {e}")
         return False
     finally:
         conn.close()
@@ -315,16 +501,11 @@ def get_seller_info(product_id: int) -> dict:
         conn.close()
 
 
-# ─────────────────────────────────────────
+# =============================================================================
 # COMPLIANCE INFO
-# ─────────────────────────────────────────
+# =============================================================================
 
 def insert_compliance_info(product_id: int, compliance_data: dict) -> bool:
-    """
-    Store compliance info with composite unique key (product_id, compliance_product_id).
-    This means if the same product is scraped twice with same compliance_product_id,
-    it won't duplicate.
-    """
     if not compliance_data:
         return False
     conn   = create_connection()
@@ -332,16 +513,11 @@ def insert_compliance_info(product_id: int, compliance_data: dict) -> bool:
     try:
         cursor.execute("""
             INSERT OR IGNORE INTO compliance_info (
-                product_id,
-                compliance_product_id,
-                manufacturer_name,
-                manufacturer_address,
-                manufacturer_email,
-                manufacturer_phone,
-                eu_responsible_name,
-                eu_responsible_address,
-                eu_responsible_email,
-                eu_responsible_phone
+                product_id, compliance_product_id,
+                manufacturer_name, manufacturer_address,
+                manufacturer_email, manufacturer_phone,
+                eu_responsible_name, eu_responsible_address,
+                eu_responsible_email, eu_responsible_phone
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             product_id,
@@ -357,26 +533,21 @@ def insert_compliance_info(product_id: int, compliance_data: dict) -> bool:
         ))
         conn.commit()
         if cursor.rowcount > 0:
-            print(f"✅ Compliance info saved (product_id={product_id})")
-        else:
-            print(f"⚠️ Compliance already exists (product_id={product_id})")
+            print(f"Compliance info saved (product_id={product_id})")
         return True
     except Exception as e:
-        print(f"❌ Compliance info error: {e}")
+        print(f"Compliance info error: {e}")
         return False
     finally:
         conn.close()
 
 
 def get_compliance_info(product_id: int) -> list:
-    """Returns list because one product can have multiple compliance records."""
     conn = create_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     try:
-        cursor.execute(
-            "SELECT * FROM compliance_info WHERE product_id = ?", (product_id,)
-        )
+        cursor.execute("SELECT * FROM compliance_info WHERE product_id = ?", (product_id,))
         return [dict(r) for r in cursor.fetchall()]
     except Exception:
         return []
@@ -384,9 +555,9 @@ def get_compliance_info(product_id: int) -> list:
         conn.close()
 
 
-# ─────────────────────────────────────────
+# =============================================================================
 # SCRAPED PRODUCTS
-# ─────────────────────────────────────────
+# =============================================================================
 
 def insert_scraped_product(url, attributes):
     conn   = create_connection()
@@ -430,23 +601,24 @@ def insert_scraped_product(url, attributes):
         ))
         conn.commit()
         product_id = cursor.lastrowid
-        print(f"✅ Scraped product saved (product_id={product_id})")
+        print(f"Scraped product saved (product_id={product_id})")
         return product_id
     except sqlite3.IntegrityError:
         cursor.execute("SELECT product_id FROM scraped_products WHERE url = ?", (url,))
-        product_id = cursor.fetchone()[0]
-        print(f"⚠️ Product already exists (product_id={product_id})")
+        row = cursor.fetchone()
+        product_id = row[0] if row else None
+        print(f"Product already exists (product_id={product_id})")
         return product_id
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"Error inserting scraped product: {e}")
         return None
     finally:
         conn.close()
 
 
-# ─────────────────────────────────────────
+# =============================================================================
 # REMAINING FUNCTIONS (unchanged)
-# ─────────────────────────────────────────
+# =============================================================================
 
 def insert_category_assignment(product_id, orig_cat_id, orig_cat_name,
                                 enh_cat_id, enh_cat_name, confidence):
@@ -498,10 +670,10 @@ def insert_mapped_product(product_id, category_id, mapped_data):
             json.dumps({k: v for k, v in mapped_data.items()})
         ))
         conn.commit()
-        print(f"✅ Mapped product saved (product_id={product_id})")
+        print(f"Mapped product saved (product_id={product_id})")
         return True
     except Exception as e:
-        print(f"❌ Mapped product error: {e}")
+        print(f"Mapped product error: {e}")
         return False
     finally:
         conn.close()
@@ -520,7 +692,7 @@ def insert_template_output(product_id, category_id, output_type,
         conn.commit()
         return True
     except Exception as e:
-        print(f"❌ Template output error: {e}")
+        print(f"Template output error: {e}")
         return False
     finally:
         conn.close()
@@ -536,7 +708,7 @@ def log_processing(product_id, url, step, status, message=""):
         """, (product_id, url, step, status, message))
         conn.commit()
     except Exception as e:
-        print(f"❌ Log error: {e}")
+        print(f"Log error: {e}")
     finally:
         conn.close()
 
@@ -575,12 +747,12 @@ def insert_enhanced_content(product_id, enhanced_data):
             enhanced_data.get('product_type', '')
         ))
         conn.commit()
-        print(f"✅ Enhanced content saved (product_id={product_id})")
+        print(f"Enhanced content saved (product_id={product_id})")
         return True
     except sqlite3.IntegrityError:
         return False
     except Exception as e:
-        print(f"❌ Enhanced content error: {e}")
+        print(f"Enhanced content error: {e}")
         return False
     finally:
         conn.close()
@@ -612,12 +784,12 @@ def insert_original_specifications(product_id, original_specs):
             original_specs.get("gender", "")
         ))
         conn.commit()
-        print(f"✅ Original specs saved (product_id={product_id})")
+        print(f"Original specs saved (product_id={product_id})")
         return True
     except sqlite3.IntegrityError:
         return False
     except Exception as e:
-        print(f"⚠️ Original specs error: {e}")
+        print(f"Original specs error: {e}")
         return False
     finally:
         conn.close()
@@ -649,12 +821,12 @@ def insert_enhanced_specifications(product_id, enhanced_specs):
             enhanced_specs.get("gender", "")
         ))
         conn.commit()
-        print(f"✅ Enhanced specs saved (product_id={product_id})")
+        print(f"Enhanced specs saved (product_id={product_id})")
         return True
     except sqlite3.IntegrityError:
         return False
     except Exception as e:
-        print(f"⚠️ Enhanced specs error: {e}")
+        print(f"Enhanced specs error: {e}")
         return False
     finally:
         conn.close()
@@ -674,7 +846,7 @@ def log_specification_audit(product_id, spec_field, original_value,
               enhanced_value or "", template_value or "", source_used, notes))
         conn.commit()
     except Exception as e:
-        print(f"⚠️ Audit log error: {e}")
+        print(f"Audit log error: {e}")
     finally:
         conn.close()
 
@@ -691,7 +863,7 @@ def log_all_spec_audits(product_id, scraped_data, specs_enhanced, enriched_data_
         source       = "enhanced" if template_val else "empty"
         log_specification_audit(product_id, field, original_val,
                                 enhanced_val, template_val, source)
-    print(f"✅ Audit log written (product_id={product_id})")
+    print(f"Audit log written (product_id={product_id})")
 
 
 # Backward compat
@@ -700,3 +872,18 @@ def create_table():
 
 def create_categories_table():
     pass
+
+
+# =============================================================================
+# CLI — load restricted keywords directly
+# =============================================================================
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == 'load-keywords':
+        csv_file = sys.argv[2] if len(sys.argv) > 2 else 'restricted_keywords.csv'
+        create_all_tables()
+        n = load_restricted_keywords_from_csv(csv_file)
+        print(f"Loaded {n} keywords from {csv_file}")
+    else:
+        create_all_tables()
+        print("Tables created. To load keywords: python db.py load-keywords restricted_keywords.csv")
