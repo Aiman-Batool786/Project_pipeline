@@ -1277,6 +1277,7 @@ def scrape_search_results(
     max_pages: int = MAX_SEARCH_PAGES,
     max_products: int = 0,
     deduplicate: bool = True,
+    delay: float = 1.5,  # ← ADD THIS LINE
 ) -> Dict:
     """
     Scrape AliExpress search result pages and return product IDs + URLs.
