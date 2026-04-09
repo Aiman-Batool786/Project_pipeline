@@ -387,6 +387,8 @@ def scrape_search_results(
     max_pages: Optional[int] = None,
     delay: float = 1.5,
 ) -> List[Dict]:
+      sleep_time = random.uniform(PAGE_DELAY_MIN, PAGE_DELAY_MAX) if delay is None else random.uniform(delay, delay * 1.5)
+
     """
     Scrape AliExpress search results across multiple pages.
 
