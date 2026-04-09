@@ -1,11 +1,9 @@
 """
-db.py - Complete schema with seller_info + compliance + restricted_keywords tables.
+db.py - Complete schema with seller_info + compliance tables.
 """
 
 import sqlite3
 import json
-import csv
-import os
 
 DB_NAME = "products.db"
 
@@ -15,10 +13,14 @@ def create_connection():
 
 
 def create_all_tables():
-    conn = create_connection()
+    conn   = create_connection()
     cursor = conn.cursor()
 
-    # Categories table
+    try:
+        cursor.execute("ALTER TABLE categories RENAME TO categories_old")
+    except sqlite3.OperationalError:
+        pass
+
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS categories (
         category_id   INTEGER PRIMARY KEY,
@@ -26,7 +28,6 @@ def create_all_tables():
         embedding     BLOB
     )""")
 
-    # Scraped products table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS scraped_products (
         product_id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,7 +59,7 @@ def create_all_tables():
         scraped_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    # Seller info table
+    # ── SELLER INFO ────────────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS seller_info (
         id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,7 +82,8 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # Compliance info table
+    # ── COMPLIANCE TABLE ────────────────────────────────────────────────────
+    # Composite unique key: product_id + compliance_product_id
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS compliance_info (
         id                       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,16 +102,6 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # Restricted keywords table
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS restricted_keywords (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        keyword     TEXT UNIQUE,
-        category    TEXT DEFAULT 'description_spec',
-        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-
-    # Enhanced content table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS enhanced_content (
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,7 +123,6 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # Category assignments table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS category_assignments (
         id                     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,7 +135,6 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # Mapped products table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS mapped_products (
         id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,7 +161,6 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # Template outputs table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS template_outputs (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -186,7 +175,6 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # Processing logs table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS processing_logs (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,7 +187,6 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # Original specifications table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS original_specifications (
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -221,7 +208,6 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # Enhanced specifications table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS enhanced_specifications (
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,7 +229,6 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # Specification audit log table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS specification_audit_log (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -260,71 +245,13 @@ def create_all_tables():
 
     conn.commit()
     conn.close()
-    print("✅ All tables created (including seller_info, compliance_info, and restricted_keywords)")
+    print("✅ All tables created (including seller_info and compliance_info)")
 
 
-def load_restricted_keywords_from_csv(csv_file_path):
-    """
-    Load restricted keywords from CSV file into database
-    
-    Args:
-        csv_file_path: Path to CSV file with column 'desc_and_spec_restricted_keywords'
-    
-    Returns:
-        Number of keywords loaded
-    """
-    if not os.path.exists(csv_file_path):
-        print(f"❌ CSV file not found: {csv_file_path}")
-        return 0
-    
-    conn = create_connection()
-    cursor = conn.cursor()
-    
-    count = 0
-    try:
-        with open(csv_file_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                keyword = row.get('desc_and_spec_restricted_keywords', '').strip()
-                if keyword:
-                    try:
-                        cursor.execute(
-                            "INSERT OR IGNORE INTO restricted_keywords (keyword, category) VALUES (?, ?)",
-                            (keyword, 'description_spec')
-                        )
-                        if cursor.rowcount > 0:
-                            count += 1
-                    except Exception as e:
-                        print(f"⚠️ Error inserting keyword '{keyword}': {e}")
-        
-        conn.commit()
-        print(f"✅ Loaded {count} restricted keywords from CSV")
-        
-    except Exception as e:
-        print(f"❌ Error loading CSV: {e}")
-    finally:
-        conn.close()
-    
-    return count
+# ─────────────────────────────────────────
+# SELLER INFO
+# ─────────────────────────────────────────
 
-
-def get_restricted_keywords():
-    """Get all restricted keywords from database"""
-    conn = create_connection()
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("SELECT keyword FROM restricted_keywords")
-        keywords = [row[0] for row in cursor.fetchall()]
-        return keywords
-    except Exception as e:
-        print(f"❌ Error fetching restricted keywords: {e}")
-        return []
-    finally:
-        conn.close()
-
-
-# Seller info functions
 SELLER_FIELDS = [
     'store_name', 'store_id', 'store_url', 'seller_id',
     'seller_positive_rate', 'seller_rating', 'seller_communication',
@@ -334,15 +261,11 @@ SELLER_FIELDS = [
 
 
 def insert_seller_info(product_id: int, seller_data: dict) -> bool:
-    """Insert or update seller information"""
-    if not seller_data:
-        return False
-    
-    conn = create_connection()
+    conn   = create_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT OR REPLACE INTO seller_info (
+            INSERT INTO seller_info (
                 product_id, store_name, store_id, store_url, seller_id,
                 seller_positive_rate, seller_rating, seller_communication,
                 seller_shipping_speed, seller_country, store_open_date,
@@ -368,6 +291,9 @@ def insert_seller_info(product_id: int, seller_data: dict) -> bool:
         conn.commit()
         print(f"✅ Seller info saved (product_id={product_id})")
         return True
+    except sqlite3.IntegrityError:
+        print(f"⚠️ Seller info already exists (product_id={product_id})")
+        return False
     except Exception as e:
         print(f"❌ Seller info error: {e}")
         return False
@@ -376,7 +302,6 @@ def insert_seller_info(product_id: int, seller_data: dict) -> bool:
 
 
 def get_seller_info(product_id: int) -> dict:
-    """Get seller information for a product"""
     conn = create_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -390,16 +315,23 @@ def get_seller_info(product_id: int) -> dict:
         conn.close()
 
 
+# ─────────────────────────────────────────
+# COMPLIANCE INFO
+# ─────────────────────────────────────────
+
 def insert_compliance_info(product_id: int, compliance_data: dict) -> bool:
-    """Store compliance info"""
+    """
+    Store compliance info with composite unique key (product_id, compliance_product_id).
+    This means if the same product is scraped twice with same compliance_product_id,
+    it won't duplicate.
+    """
     if not compliance_data:
         return False
-    
-    conn = create_connection()
+    conn   = create_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT OR REPLACE INTO compliance_info (
+            INSERT OR IGNORE INTO compliance_info (
                 product_id,
                 compliance_product_id,
                 manufacturer_name,
@@ -424,7 +356,10 @@ def insert_compliance_info(product_id: int, compliance_data: dict) -> bool:
             compliance_data.get('eu_responsible_phone', ''),
         ))
         conn.commit()
-        print(f"✅ Compliance info saved (product_id={product_id})")
+        if cursor.rowcount > 0:
+            print(f"✅ Compliance info saved (product_id={product_id})")
+        else:
+            print(f"⚠️ Compliance already exists (product_id={product_id})")
         return True
     except Exception as e:
         print(f"❌ Compliance info error: {e}")
@@ -434,7 +369,7 @@ def insert_compliance_info(product_id: int, compliance_data: dict) -> bool:
 
 
 def get_compliance_info(product_id: int) -> list:
-    """Get compliance information for a product"""
+    """Returns list because one product can have multiple compliance records."""
     conn = create_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -449,13 +384,16 @@ def get_compliance_info(product_id: int) -> list:
         conn.close()
 
 
+# ─────────────────────────────────────────
+# SCRAPED PRODUCTS
+# ─────────────────────────────────────────
+
 def insert_scraped_product(url, attributes):
-    """Insert scraped product data"""
-    conn = create_connection()
+    conn   = create_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT OR REPLACE INTO scraped_products (
+            INSERT INTO scraped_products (
                 url, title, description, brand,
                 image_1, image_2, image_3, image_4, image_5, image_6,
                 color, dimensions, weight, material,
@@ -465,81 +403,300 @@ def insert_scraped_product(url, attributes):
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             url,
-            attributes.get("title", "")[:500],
-            attributes.get("description", "")[:5000],
-            attributes.get("brand", "")[:100],
+            attributes.get("title", ""),
+            attributes.get("description", ""),
+            attributes.get("brand", ""),
             attributes.get("image_1", ""),
             attributes.get("image_2", ""),
             attributes.get("image_3", ""),
             attributes.get("image_4", ""),
             attributes.get("image_5", ""),
             attributes.get("image_6", ""),
-            attributes.get("color", "")[:100],
-            attributes.get("dimensions", "")[:100],
-            attributes.get("weight", "")[:100],
-            attributes.get("material", "")[:200],
-            attributes.get("age_from", "")[:20],
-            attributes.get("age_to", "")[:20],
-            attributes.get("certifications", "")[:200],
-            attributes.get("country_of_origin", "")[:100],
+            attributes.get("color", ""),
+            attributes.get("dimensions", ""),
+            attributes.get("weight", ""),
+            attributes.get("material", ""),
+            attributes.get("age_from", ""),
+            attributes.get("age_to", ""),
+            attributes.get("certifications", ""),
+            attributes.get("country_of_origin", ""),
             json.dumps(attributes.get("bullet_points", [])),
-            attributes.get("price", "")[:50],
-            attributes.get("shipping", "")[:100],
-            attributes.get("warranty", "")[:200],
-            attributes.get("product_type", "")[:100],
-            attributes.get("store_name", "")[:200],
+            attributes.get("price", ""),
+            attributes.get("shipping", ""),
+            attributes.get("warranty", ""),
+            attributes.get("product_type", ""),
+            attributes.get("store_name", ""),
             json.dumps(attributes)
         ))
         conn.commit()
         product_id = cursor.lastrowid
         print(f"✅ Scraped product saved (product_id={product_id})")
         return product_id
+    except sqlite3.IntegrityError:
+        cursor.execute("SELECT product_id FROM scraped_products WHERE url = ?", (url,))
+        product_id = cursor.fetchone()[0]
+        print(f"⚠️ Product already exists (product_id={product_id})")
+        return product_id
     except Exception as e:
-        print(f"❌ Error inserting product: {e}")
+        print(f"❌ Error: {e}")
         return None
     finally:
         conn.close()
 
 
+# ─────────────────────────────────────────
+# REMAINING FUNCTIONS (unchanged)
+# ─────────────────────────────────────────
+
 def insert_category_assignment(product_id, orig_cat_id, orig_cat_name,
                                 enh_cat_id, enh_cat_name, confidence):
-    """Insert category assignment"""
-    conn = create_connection()
+    conn   = create_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
-            INSERT OR REPLACE INTO category_assignments
+            INSERT INTO category_assignments
             (product_id, original_category_id, original_category_name,
              enhanced_category_id, enhanced_category_name, confidence)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (product_id, orig_cat_id, orig_cat_name,
               enh_cat_id, enh_cat_name, confidence))
         conn.commit()
+    except sqlite3.IntegrityError:
+        pass
+    finally:
+        conn.close()
+
+
+def insert_mapped_product(product_id, category_id, mapped_data):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO mapped_products (
+                product_id, titre, description, marque,
+                url_image_1, couleur_principale, dimensions, poids, matiere,
+                age_from, age_to, certifications, pays_origine,
+                fabricant_nom, garantie, notes, additional_fields
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            mapped_data.get("title", ""),
+            mapped_data.get("description", ""),
+            mapped_data.get("brand", ""),
+            mapped_data.get("sellerPictureUrls_1", ""),
+            mapped_data.get("3264", ""),
+            mapped_data.get("24069", ""),
+            mapped_data.get("5403", ""),
+            mapped_data.get("24061", ""),
+            mapped_data.get("11335", ""),
+            mapped_data.get("24947", ""),
+            mapped_data.get("38412", ""),
+            mapped_data.get("37045", ""),
+            mapped_data.get("47456", ""),
+            mapped_data.get("37937", ""),
+            mapped_data.get("6587", ""),
+            json.dumps({k: v for k, v in mapped_data.items()})
+        ))
+        conn.commit()
+        print(f"✅ Mapped product saved (product_id={product_id})")
+        return True
     except Exception as e:
-        print(f"⚠️ Category assignment error: {e}")
+        print(f"❌ Mapped product error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def insert_template_output(product_id, category_id, output_type,
+                            file_path, file_name, status="success"):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO template_outputs
+            (product_id, category_id, output_type, file_path, file_name, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (product_id, category_id, output_type, file_path, file_name, status))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"❌ Template output error: {e}")
+        return False
     finally:
         conn.close()
 
 
 def log_processing(product_id, url, step, status, message=""):
-    """Log processing step"""
-    conn = create_connection()
+    conn   = create_connection()
     cursor = conn.cursor()
     try:
         cursor.execute("""
             INSERT INTO processing_logs (product_id, url, step, status, message)
             VALUES (?, ?, ?, ?, ?)
-        """, (product_id, url, step, status, message[:500]))
+        """, (product_id, url, step, status, message))
         conn.commit()
     except Exception as e:
-        print(f"⚠️ Log error: {e}")
+        print(f"❌ Log error: {e}")
     finally:
         conn.close()
 
 
+SPEC_FIELDS = [
+    'brand', 'color', 'dimensions', 'weight', 'material',
+    'certifications', 'country_of_origin', 'warranty',
+    'product_type', 'age_from', 'age_to', 'gender'
+]
+
+
+def insert_enhanced_content(product_id, enhanced_data):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO enhanced_content (
+                product_id, title, description, bullet_points, html_description,
+                brand, color, dimensions, weight, material, certifications,
+                country_of_origin, warranty, product_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            enhanced_data.get('title', ''),
+            enhanced_data.get('description', ''),
+            json.dumps(enhanced_data.get('bullet_points', [])),
+            enhanced_data.get('html_description', ''),
+            enhanced_data.get('brand', ''),
+            enhanced_data.get('color', ''),
+            enhanced_data.get('dimensions', ''),
+            enhanced_data.get('weight', ''),
+            enhanced_data.get('material', ''),
+            enhanced_data.get('certifications', ''),
+            enhanced_data.get('country_of_origin', ''),
+            enhanced_data.get('warranty', ''),
+            enhanced_data.get('product_type', '')
+        ))
+        conn.commit()
+        print(f"✅ Enhanced content saved (product_id={product_id})")
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as e:
+        print(f"❌ Enhanced content error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def insert_original_specifications(product_id, original_specs):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO original_specifications (
+                product_id, brand, color, dimensions, weight, material,
+                certifications, country_of_origin, warranty, product_type,
+                age_from, age_to, gender
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            original_specs.get("brand", ""),
+            original_specs.get("color", ""),
+            original_specs.get("dimensions", ""),
+            original_specs.get("weight", ""),
+            original_specs.get("material", ""),
+            original_specs.get("certifications", ""),
+            original_specs.get("country_of_origin", ""),
+            original_specs.get("warranty", ""),
+            original_specs.get("product_type", ""),
+            original_specs.get("age_from", ""),
+            original_specs.get("age_to", ""),
+            original_specs.get("gender", "")
+        ))
+        conn.commit()
+        print(f"✅ Original specs saved (product_id={product_id})")
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as e:
+        print(f"⚠️ Original specs error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def insert_enhanced_specifications(product_id, enhanced_specs):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO enhanced_specifications (
+                product_id, brand, color, dimensions, weight, material,
+                certifications, country_of_origin, warranty, product_type,
+                age_from, age_to, gender
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            enhanced_specs.get("brand", ""),
+            enhanced_specs.get("color", ""),
+            enhanced_specs.get("dimensions", ""),
+            enhanced_specs.get("weight", ""),
+            enhanced_specs.get("material", ""),
+            enhanced_specs.get("certifications", ""),
+            enhanced_specs.get("country_of_origin", ""),
+            enhanced_specs.get("warranty", ""),
+            enhanced_specs.get("product_type", ""),
+            enhanced_specs.get("age_from", ""),
+            enhanced_specs.get("age_to", ""),
+            enhanced_specs.get("gender", "")
+        ))
+        conn.commit()
+        print(f"✅ Enhanced specs saved (product_id={product_id})")
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as e:
+        print(f"⚠️ Enhanced specs error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def log_specification_audit(product_id, spec_field, original_value,
+                             enhanced_value, template_value, source_used, notes=""):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO specification_audit_log (
+                product_id, spec_field, original_value,
+                enhanced_value, template_value, source_used, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (product_id, spec_field, original_value or "",
+              enhanced_value or "", template_value or "", source_used, notes))
+        conn.commit()
+    except Exception as e:
+        print(f"⚠️ Audit log error: {e}")
+    finally:
+        conn.close()
+
+
+def log_all_spec_audits(product_id, scraped_data, specs_enhanced, enriched_data_for_template):
+    audit_fields = [
+        'brand', 'color', 'dimensions', 'weight', 'material',
+        'certifications', 'country_of_origin', 'warranty', 'product_type'
+    ]
+    for field in audit_fields:
+        original_val = scraped_data.get(field, "")
+        enhanced_val = specs_enhanced.get(field, "")
+        template_val = enriched_data_for_template.get(field, "")
+        source       = "enhanced" if template_val else "empty"
+        log_specification_audit(product_id, field, original_val,
+                                enhanced_val, template_val, source)
+    print(f"✅ Audit log written (product_id={product_id})")
+
+
+# Backward compat
 def create_table():
     create_all_tables()
-
 
 def create_categories_table():
     pass
