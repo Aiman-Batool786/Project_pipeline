@@ -15,8 +15,8 @@ import json
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
-# Import the new search scraper
-from search_scraper import scrape_search_results
+# scrape_search_results lives inside scraper.py (merged v6.2)
+from scraper import scrape_search_results
 
 logging.basicConfig(
     level=logging.INFO,
