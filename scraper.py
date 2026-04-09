@@ -1345,8 +1345,13 @@ def scrape_search_results(
                     print(f"[search_scraper] Reached last page ({total_pages})")
                     break
                 if max_products > 0 and len(all_products) >= max_products:
-                    print(f"[search_scraper] Max products ({max_products}) reached")
-                    break
+                print(f"[search_scraper] Max products ({max_products}) reached")
+                   break
+
+# Polite delay between pages (uses the 'delay' parameter)
+               sleep_time = random.uniform(delay, delay * 1.5)
+               print(f"[search_scraper] Waiting {sleep_time:.1f}s before next page...")
+               time.sleep(sleep_time)
 
                 page.wait_for_timeout(random.randint(2000, 3500))
 
