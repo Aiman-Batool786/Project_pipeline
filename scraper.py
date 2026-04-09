@@ -17,6 +17,8 @@ import urllib.request
 import concurrent.futures
 from typing import List, Dict, Optional
 from camoufox.sync_api import Camoufox
+from search_scraper import scrape_search_results as scrape_search
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
