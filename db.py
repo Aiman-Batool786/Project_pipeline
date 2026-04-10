@@ -268,6 +268,14 @@ def create_all_tables():
         keyword    TEXT UNIQUE NOT NULL COLLATE NOCASE,
         added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
+  cursor.execute("""
+CREATE TABLE IF NOT EXISTS restricted_categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT UNIQUE NOT NULL,
+    embedding BLOB,
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
 
     conn.commit()
     conn.close()
