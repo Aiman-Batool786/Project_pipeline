@@ -1,12 +1,13 @@
 """
-scraper.py v6.2
+scraper.py v6.3
 ────────────────
-Fixes:
-  1. Mouse.wheel "Execution context destroyed" — scroll wraps navigation events
-  2. Seller info empty — restored _extract_seller_from_popup() from old scraper
-  3. Title dirty suffix — strips "- AliExpress XXXXXXX" from titles
-  4. Region rotation — non-EU server uses safe regions (AE/US/AU/CA/PK/SA/TR)
-  5. Title cleaning applied at every extraction path
+Fixes vs v6.2:
+  6. Removed bad 'from search_scraper import' (circular import from doc 9)
+  7. Added 'delay' param to scrape_search_results() (required by main.py)
+  8. Fixed indentation errors copied from doc 9
+  9. Search speed: PAGE_LOAD_TIMEOUT reduced to 30s, _wait_for_page_load
+     uses networkidle + shorter selector wait, polite delay between pages
+     (~1.5s) replaces 2-3.5s random sleep
 """
 
 import re
@@ -17,8 +18,6 @@ import urllib.request
 import concurrent.futures
 from typing import List, Dict, Optional
 from camoufox.sync_api import Camoufox
-from search_scraper import scrape_search_results as scrape_search
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -54,10 +53,11 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
-MAX_RETRIES      = 3
-MAX_SEARCH_PAGES = 50
-PAGE_TIMEOUT     = 90_000
-SCROLL_PAUSE     = 600
+MAX_RETRIES       = 3
+MAX_SEARCH_PAGES  = 50
+PAGE_TIMEOUT      = 90_000   # product detail — needs full 90s
+SEARCH_TIMEOUT    = 30_000   # search pages — faster, simpler pages
+SCROLL_PAUSE      = 600
 
 # Set SERVER_IS_EU = True only if your server IP is physically inside the EU.
 SERVER_IS_EU = False
@@ -1262,16 +1262,30 @@ def _scroll_page(page, steps: int = 8) -> None:
         print(f"[search_scraper] Scroll error: {e}")
 
 
-def _wait_for_page_load(page, timeout: int = 20_000) -> bool:
+def _wait_for_page_load(page, timeout: int = 12_000) -> bool:
+    """
+    Wait for search-result cards to appear.
+    Uses networkidle first (fast when it works), then selector fallback.
+    Timeout reduced to 12s — 20s was the main cause of 40-min runs.
+    """
+    # Try networkidle first — catches pages that load cards via XHR
+    try:
+        page.wait_for_load_state('networkidle', timeout=8_000)
+    except Exception:
+        pass  # Not fatal — continue to selector check
+
+    # Then confirm product cards actually exist
     try:
         page.wait_for_selector(
             '#card-list, .hm_hn, a.search-card-item, a.lw_b.h7_ic',
             timeout=timeout
         )
-        page.wait_for_timeout(random.randint(2000, 3500))
+        page.wait_for_timeout(random.randint(800, 1500))   # shorter than before
         return True
     except Exception:
-        return False
+        # Page may still have products — let extraction try
+        print(f"[search_scraper] Card selector not found — attempting extraction anyway")
+        return True   # Return True so we don't bail early
 
 
 def scrape_search_results(
@@ -1279,13 +1293,23 @@ def scrape_search_results(
     max_pages: int = MAX_SEARCH_PAGES,
     max_products: int = 0,
     deduplicate: bool = True,
-    delay: float = 1.5,  # ← ADD THIS LINE
+    delay: float = 1.5,
 ) -> Dict:
     """
     Scrape AliExpress search result pages and return product IDs + URLs.
 
-    FIX: Products extracted BEFORE scroll to prevent context-destruction errors.
-    FIX: Uses direct URL navigation per page instead of clicking next button.
+    Speed improvements vs v6.2:
+      - SEARCH_TIMEOUT = 30s (was 90s) for page navigation
+      - _wait_for_page_load returns True even if selector not found
+      - networkidle detection replaces fixed 2-3.5s sleep
+      - inter-page delay uses 'delay' param (default 1.5s) not random 2-3.5s
+
+    Args:
+        search_url:   Full AliExpress search URL
+        max_pages:    Safety cap (default 50)
+        max_products: Stop after N products; 0 = unlimited
+        deduplicate:  Skip duplicate product IDs
+        delay:        Seconds between pages (default 1.5)
     """
     all_products: List[Dict] = []
     seen_ids:     set        = set()
@@ -1293,7 +1317,7 @@ def scrape_search_results(
     ua                       = random.choice(USER_AGENTS)
 
     print(f"\n[search_scraper] URL: {search_url[:100]}")
-    print(f"[search_scraper] Max pages: {max_pages} | Products cap: {max_products or 'unlimited'}")
+    print(f"[search_scraper] Max pages: {max_pages} | Products cap: {max_products or 'unlimited'} | Delay: {delay}s")
 
     try:
         with Camoufox(headless=True, os='windows') as browser:
@@ -1310,19 +1334,18 @@ def scrape_search_results(
 
                 try:
                     nav_url = search_url if page_num == 1 else _build_page_url(search_url, page_num)
-                    page.goto(nav_url, timeout=PAGE_TIMEOUT, wait_until='domcontentloaded')
+                    page.goto(nav_url, timeout=SEARCH_TIMEOUT, wait_until='domcontentloaded')
 
-                    if not _wait_for_page_load(page):
-                        print(f"[search_scraper] Page {page_num} load failed")
-                        break
+                    _wait_for_page_load(page)
 
-                    _dismiss_banners(page)
-                    page.wait_for_timeout(1500)
+                    if page_num == 1:
+                        _dismiss_banners(page)
+                        page.wait_for_timeout(800)
                 except Exception as e:
                     print(f"[search_scraper] Navigation error page {page_num}: {e}")
                     break
 
-                # Extract FIRST before scroll
+                # Extract FIRST — before any scroll to avoid context-destroyed errors
                 page_products = _extract_products_from_page(page)
 
                 new_count = 0
@@ -1337,6 +1360,7 @@ def scrape_search_results(
                 pages_scraped = page_num
                 print(f"[search_scraper] Page {page_num}: +{new_count} new | total={len(all_products)}")
 
+                # Check stopping conditions BEFORE waiting
                 if not _has_next_page(page):
                     print(f"[search_scraper] No more pages after {page_num}")
                     break
@@ -1345,15 +1369,13 @@ def scrape_search_results(
                     print(f"[search_scraper] Reached last page ({total_pages})")
                     break
                 if max_products > 0 and len(all_products) >= max_products:
-                print(f"[search_scraper] Max products ({max_products}) reached")
-                   break
+                    print(f"[search_scraper] Max products ({max_products}) reached")
+                    break
 
-# Polite delay between pages (uses the 'delay' parameter)
-               sleep_time = random.uniform(delay, delay * 1.5)
-               print(f"[search_scraper] Waiting {sleep_time:.1f}s before next page...")
-               time.sleep(sleep_time)
-
-                page.wait_for_timeout(random.randint(2000, 3500))
+                # Polite delay — randomised around the 'delay' param
+                sleep_time = random.uniform(delay, delay * 1.5)
+                print(f"[search_scraper] Waiting {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
 
             page.close()
             context.close()
