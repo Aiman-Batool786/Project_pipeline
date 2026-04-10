@@ -22,6 +22,7 @@ import sqlite3
 import json
 import csv
 import os
+import re
 
 DB_NAME = "products.db"
 
@@ -268,18 +269,22 @@ def create_all_tables():
         keyword    TEXT UNIQUE NOT NULL COLLATE NOCASE,
         added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
-  cursor.execute("""
-CREATE TABLE IF NOT EXISTS restricted_categories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    category TEXT UNIQUE NOT NULL,
-    embedding BLOB,
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-)
-""")
+
+    # ── RESTRICTED CATEGORIES TABLE ────────────────────────────────────────
+    # Stores product categories that are forbidden/restricted.
+    # Embeddings stored as BLOB (pickle) for cosine similarity matching.
+    # Populated by: python restricted_category_embeddings.py
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS restricted_categories (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        category   TEXT UNIQUE NOT NULL,
+        embedding  BLOB,
+        added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
 
     conn.commit()
     conn.close()
-    print("All tables created (including restricted_keywords)")
+    print("All tables created (including restricted_keywords and restricted_categories)")
 
 
 # =============================================================================
@@ -409,10 +414,6 @@ def filter_restricted_keywords(text: str, keywords: list = None) -> tuple:
             found.append(kw)
             cleaned = pattern.sub('[REMOVED]', cleaned)
 
-    return cleaned, found
-
-
-import re  # needed for filter_restricted_keywords
 
 
 # =============================================================================
