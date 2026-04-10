@@ -16,7 +16,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 # scrape_search_results lives inside scraper.py (merged v6.2)
-from scraper import scrape_search_results
+from scraper import scrape_search_results, MAX_SEARCH_PAGES
 
 logging.basicConfig(
     level=logging.INFO,
@@ -484,16 +484,19 @@ def scrape_search_products(request: SearchScrapeRequest):
         logger.info(f"🔍 Starting search scrape: {request.search_url}")
         logger.info(f"   Max pages: {request.max_pages if request.max_pages else 'unlimited'}")
         
-        products = scrape_search_results(
+        result = scrape_search_results(
             search_url=request.search_url,
-            max_pages=request.max_pages,
+            max_pages=request.max_pages if request.max_pages else MAX_SEARCH_PAGES,
             delay=request.delay_between_requests
         )
-        
+
+        # scrape_search_results returns a Dict, not a List
+        products = result.get("products", []) if isinstance(result, dict) else result
+
         if not products:
             logger.info("No products found")
             return []
-        
+
         logger.info(f"✅ Search scrape complete: {len(products)} products found")
         
         return [
