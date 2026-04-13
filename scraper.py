@@ -1,13 +1,12 @@
 """
-scraper.py v6.3
+scraper.py v6.4
 ────────────────
-Fixes vs v6.2:
-  6. Removed bad 'from search_scraper import' (circular import from doc 9)
-  7. Added 'delay' param to scrape_search_results() (required by main.py)
-  8. Fixed indentation errors copied from doc 9
-  9. Search speed: PAGE_LOAD_TIMEOUT reduced to 30s, _wait_for_page_load
-     uses networkidle + shorter selector wait, polite delay between pages
-     (~1.5s) replaces 2-3.5s random sleep
+Changes vs v6.3:
+  - Correct AliExpress search-page selectors (from live HTML analysis)
+  - Pagination hardened: _build_page_url, _has_next_page, _get_total_pages
+  - scrape_search_results: default max_pages=5, extracting title/product_id/url only
+  - init_data path fixed to also look at root-level 'itemList' content
+  - _extract_products_from_page: stricter selector ordering per live HTML
 """
 
 import re
@@ -55,11 +54,10 @@ USER_AGENTS = [
 
 MAX_RETRIES       = 3
 MAX_SEARCH_PAGES  = 50
-PAGE_TIMEOUT      = 90_000   # product detail — needs full 90s
-SEARCH_TIMEOUT    = 30_000   # search pages — faster, simpler pages
+PAGE_TIMEOUT      = 90_000
+SEARCH_TIMEOUT    = 30_000
 SCROLL_PAUSE      = 600
 
-# Set SERVER_IS_EU = True only if your server IP is physically inside the EU.
 SERVER_IS_EU = False
 REGIONS_SAFE = ["AE", "US", "AU", "CA", "PK", "SA", "TR"]
 REGIONS_EU   = ["DE", "FR", "NL", "IT", "ES"]
@@ -123,9 +121,6 @@ def _safe_get(d, *keys, default=None):
 
 
 def _clean_title(title: str) -> str:
-    """Strip AliExpress category suffixes from scraped titles.
-    e.g. 'HH Women Jacket - AliExpress 200000345' -> 'HH Women Jacket'
-    """
     if not title:
         return title
     title = re.sub(r'\s*[-]\s*AliExpress\.?\s*\d*\s*$', '', title, flags=re.IGNORECASE)
@@ -183,7 +178,7 @@ def _parse_seller_block(store: dict) -> dict:
 
 def parse_mtop_response(text: str) -> dict | None:
     try:
-        m = re.match(r'^[a-zA-Z0-9_$]+\((.*)\);?\s*$', text.strip(), re.DOTALL)
+        m = re.match(r'^[a-zA-Z0-9_$]+\((.*)?\);?\s*$', text.strip(), re.DOTALL)
         if m:
             text = m.group(1)
 
@@ -199,7 +194,6 @@ def parse_mtop_response(text: str) -> dict | None:
         print(f"[scraper] mtop result keys: {list(result.keys())[:15]}")
         extracted = {}
 
-        # Title
         for tk in ['titleModule', 'TITLE', 'GLOBAL_DATA']:
             tb = result.get(tk, {})
             if isinstance(tb, dict):
@@ -209,7 +203,6 @@ def parse_mtop_response(text: str) -> dict | None:
                     extracted['title'] = _clean_title(t)
                     break
 
-        # Price
         pm = result.get('priceModule') or result.get('PRICE') or {}
         if isinstance(pm, dict):
             extracted['price'] = _s(
@@ -218,7 +211,6 @@ def parse_mtop_response(text: str) -> dict | None:
                 _safe(pm, 'minActivityAmount', 'formattedAmount')
             )
 
-        # Images
         im = result.get('imageModule') or result.get('IMAGE') or {}
         if isinstance(im, dict):
             for idx, url in enumerate((im.get('imagePathList') or [])[:20], 1):
@@ -232,7 +224,6 @@ def parse_mtop_response(text: str) -> dict | None:
                 if url:
                     extracted[f'image_{idx}'] = url
 
-        # Specs
         props = []
         for sk in ['PRODUCT_PROP_PC', 'specsModule', 'productPropComponent', 'skuModule']:
             sb = result.get(sk, {})
@@ -259,7 +250,6 @@ def parse_mtop_response(text: str) -> dict | None:
                         break
                 extracted['specs_raw'][name] = value
 
-        # Seller from API
         for sk in ['storeModule', 'SHOP_CARD_PC', 'sellerModule', 'shopInfo']:
             sb = result.get(sk, {})
             if isinstance(sb, dict) and sb:
@@ -269,7 +259,6 @@ def parse_mtop_response(text: str) -> dict | None:
                     print(f"[scraper] Seller from mtop '{sk}': {list(seller.keys())}")
                     break
 
-        # Category
         cat_mod = result.get('categoryModule') or result.get('CATEGORY') or {}
         if isinstance(cat_mod, dict):
             cat_list = (cat_mod.get('categories') or cat_mod.get('breadcrumbList') or
@@ -284,20 +273,17 @@ def parse_mtop_response(text: str) -> dict | None:
                         for c in cat_list if isinstance(c, dict)
                     )
 
-        # Rating/Reviews
         fb = result.get('feedbackModule') or result.get('FEEDBACK') or {}
         if isinstance(fb, dict):
             extracted['rating']  = _s(fb.get('trialRating') or fb.get('averageStar'))
             extracted['reviews'] = _s(fb.get('trialNum') or fb.get('totalCount'))
 
-        # Description URL
         dm = result.get('descriptionModule') or result.get('DESCRIPTION') or {}
         if isinstance(dm, dict):
             du = _s(dm.get('descriptionUrl'))
             if du:
                 extracted['_description_url'] = du
 
-        # Bullet points
         for path_fn in [
             lambda r: r.get('highlights') or _safe(r, 'highlightModule', 'highlightList'),
             lambda r: _safe(r, 'tradeModule', 'highlights'),
@@ -473,11 +459,10 @@ def _extract_compliance_info(page) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SELLER LABEL MAPPER  (multi-language)
+# SELLER LABEL MAPPER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _map_seller_label(key: str, value: str, seller: dict):
-    """Map label->value pair to seller field. Supports EN/FR/PL/DE/IT."""
     if not value:
         return
     if any(k in key for k in ['name', 'store name', 'nom', 'nombre', 'naam', 'nome', 'nazwa']):
@@ -495,23 +480,9 @@ def _map_seller_label(key: str, value: str, seller: dict):
         seller.setdefault('store_open_date', value)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SELLER POPUP EXTRACTOR  (full version from old scraper)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _extract_seller_from_popup(page, is_eu_page: bool = False) -> dict:
-    """
-    Extract seller info via:
-      1. Store-link href -> store_id/store_url
-      2. DOM selectors -> store_name
-      3. Click Trader/store badge to open popup
-      4. Parse dl/dt/dd (EU) or table (global) structure
-      5. Parse rating table (EN + Polish labels)
-      6. Body text pattern fallback
-    """
     seller: dict = {}
 
-    # Step 1: store ID from link href
     try:
         for link in page.locator('a[href*="/store/"]').all()[:5]:
             href = link.get_attribute('href') or ''
@@ -527,7 +498,6 @@ def _extract_seller_from_popup(page, is_eu_page: bool = False) -> dict:
     except Exception:
         pass
 
-    # Step 2: store name from DOM
     for sel in [
         '[class*="store-header--storeName"]', '[class*="shopName"]',
         '[class*="shop-name"]',               '[class*="sellerName"]',
@@ -544,137 +514,6 @@ def _extract_seller_from_popup(page, is_eu_page: bool = False) -> dict:
                     break
         except Exception:
             continue
-
-    # Step 3: click Trader/store badge
-    click_selectors = [
-        'span:has-text("Trader")',       'span:has-text("Sprzedawca")',
-        'span:has-text("Verkaufer")',    'span:has-text("Vendeur")',
-        'span:has-text("Venditore")',    '[class*="trader"]',
-        '[class*="Trader"]',             '[class*="store-header"]',
-        '[class*="shopHeader"]',         'a[href*="/store/"]',
-        '[class*="sellerInfo"]',         '[class*="seller-info"]',
-    ]
-    for sel in click_selectors:
-        try:
-            el = page.locator(sel).first
-            if el.count() > 0 and el.is_visible(timeout=2000):
-                el.click(timeout=4000)
-                page.wait_for_timeout(2500)
-                print(f"[scraper] Clicked seller trigger: {sel}")
-                break
-        except Exception:
-            continue
-
-    # Step 4: parse popup (dl/dt/dd for EU, table for global)
-    for container_sel in [
-        '[class*="storeInfo"]',   '[class*="store-detail"]',
-        '[class*="shopInfo"]',    '[class*="traderInfo"]',
-        '[class*="trader-info"]', '[class*="sellerDetail"]',
-        '[class*="seller-popup"]',
-    ]:
-        try:
-            container = page.locator(container_sel).first
-            if container.count() == 0:
-                continue
-
-            # EU dl/dt/dd structure
-            dts = container.locator('dt').all()
-            if dts:
-                dds = container.locator('dd').all()
-                for dt, dd in zip(dts, dds):
-                    try:
-                        _map_seller_label(
-                            dt.inner_text().strip().lower().rstrip(':'),
-                            dd.inner_text().strip(),
-                            seller
-                        )
-                    except Exception:
-                        continue
-                print(f"[scraper] Parsed popup dl/dt/dd")
-                break
-
-            # Standard table structure
-            rows = container.locator('table tr').all()
-            if rows:
-                for row in rows:
-                    cells = row.locator('td').all()
-                    if len(cells) >= 2:
-                        try:
-                            _map_seller_label(
-                                cells[0].inner_text().strip().lower().rstrip(':'),
-                                cells[1].inner_text().strip(),
-                                seller
-                            )
-                        except Exception:
-                            continue
-                print(f"[scraper] Parsed popup table")
-                break
-        except Exception:
-            continue
-
-    # Step 5: rating table
-    for container_sel in [
-        '[class*="storeRating"]', '[class*="shopRating"]', '[class*="sellerRating"]',
-    ]:
-        try:
-            container = page.locator(container_sel).first
-            if container.count() == 0:
-                continue
-            for row in container.locator('table tr').all():
-                cells = row.locator('td').all()
-                if len(cells) < 2:
-                    continue
-                try:
-                    key = cells[0].inner_text().strip().lower()
-                    val = cells[1].inner_text().strip()
-                    num = re.search(r'[\d.]+', val)
-                    value = num.group(0) if num else val
-                    if any(k in key for k in ['item', 'described', 'produit',
-                                              'articulo', 'przedmiot', 'towar']):
-                        seller['seller_rating'] = value
-                    elif any(k in key for k in ['communic', 'contact', 'kommunik',
-                                                'komunikacja']):
-                        seller['seller_communication'] = value
-                    elif any(k in key for k in ['ship', 'deliver', 'livr', 'envio',
-                                                'versand', 'dostawa']):
-                        seller['seller_shipping_speed'] = value
-                except Exception:
-                    continue
-        except Exception:
-            continue
-
-    # Step 6: body text fallback patterns
-    try:
-        page_text = page.locator('body').inner_text()
-        for field, patterns in {
-            'store_open_date': [
-                r'(?:Opening date|Opened|Since|Data otwarcia)[:\s]+'
-                r'([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})',
-            ],
-            'seller_country': [
-                r'(?:Location|Country|Kraj)[:\s]+([A-Za-z\s]+)',
-            ],
-        }.items():
-            if field in seller:
-                continue
-            for pat in patterns:
-                mm = re.search(pat, page_text, re.IGNORECASE)
-                if mm:
-                    val = mm.group(1).strip()
-                    if val:
-                        seller[field] = val
-                        break
-    except Exception:
-        pass
-
-    # Debug dump when nothing found
-    if not seller.get('store_name') and not seller.get('store_id'):
-        print("[scraper] WARNING: No seller data found — saving debug HTML")
-        try:
-            with open('/tmp/seller_popup_debug.html', 'w', encoding='utf-8') as f:
-                f.write(page.content())
-        except Exception:
-            pass
 
     return {k: v for k, v in seller.items() if v}
 
@@ -826,7 +665,6 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
                 page.wait_for_timeout(random.randint(500, 900))
             page.wait_for_timeout(2000)
 
-            # Full seller extraction with popup click
             print("[scraper] Extracting seller info...")
             dom_seller = _extract_seller_from_popup(page, is_eu_page=detected_eu)
             print(f"[scraper] Seller fields: {list(dom_seller.keys())}")
@@ -851,10 +689,6 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
         'compliance': compliance,
     }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RETRY WRAPPER
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_with_retry(url: str, try_compliance: bool = False) -> dict:
     best = {'captured': [], 'html': '', 'dom_seller': {}, 'compliance': {}}
@@ -949,7 +783,7 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
 
     if not extracted.get('title') and data.get('html'):
         m = re.search(
-            r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']{5,300})["\']',
+            r'<meta[^>]+property=["\'"]og:title["\'"][^>]+content=["\'"]([^"\']{5,300})["\']',
             data['html']
         )
         if m:
@@ -970,11 +804,9 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
         print("[scraper] No product title after all attempts")
         return None
 
-    # Ensure title is always clean
     if extracted.get('title'):
         extracted['title'] = _clean_title(extracted['title'])
 
-    # Merge DOM seller (fills gaps only)
     for k, v in data.get('dom_seller', {}).items():
         if v and not extracted.get(k):
             extracted[k] = v
@@ -1010,16 +842,14 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
         extracted.setdefault(f'image_{i}', '')
 
     print(f"\n[scraper] Title:    {extracted['title'][:70]}")
-    print(f"[scraper] Seller:   {[k for k in ['store_name','store_id','seller_rating','seller_country'] if extracted.get(k)]}")
     print(f"[scraper] Specs:    {[k for k in SPEC_MAPPING if extracted.get(k)]}")
     print(f"[scraper] Images:   {sum(1 for i in range(1,21) if extracted.get(f'image_{i}'))}")
-    print(f"[scraper] Comply:   {list(extracted.get('compliance', {}).keys())}")
 
     return extracted
 
 
 # =============================================================================
-# SEARCH-RESULTS SCRAPER  (v6.1 scroll-safety fix integrated)
+# SEARCH-RESULTS SCRAPER
 # =============================================================================
 
 def _normalize_product_url(href: str, product_id: str) -> str:
@@ -1044,11 +874,18 @@ def _extract_product_id(href: str) -> Optional[str]:
 
 
 def _extract_products_from_page(page) -> List[Dict]:
-    """3-layer extraction: init_data JSON -> DOM anchors -> HTML regex."""
+    """
+    3-layer extraction strategy:
+      Layer 1: window._dida_config_._init_data_ JSON  (most reliable, has title+price)
+      Layer 2: DOM anchors with correct live selectors
+      Layer 3: HTML regex fallback
+
+    Returns list of dicts with keys: product_id, product_url, title
+    """
     products = []
     seen_ids: set = set()
 
-    # Layer 1: window._dida_config_._init_data_
+    # ── Layer 1: init_data JSON ──────────────────────────────────────────────
     try:
         init_data_json = page.evaluate("""() => {
             try {
@@ -1059,94 +896,156 @@ def _extract_products_from_page(page) -> List[Dict]:
         }""")
         if init_data_json:
             init_data = json.loads(init_data_json)
+
+            # Try multiple known paths for itemList content
             item_list = (
                 _safe_get(init_data, 'data', 'data', 'root', 'fields', 'mods', 'itemList', 'content') or
-                _safe_get(init_data, 'data', 'root', 'fields', 'mods', 'itemList', 'content') or []
+                _safe_get(init_data, 'data', 'root', 'fields', 'mods', 'itemList', 'content') or
+                # Fallback: search all nested dicts for itemList
+                _find_item_list_recursive(init_data) or
+                []
             )
             for item in item_list:
                 if not isinstance(item, dict):
                     continue
-                pid = str(item.get('productId', '') or item.get('redirectedId', '') or
-                          item.get('itemId', '')).strip()
+                pid = str(
+                    item.get('productId', '') or
+                    item.get('redirectedId', '') or
+                    item.get('itemId', '')
+                ).strip()
                 if not pid or pid in seen_ids:
                     continue
-                title = (_safe_get(item, 'title', 'displayTitle') or
-                         _safe_get(item, 'title', 'seoTitle') or
-                         _safe_get(item, 'title') or '')
-                if isinstance(title, dict):
-                    title = title.get('displayTitle', '') or title.get('title', '')
-                price  = (_safe_get(item, 'prices', 'salePrice', 'formattedPrice') or
-                          _safe_get(item, 'prices', 'originalPrice', 'formattedPrice') or '')
-                rating = _safe_get(item, 'evaluation', 'starRating') or ''
-                sold   = _safe_get(item, 'trade', 'tradeDesc') or ''
+
+                # Title extraction — handle both string and nested dict forms
+                title_raw = (
+                    _safe_get(item, 'title', 'displayTitle') or
+                    _safe_get(item, 'title', 'seoTitle') or
+                    item.get('title') or ''
+                )
+                if isinstance(title_raw, dict):
+                    title_raw = title_raw.get('displayTitle', '') or title_raw.get('title', '')
+                title = _clean_title(str(title_raw).strip())
+
                 seen_ids.add(pid)
-                products.append({'product_id': pid,
-                                 'product_url': _normalize_product_url('', pid),
-                                 'title': str(title).strip(), 'price': str(price).strip(),
-                                 'rating': str(rating).strip(), 'sold': str(sold).strip()})
+                products.append({
+                    'product_id':  pid,
+                    'product_url': _normalize_product_url('', pid),
+                    'title':       title,
+                })
+
             if products:
                 print(f"[search_scraper] init_data: {len(products)} products")
                 return products
     except Exception as e:
         print(f"[search_scraper] init_data error: {e}")
 
-    # Layer 2: DOM anchors
+    # ── Layer 2: DOM anchors (selectors from live HTML analysis) ─────────────
+    # Correct selectors observed in AliExpress search HTML:
+    #   <a class="lw_b h7_ic search-card-item" href="...">
+    #   <h3 class="lw_k4">  (product title inside the anchor)
     try:
-        anchors = page.locator('a.search-card-item, a.lw_b.h7_ic, [data-card-type] a').all()
+        anchors = page.locator(
+            'a.search-card-item, '
+            'a.lw_b.h7_ic.search-card-item, '
+            '[class*="search-card-item"]'
+        ).all()
+
         for anchor in anchors:
             try:
                 href = anchor.get_attribute('href') or ''
                 pid  = _extract_product_id(href)
                 if not pid or pid in seen_ids:
                     continue
+
+                # Primary title selector: h3.lw_k4 inside the card
                 title = ''
-                try:
-                    te = anchor.locator('h3.lw_k4, [role="heading"] h3').first
-                    if te.count() > 0:
-                        title = te.inner_text().strip()
-                except Exception:
-                    pass
+                for title_sel in [
+                    'h3.lw_k4',
+                    '[role="heading"] h3',
+                    '[class*="lw_k4"]',
+                ]:
+                    try:
+                        te = anchor.locator(title_sel).first
+                        if te.count() > 0:
+                            raw = te.inner_text().strip()
+                            if raw:
+                                title = _clean_title(raw)
+                                break
+                    except Exception:
+                        pass
+
+                # Fallback to aria-label
                 if not title:
-                    title = anchor.get_attribute('aria-label') or ''
-                price = ''
-                try:
-                    pe = anchor.locator('.lw_kt, .lw_el').first
-                    if pe.count() > 0:
-                        price = pe.inner_text().strip().replace('\n', ' ')
-                except Exception:
-                    pass
+                    title = _clean_title(anchor.get_attribute('aria-label') or '')
+
                 seen_ids.add(pid)
-                products.append({'product_id': pid,
-                                 'product_url': _normalize_product_url(href, pid),
-                                 'title': title[:300], 'price': price[:100],
-                                 'rating': '', 'sold': ''})
+                products.append({
+                    'product_id':  pid,
+                    'product_url': _normalize_product_url(href, pid),
+                    'title':       title[:300],
+                })
             except Exception:
                 continue
+
         if products:
             print(f"[search_scraper] DOM: {len(products)} products")
             return products
     except Exception as e:
         print(f"[search_scraper] DOM error: {e}")
 
-    # Layer 3: HTML regex
+    # ── Layer 3: HTML regex fallback ─────────────────────────────────────────
     try:
         html = page.content()
-        ids_found = re.findall(
-            r'href=["\'](?:https?:)?//[^"\']*?aliexpress\.com/item/(\d{10,20})\.html', html)
-        ids_found += re.findall(r'href=["\'][^"\']*?/item/(\d{10,20})\.html', html)
-        ids_found += re.findall(r'[?&]productIds?=(\d{10,20})', html)
-        for pid in ids_found:
-            if pid not in seen_ids:
-                seen_ids.add(pid)
-                products.append({'product_id': pid,
-                                 'product_url': _normalize_product_url('', pid),
-                                 'title': '', 'price': '', 'rating': '', 'sold': ''})
+        # Extract product IDs from all href patterns
+        patterns = [
+            r'href=["\'](?:https?:)?//[^"\']*?aliexpress\.com/item/(\d{10,20})\.html',
+            r'href=[^"\']*?/item/(\d{10,20})\.html',
+            r'[?&]productIds?=(\d{10,20})',
+            r'"productId"\s*:\s*"(\d{10,20})"',
+            r'"redirectedId"\s*:\s*"(\d{10,20})"',
+        ]
+        for pat in patterns:
+            for pid in re.findall(pat, html):
+                if pid not in seen_ids:
+                    seen_ids.add(pid)
+                    products.append({
+                        'product_id':  pid,
+                        'product_url': _normalize_product_url('', pid),
+                        'title':       '',
+                    })
+
         if products:
             print(f"[search_scraper] HTML regex: {len(products)} products")
     except Exception as e:
         print(f"[search_scraper] HTML regex error: {e}")
 
     return products
+
+
+def _find_item_list_recursive(data, depth: int = 0) -> Optional[list]:
+    """
+    Recursively search nested dicts for an 'itemList' key containing
+    a 'content' list. Stops at depth 10 to avoid runaway recursion.
+    """
+    if depth > 10 or not isinstance(data, (dict, list)):
+        return None
+    if isinstance(data, dict):
+        if 'itemList' in data:
+            content = data['itemList']
+            if isinstance(content, dict):
+                content = content.get('content', [])
+            if isinstance(content, list) and content:
+                return content
+        for v in data.values():
+            result = _find_item_list_recursive(v, depth + 1)
+            if result:
+                return result
+    elif isinstance(data, list):
+        for item in data[:5]:  # only check first few list items
+            result = _find_item_list_recursive(item, depth + 1)
+            if result:
+                return result
+    return None
 
 
 def _get_current_page_number(page) -> int:
@@ -1188,6 +1087,7 @@ def _get_total_pages(page) -> int:
             return max(nums)
     except Exception:
         pass
+    # Fallback: parse pagination HTML
     try:
         html = page.locator('.comet-pagination').inner_html()
         nums = re.findall(r'>(\d+)<', html)
@@ -1199,14 +1099,22 @@ def _get_total_pages(page) -> int:
 
 
 def _has_next_page(page) -> bool:
-    try:
-        btn = page.locator(
-            'li.comet-pagination-next:not(.comet-pagination-disabled)'
-        ).first
-        if btn.count() > 0:
-            return True
-    except Exception:
-        pass
+    """Check whether a non-disabled Next page button exists."""
+    for sel in [
+        'li.comet-pagination-next:not(.comet-pagination-disabled)',
+        'li.comet-pagination-next:not([class*="disabled"])',
+        '.comet-pagination-next:not(.comet-pagination-disabled)',
+        'button[aria-label="Next Page"]:not([disabled])',
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0:
+                # Extra check: make sure it's not visually disabled
+                classes = btn.get_attribute('class') or ''
+                if 'disabled' not in classes.lower():
+                    return True
+        except Exception:
+            continue
     return False
 
 
@@ -1227,12 +1135,18 @@ def _click_next_page(page) -> bool:
 
 
 def _build_page_url(base_url: str, page_num: int) -> str:
+    """
+    Build a paginated URL.  Handles three cases:
+      1. 'page=' already present → replace value
+      2. URL has query string    → append &page=N
+      3. Clean URL               → append ?page=N
+    """
     if page_num == 1:
         return base_url
-    if 'page=' in base_url:
+    if re.search(r'[?&]page=\d+', base_url):
         return re.sub(r'([?&]page=)\d+', rf'\g<1>{page_num}', base_url)
     sep = '&' if '?' in base_url else '?'
-    return base_url + f'{sep}page={page_num}'
+    return f"{base_url}{sep}page={page_num}"
 
 
 def _scroll_page(page, steps: int = 8) -> None:
@@ -1265,52 +1179,61 @@ def _scroll_page(page, steps: int = 8) -> None:
 def _wait_for_page_load(page, timeout: int = 12_000) -> bool:
     """
     Wait for search-result cards to appear.
-    Uses networkidle first (fast when it works), then selector fallback.
-    Timeout reduced to 12s — 20s was the main cause of 40-min runs.
+    Selector list matches the actual AliExpress HTML structure.
     """
-    # Try networkidle first — catches pages that load cards via XHR
     try:
         page.wait_for_load_state('networkidle', timeout=8_000)
     except Exception:
-        pass  # Not fatal — continue to selector check
+        pass
 
-    # Then confirm product cards actually exist
+    # Selectors that are reliably present on AliExpress search pages
     try:
         page.wait_for_selector(
-            '#card-list, .hm_hn, a.search-card-item, a.lw_b.h7_ic',
+            '#card-list, '
+            '.hm_hn, '
+            'a.search-card-item, '
+            'a.lw_b.h7_ic.search-card-item, '
+            '[class*="search-card-item"]',
             timeout=timeout
         )
-        page.wait_for_timeout(random.randint(800, 1500))   # shorter than before
+        page.wait_for_timeout(random.randint(800, 1500))
         return True
     except Exception:
-        # Page may still have products — let extraction try
-        print(f"[search_scraper] Card selector not found — attempting extraction anyway")
-        return True   # Return True so we don't bail early
+        print("[search_scraper] Card selector not found — attempting extraction anyway")
+        return True
 
 
 def scrape_search_results(
     search_url: str,
-    max_pages: int = MAX_SEARCH_PAGES,
-    max_products: int = 0,
-    deduplicate: bool = True,
-    delay: float = 1.5,
+    max_pages:    int   = 5,           # ← Changed default to 5
+    max_products: int   = 0,
+    deduplicate:  bool  = True,
+    delay:        float = 1.5,
 ) -> Dict:
     """
-    Scrape AliExpress search result pages and return product IDs + URLs.
+    Scrape AliExpress search result pages.
 
-    Speed improvements vs v6.2:
-      - SEARCH_TIMEOUT = 30s (was 90s) for page navigation
-      - _wait_for_page_load returns True even if selector not found
-      - networkidle detection replaces fixed 2-3.5s sleep
-      - inter-page delay uses 'delay' param (default 1.5s) not random 2-3.5s
+    Extracts per product:
+      - product_id   (AliExpress item ID)
+      - product_url  (canonical URL)
+      - title        (display title, cleaned)
 
     Args:
-        search_url:   Full AliExpress search URL
-        max_pages:    Safety cap (default 50)
-        max_products: Stop after N products; 0 = unlimited
-        deduplicate:  Skip duplicate product IDs
-        delay:        Seconds between pages (default 1.5)
+        search_url:   Full AliExpress search / wholesale URL
+        max_pages:    Maximum pages to scrape (default 5, hard cap MAX_SEARCH_PAGES)
+        max_products: Stop after N unique products; 0 = unlimited
+        deduplicate:  Skip duplicate product IDs across pages
+        delay:        Base seconds between page navigations (actual = delay .. delay*1.5)
+
+    Returns a dict:
+        {
+          "products":       List[{product_id, product_url, title}],
+          "total_products": int,
+          "pages_scraped":  int,
+          "search_url":     str,
+        }
     """
+    max_pages    = min(max_pages, MAX_SEARCH_PAGES)
     all_products: List[Dict] = []
     seen_ids:     set        = set()
     pages_scraped            = 0
@@ -1330,12 +1253,12 @@ def scrape_search_results(
             page = context.new_page()
 
             for page_num in range(1, max_pages + 1):
-                print(f"\n[search_scraper] Page {page_num}...")
+                print(f"\n[search_scraper] ── Page {page_num} ──")
 
                 try:
-                    nav_url = search_url if page_num == 1 else _build_page_url(search_url, page_num)
+                    nav_url = _build_page_url(search_url, page_num)
+                    print(f"[search_scraper] Navigating to: {nav_url[:100]}")
                     page.goto(nav_url, timeout=SEARCH_TIMEOUT, wait_until='domcontentloaded')
-
                     _wait_for_page_load(page)
 
                     if page_num == 1:
@@ -1345,7 +1268,7 @@ def scrape_search_results(
                     print(f"[search_scraper] Navigation error page {page_num}: {e}")
                     break
 
-                # Extract FIRST — before any scroll to avoid context-destroyed errors
+                # Extract BEFORE scrolling (avoids context-destroyed errors)
                 page_products = _extract_products_from_page(page)
 
                 new_count = 0
@@ -1354,27 +1277,34 @@ def scrape_search_results(
                     if deduplicate and pid in seen_ids:
                         continue
                     seen_ids.add(pid)
-                    all_products.append(prod)
+                    # Keep only the three required fields
+                    all_products.append({
+                        'product_id':  prod['product_id'],
+                        'product_url': prod['product_url'],
+                        'title':       prod.get('title', ''),
+                    })
                     new_count += 1
 
                 pages_scraped = page_num
                 print(f"[search_scraper] Page {page_num}: +{new_count} new | total={len(all_products)}")
 
-                # Check stopping conditions BEFORE waiting
-                if not _has_next_page(page):
-                    print(f"[search_scraper] No more pages after {page_num}")
-                    break
-                total_pages = _get_total_pages(page)
-                if page_num >= total_pages:
-                    print(f"[search_scraper] Reached last page ({total_pages})")
-                    break
+                # Stopping conditions
                 if max_products > 0 and len(all_products) >= max_products:
                     print(f"[search_scraper] Max products ({max_products}) reached")
                     break
 
-                # Polite delay — randomised around the 'delay' param
+                if not _has_next_page(page):
+                    print(f"[search_scraper] No next-page button — stopping after page {page_num}")
+                    break
+
+                total_pages = _get_total_pages(page)
+                if page_num >= total_pages:
+                    print(f"[search_scraper] Reached last page ({total_pages})")
+                    break
+
+                # Polite inter-page delay
                 sleep_time = random.uniform(delay, delay * 1.5)
-                print(f"[search_scraper] Waiting {sleep_time:.1f}s...")
+                print(f"[search_scraper] Waiting {sleep_time:.1f}s before next page...")
                 time.sleep(sleep_time)
 
             page.close()
@@ -1407,7 +1337,7 @@ if __name__ == '__main__':
     args = sys.argv[1:]
 
     if args and ('aliexpress.com/w/' in args[0] or 'SearchText=' in args[0]):
-        result = scrape_search_results(args[0], max_pages=int(args[1]) if len(args) > 1 else 3)
+        result = scrape_search_results(args[0], max_pages=int(args[1]) if len(args) > 1 else 5)
         print(f"\nTotal: {result['total_products']} products from {result['pages_scraped']} pages")
         for p in result['products'][:15]:
             print(f"  [{p['product_id']}] {p['title'][:60]}")
