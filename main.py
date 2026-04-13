@@ -17,6 +17,7 @@ from datetime import datetime
 
 # scrape_search_results lives inside scraper.py (merged v6.2)
 from scraper import scrape_search_results, MAX_SEARCH_PAGES
+from product_filter import filter_product, filter_products, reload_filter_data
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,9 +118,10 @@ def startup_event():
         create_all_tables()
         logger.info("✅ API Ready")
         logger.info("📋 Available endpoints:")
-        logger.info("   POST /scrape-products - Search results scraping")
-        logger.info("   POST /generate-product - Single product scraping")
-        logger.info("   POST /generate-products - Bulk product scraping")
+        logger.info("   POST /scrape-products   - Search results scraping (max 2 pages)")
+        logger.info("   POST /generate-product  - Single product scraping + filtering")
+        logger.info("   POST /generate-products - Bulk product scraping + filtering")
+        logger.info("   POST /reload-filters    - Hot-reload filter CSVs")
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
@@ -137,9 +139,10 @@ def root():
         "endpoints": {
             "GET /": "This info",
             "GET /health": "Health check",
-            "POST /scrape-products": "Scrape search results with pagination",
-            "POST /generate-product": "Scrape single product page",
-            "POST /generate-products": "Scrape multiple product pages",
+            "POST /scrape-products": "Scrape search results with pagination (max 2 pages)",
+            "POST /generate-product": "Scrape single product + keyword/category filtering",
+            "POST /generate-products": "Scrape multiple products + keyword/category filtering",
+            "POST /reload-filters": "Hot-reload restricted_keywords.csv / restricted_categories.csv",
             "GET /scraped-products": "View scraped products",
             "GET /seller-info": "View seller information",
             "GET /compliance-info": "View compliance information",
@@ -152,7 +155,10 @@ def root():
             "Content enhancement via OpenAI",
             "Octopia categorization",
             "Template mapping + Excel generation",
-            "Search results scraping with pagination",
+            "Search results scraping with pagination (2 pages default)",
+            "Restricted keyword filtering on product titles",
+            "Restricted category filtering — blocked products excluded from output",
+            "Hot-reload filter CSVs without server restart",
         ]
     }
 
@@ -435,31 +441,107 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
 
 @app.post("/generate-product", tags=["Product Processing"])
 def generate_product(req: ProductURLRequest):
+    """
+    Scrape and process a single product URL.
+
+    Filtering applied (both active by default):
+      - Keyword filter : title must not contain any restricted keyword
+      - Category filter: category must not appear in restricted_categories.csv
+
+    If the product is filtered out, returns success=False with a
+    'filtered' flag and the rejection reason. The category field is
+    omitted from the response when the category filter triggered.
+    """
     if not req.url:
         raise HTTPException(status_code=400, detail="URL cannot be empty")
-    return process_product_complete(req.url, extract_compliance=req.extract_compliance)
+
+    result = process_product_complete(req.url, extract_compliance=req.extract_compliance)
+
+    if not result.get("success"):
+        return result
+
+    # Build the category dict in the shape filter_product expects
+    raw_category = result.get("category")  # already a dict with id/name/leaf/path/confidence
+
+    title = result.get("original", {}).get("title", "")
+    allowed, reason = filter_product(title, raw_category)
+
+    if not allowed:
+        logger.info(f"[filter] Product {result.get('product_id')} rejected: {reason}")
+        return {
+            "success":          False,
+            "filtered":         True,
+            "rejection_reason": reason,
+            "product_id":       result.get("product_id"),
+            "url":              req.url,
+            "timestamp":        datetime.now().isoformat(),
+        }
+
+    return result
 
 
 @app.post("/generate-products", tags=["Product Processing"])
 def generate_products(req: BulkProductRequest):
+    """
+    Scrape and process multiple product URLs (max 20).
+
+    Filtering applied to every product:
+      - Keyword filter : title must not contain restricted keywords
+      - Category filter: category must not be in restricted_categories.csv
+
+    Filtered products are NOT included in 'results' and are counted
+    separately under the 'filtered' key so the caller can see how
+    many were dropped without exposing the restricted category data.
+    """
     if not req.urls:
         raise HTTPException(status_code=400, detail="URLs list cannot be empty")
     if len(req.urls) > 20:
         raise HTTPException(status_code=400, detail="Maximum 20 URLs per request")
 
-    results = []
-    successful = failed = 0
+    results        = []
+    successful     = 0
+    failed         = 0
+    filtered_count = 0
+
     for url in req.urls:
         result = process_product_complete(url, extract_compliance=req.extract_compliance)
-        results.append(result)
-        if result.get("success"):
-            successful += 1
-        else:
-            failed += 1
 
-    return {"total": len(req.urls), "successful": successful,
-            "failed": failed, "results": results,
-            "timestamp": datetime.now().isoformat()}
+        if not result.get("success"):
+            failed += 1
+            results.append(result)
+            continue
+
+        title        = result.get("original", {}).get("title", "")
+        raw_category = result.get("category")
+        allowed, reason = filter_product(title, raw_category)
+
+        if not allowed:
+            filtered_count += 1
+            logger.info(f"[filter] Filtered out ({reason}): {url}")
+            # Excluded from output — do not append to results
+            continue
+
+        successful += 1
+        results.append(result)
+
+    return {
+        "total":      len(req.urls),
+        "successful": successful,
+        "failed":     failed,
+        "filtered":   filtered_count,
+        "results":    results,
+        "timestamp":  datetime.now().isoformat(),
+    }
+
+
+@app.post("/reload-filters", tags=["Product Processing"])
+def reload_filters():
+    """
+    Hot-reload restricted_keywords.csv and restricted_categories.csv
+    without restarting the server. Call this after updating either CSV.
+    """
+    reload_filter_data()
+    return {"status": "ok", "message": "Filter data reloaded from CSV files"}
 
 
 # =============================================================================
@@ -469,45 +551,55 @@ def generate_products(req: BulkProductRequest):
 @app.post("/scrape-products", response_model=List[SearchProductInfo], tags=["Product Processing"])
 def scrape_search_products(request: SearchScrapeRequest):
     """
-    Scrape product URLs and IDs from AliExpress search results with pagination.
-    
-    Extracts only product URLs in format: https://pl.aliexpress.com/item/<PRODUCT_ID>.html
-    Rejects /srs/ redirect URLs automatically.
+    Scrape product URLs, IDs, and titles from AliExpress search results.
+
+    Pagination: scrapes up to max_pages (default: 2, hard cap: 2 unless overridden).
+    Each page yields ~60 products; duplicates are removed automatically.
+
+    Returns a flat list of {product_id, product_url, title}.
     """
     if not request.search_url:
         raise HTTPException(status_code=400, detail="search_url is required")
-    
+
     if 'aliexpress.com' not in request.search_url.lower():
         raise HTTPException(status_code=400, detail="Invalid AliExpress URL")
-    
+
+    # Enforce 2-page default; never exceed MAX_SEARCH_PAGES unless caller is explicit
+    max_pages = request.max_pages if request.max_pages is not None else 2
+
     try:
         logger.info(f"🔍 Starting search scrape: {request.search_url}")
-        logger.info(f"   Max pages: {request.max_pages if request.max_pages else 'unlimited'}")
-        
-        result = scrape_search_results(
+        logger.info(f"   Max pages: {max_pages}")
+
+        raw = scrape_search_results(
             search_url=request.search_url,
-            max_pages=request.max_pages if request.max_pages else MAX_SEARCH_PAGES,
-            delay=request.delay_between_requests
+            max_pages=max_pages,
+            delay=request.delay_between_requests,
         )
 
-        # scrape_search_results returns a Dict, not a List
-        products = result.get("products", []) if isinstance(result, dict) else result
+        # scrape_search_results returns List[Dict] directly (search_scraper.py)
+        # Guard against a legacy Dict wrapper just in case
+        if isinstance(raw, dict):
+            products = raw.get("products", [])
+        else:
+            products = raw or []
 
         if not products:
             logger.info("No products found")
             return []
 
         logger.info(f"✅ Search scrape complete: {len(products)} products found")
-        
+
         return [
             SearchProductInfo(
-                product_id=p['product_id'],
-                product_url=p['product_url'],
-                title=p['title']
+                product_id=str(p["product_id"]),
+                product_url=p["product_url"],
+                title=p.get("title", ""),
             )
             for p in products
+            if p.get("product_id")   # skip any malformed entries
         ]
-        
+
     except Exception as e:
         logger.error(f"❌ Search scrape failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Scraping failed: {str(e)}")
