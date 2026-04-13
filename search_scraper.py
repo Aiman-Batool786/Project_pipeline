@@ -384,17 +384,15 @@ def _scrape_one_page(page, url: str) -> Tuple[List[Dict], bool]:
 
 def scrape_search_results(
     search_url: str,
-    max_pages: Optional[int] = None,
+    max_pages: Optional[int] = 2,
     delay: float = 1.5,
 ) -> List[Dict]:
-      sleep_time = random.uniform(PAGE_DELAY_MIN, PAGE_DELAY_MAX) if delay is None else random.uniform(delay, delay * 1.5)
-
     """
     Scrape AliExpress search results across multiple pages.
 
     Args:
         search_url:  Any valid AliExpress search URL.
-        max_pages:   Stop after this many pages (None = scrape all).
+        max_pages:   Stop after this many pages (default: 2).
         delay:       Seconds to wait between pages (polite minimum: 1.0).
 
     Returns:
