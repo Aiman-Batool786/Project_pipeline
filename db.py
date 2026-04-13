@@ -267,8 +267,15 @@ def create_all_tables():
     CREATE TABLE IF NOT EXISTS restricted_keywords (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         keyword    TEXT UNIQUE NOT NULL COLLATE NOCASE,
+        embedding  BLOB,
         added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
+
+    # Migration: add embedding column if this table already exists without it
+    try:
+        cursor.execute("ALTER TABLE restricted_keywords ADD COLUMN embedding BLOB")
+    except Exception:
+        pass  # Column already exists — safe to ignore
 
     # ── RESTRICTED CATEGORIES TABLE ────────────────────────────────────────
     # Stores product categories that are forbidden/restricted.
