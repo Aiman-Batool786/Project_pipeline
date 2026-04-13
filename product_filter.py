@@ -1,36 +1,43 @@
 """
-product_filter.py
-═════════════════
-Embedding-based product filter using products.db.
-
+product_filter.py  (v2.1)
+═════════════════════════
 Two independent filters applied in sequence:
 
-  1. Keyword filter  — embed the product title with OpenAI text-embedding-3-small,
-                       then cosine-similarity against every embedding stored in
-                       restricted_keywords table.  If any keyword scores above
-                       KEYWORD_THRESHOLD → product is rejected.
+  1. KEYWORD FILTER  — direct string match on product title.
+     Function: filter_restricted_keywords(title)
+     ❌ Block condition: title contains any restricted keyword (case-insensitive)
+     📢 Output message (when blocked): "Title has restricted keyword"
 
-  2. Category filter — embed the assigned category string, then cosine-similarity
-                       against every embedding in restricted_categories table.
-                       If any category scores above CATEGORY_THRESHOLD → rejected.
+  2. CATEGORY FILTER — embedding-based similarity on category.leaf.
+     Embed the leaf text with OpenAI text-embedding-3-small, then compare
+     against every embedding stored in the restricted_categories table.
 
-Both embedding caches are loaded once from DB at first use and held in memory.
-Call reload_filter_data() to refresh after the DB is updated.
+     Score thresholds:
+       > 0.85  → BLOCK   ("Category blocked due to restriction")
+       0.6–0.85 → REVIEW  (allowed but flagged for manual review)
+       < 0.6   → ALLOW
 
-Dependencies (already in requirements.txt):
-    openai, numpy, python-dotenv
+     📢 Output message (when blocked): "Category blocked due to restriction"
+
+⚠️  IMPORTANT:
+  • Keyword filter operates ONLY on the title field — never on description.
+  • Category filter operates ONLY on category.leaf — never on full name path.
+  • These two messages are the ONLY console outputs for blocked products.
+  • No description field is read or used anywhere.
+
+Dependencies: openai, numpy, python-dotenv, sqlite3
 """
 
 import logging
 import os
 import pickle
+import re
 import sqlite3
-from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from openai import OpenAI
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -39,10 +46,12 @@ logger = logging.getLogger(__name__)
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-DB_PATH             = os.getenv("DB_PATH", "products.db")
-EMBED_MODEL         = "text-embedding-3-small"
-KEYWORD_THRESHOLD   = float(os.getenv("KEYWORD_THRESHOLD",  "0.70"))
-CATEGORY_THRESHOLD  = float(os.getenv("CATEGORY_THRESHOLD", "0.75"))
+DB_PATH = os.getenv("DB_PATH", "products.db")
+EMBED_MODEL = "text-embedding-3-small"
+
+# Category similarity thresholds
+BLOCK_THRESHOLD  = float(os.getenv("CATEGORY_BLOCK_THRESHOLD",  "0.85"))
+REVIEW_THRESHOLD = float(os.getenv("CATEGORY_REVIEW_THRESHOLD", "0.60"))
 
 _openai_client: Optional[OpenAI] = None
 
@@ -58,7 +67,7 @@ def _get_client() -> OpenAI:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EMBEDDING HELPER
+# EMBEDDING HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _embed(text: str) -> np.ndarray:
@@ -75,49 +84,41 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DB CACHE  — loaded once, held in module-level dict, cleared by reload_filter_data()
+# DB CACHES — loaded once at first use
 # ─────────────────────────────────────────────────────────────────────────────
 
-# { keyword_text: np.ndarray }
-_keyword_embeddings:  Optional[Dict[str, np.ndarray]] = None
-# { category_text: np.ndarray }
+# Plain keyword strings loaded from restricted_keywords table
+_keyword_list: Optional[List[str]] = None
+
+# { category_text: np.ndarray } loaded from restricted_categories table
 _category_embeddings: Optional[Dict[str, np.ndarray]] = None
 
 
-def _load_keyword_embeddings() -> Dict[str, np.ndarray]:
-    """Load all keyword embeddings from restricted_keywords table."""
-    global _keyword_embeddings
-    if _keyword_embeddings is not None:
-        return _keyword_embeddings
+def _load_keyword_list() -> List[str]:
+    """
+    Load restricted keywords as plain strings from DB.
+    Falls back to empty list — product is allowed when DB has no keywords.
+    """
+    global _keyword_list
+    if _keyword_list is not None:
+        return _keyword_list
 
-    result: Dict[str, np.ndarray] = {}
+    result: List[str] = []
     try:
         conn = sqlite3.connect(DB_PATH)
-        rows = conn.execute(
-            "SELECT keyword, embedding FROM restricted_keywords WHERE embedding IS NOT NULL"
-        ).fetchall()
+        rows = conn.execute("SELECT keyword FROM restricted_keywords").fetchall()
         conn.close()
+        result = [row[0].strip().lower() for row in rows if row[0]]
     except Exception as exc:
-        logger.error(f"[filter] Failed to load keyword embeddings: {exc}")
-        _keyword_embeddings = {}
-        return _keyword_embeddings
+        logger.error(f"[filter] Failed to load keywords: {exc}")
 
-    for keyword, blob in rows:
-        try:
-            vec  = pickle.loads(blob)
-            arr  = np.array(vec, dtype=np.float32)
-            norm = np.linalg.norm(arr)
-            result[keyword.lower()] = arr / norm if norm > 0 else arr
-        except Exception as exc:
-            logger.warning(f"[filter] Bad embedding for keyword '{keyword}': {exc}")
-
-    logger.info(f"[filter] Loaded {len(result)} keyword embeddings from DB")
-    _keyword_embeddings = result
-    return _keyword_embeddings
+    logger.info(f"[filter] Loaded {len(result)} restricted keywords from DB")
+    _keyword_list = result
+    return _keyword_list
 
 
 def _load_category_embeddings() -> Dict[str, np.ndarray]:
-    """Load all category embeddings from restricted_categories table."""
+    """Load restricted category embeddings from DB."""
     global _category_embeddings
     if _category_embeddings is not None:
         return _category_embeddings
@@ -150,81 +151,109 @@ def _load_category_embeddings() -> Dict[str, np.ndarray]:
 
 def reload_filter_data() -> None:
     """
-    Clear in-memory caches so embeddings are re-read from DB on the next
-    filter call.  Call this after running keyword_embeddings.py or
-    restricted_category_embeddings.py to pick up new entries.
+    Clear in-memory caches so data is re-read from DB on the next filter call.
+    Call this after updating the restricted_keywords or restricted_categories tables.
     """
-    global _keyword_embeddings, _category_embeddings
-    _keyword_embeddings  = None
-    _category_embeddings = None
-    logger.info("[filter] Embedding caches cleared — will reload from DB on next call")
+    global _keyword_list, _category_embeddings
+    _keyword_list         = None
+    _category_embeddings  = None
+    logger.info("[filter] Caches cleared — will reload from DB on next call")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FILTER LOGIC
+# 1. KEYWORD FILTER  (operates on title only)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def filter_restricted_keywords(title: str) -> bool:
+    """
+    Check whether the product title contains any restricted keyword.
+
+    Matching is case-insensitive whole-word (uses word-boundary regex so that
+    e.g. "weapons" matches keyword "weapon" only if it is a separate word token).
+
+    Returns:
+        True  → title IS restricted  → print "Title has restricted keyword"
+        False → title is clean       → allow
+    """
+    if not title or not title.strip():
+        return False
+
+    keywords = _load_keyword_list()
+    if not keywords:
+        logger.warning("[filter] No restricted keywords in DB — keyword filter skipped")
+        return False
+
+    title_lower = title.lower()
+
+    for kw in keywords:
+        if not kw:
+            continue
+        # Use word-boundary match so "adult" doesn't trigger on "adultery" etc.
+        pattern = r'\b' + re.escape(kw) + r'\b'
+        if re.search(pattern, title_lower):
+            print("Title has restricted keyword")
+            logger.info(f"[filter] Title BLOCKED — matched keyword: '{kw}'")
+            return True
+
+    return False
+
+
+# backward-compatible alias used by existing code
 def is_title_restricted(title: str) -> Tuple[bool, Optional[str]]:
     """
-    Embed the product title and compare against all keyword embeddings.
-
-    Returns (True, matched_keyword) if any keyword exceeds KEYWORD_THRESHOLD,
-    otherwise (False, None).
-
-    Falls back to empty-safe: if DB has no embeddings, product is allowed.
+    Embed-free title check — wrapper around filter_restricted_keywords.
+    Returns (blocked: bool, matched_keyword_or_None).
     """
     if not title or not title.strip():
         return False, None
 
-    kw_embeddings = _load_keyword_embeddings()
-    if not kw_embeddings:
-        logger.warning("[filter] No keyword embeddings in DB — keyword filter skipped")
+    keywords = _load_keyword_list()
+    if not keywords:
         return False, None
 
-    try:
-        title_vec = _embed(title)
-    except Exception as exc:
-        logger.error(f"[filter] Failed to embed title: {exc}")
-        return False, None
-
-    best_score   = 0.0
-    best_keyword = None
-
-    for keyword, kw_vec in kw_embeddings.items():
-        score = _cosine(title_vec, kw_vec)
-        if score > best_score:
-            best_score   = score
-            best_keyword = keyword
-
-    if best_score >= KEYWORD_THRESHOLD:
-        logger.info(
-            f"[filter] Title RESTRICTED — keyword='{best_keyword}' score={best_score:.3f} "
-            f"threshold={KEYWORD_THRESHOLD}"
-        )
-        return True, best_keyword
+    title_lower = title.lower()
+    for kw in keywords:
+        if not kw:
+            continue
+        pattern = r'\b' + re.escape(kw) + r'\b'
+        if re.search(pattern, title_lower):
+            print("Title has restricted keyword")
+            logger.info(f"[filter] Title BLOCKED — matched keyword: '{kw}'")
+            return True, kw
 
     return False, None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. CATEGORY FILTER  (operates on category.leaf only)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def is_category_restricted(category: Optional[Dict]) -> Tuple[bool, Optional[str]]:
     """
-    Embed the category name and compare against all restricted category embeddings.
+    Embed the category LEAF and compare against all restricted category embeddings.
 
-    category dict shape (from process_product_complete):
-        { "id": "10030H", "name": "CLOTHING - LINGERIE/...", "leaf": "EVENTAIL", ... }
+    Decision rules based on cosine similarity score:
+      > 0.85  → BLOCK   → print "Category blocked due to restriction"
+      0.6–0.85 → REVIEW  → allowed but flagged
+      < 0.6   → ALLOW
 
-    Returns (True, reason) if the category similarity exceeds CATEGORY_THRESHOLD,
-    otherwise (False, None).
+    category dict expected shape:
+        {
+          "id":         "0D0604",
+          "name":       "GARDEN - POOL/OUTDOOR FURNITURE - ...",
+          "leaf":       "SUN LOUNGER",          ← THIS is what we embed
+          "path":       "",
+          "confidence": 0.6
+        }
+
+    Returns (blocked: bool, reason_or_None).
     """
     if not category:
         return False, None
 
-    cat_name = str(category.get("name", "")).strip()
-    cat_leaf = str(category.get("leaf", "")).strip()
-
-    # Use full name when available, fall back to leaf
-    text_to_embed = cat_name or cat_leaf
-    if not text_to_embed:
+    # Use ONLY the leaf field
+    leaf = str(category.get("leaf", "")).strip()
+    if not leaf or leaf in ("Unknown", "Uncategorized", ""):
         return False, None
 
     cat_embeddings = _load_category_embeddings()
@@ -233,29 +262,43 @@ def is_category_restricted(category: Optional[Dict]) -> Tuple[bool, Optional[str
         return False, None
 
     try:
-        cat_vec = _embed(text_to_embed)
+        leaf_vec = _embed(leaf)
     except Exception as exc:
-        logger.error(f"[filter] Failed to embed category: {exc}")
+        logger.error(f"[filter] Failed to embed category leaf '{leaf}': {exc}")
         return False, None
 
     best_score    = 0.0
     best_category = None
 
     for restricted_cat, rc_vec in cat_embeddings.items():
-        score = _cosine(cat_vec, rc_vec)
+        score = _cosine(leaf_vec, rc_vec)
         if score > best_score:
             best_score    = score
             best_category = restricted_cat
 
-    if best_score >= CATEGORY_THRESHOLD:
+    if best_score >= BLOCK_THRESHOLD:
+        print("Category blocked due to restriction")
         logger.info(
-            f"[filter] Category RESTRICTED — matched='{best_category}' "
-            f"score={best_score:.3f} threshold={CATEGORY_THRESHOLD}"
+            f"[filter] Category BLOCKED — leaf='{leaf}' matched '{best_category}' "
+            f"score={best_score:.3f} (>={BLOCK_THRESHOLD})"
         )
-        return True, f"category matches restricted entry (score={best_score:.2f})"
+        return True, f"Category blocked due to restriction (score={best_score:.2f})"
 
+    if best_score >= REVIEW_THRESHOLD:
+        logger.info(
+            f"[filter] Category REVIEW — leaf='{leaf}' matched '{best_category}' "
+            f"score={best_score:.3f} (>={REVIEW_THRESHOLD}, <{BLOCK_THRESHOLD})"
+        )
+        # Allowed but flagged — caller can inspect the reason
+        return False, f"REVIEW: leaf '{leaf}' score={best_score:.2f} (manual review recommended)"
+
+    # score < REVIEW_THRESHOLD → ALLOW
     return False, None
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMBINED FILTER GATE
+# ─────────────────────────────────────────────────────────────────────────────
 
 def filter_product(
     title: str,
@@ -267,23 +310,24 @@ def filter_product(
     """
     Combined filter gate for a single product.
 
+    Pipeline (short-circuits on first rejection):
+      1. Keyword filter: filter_restricted_keywords(title)
+      2. Category filter: is_category_restricted(category)
+
     Returns:
-        (allowed, rejection_reason)
+        (allowed: bool, rejection_reason: str | None)
 
     If allowed is True  → product passes; rejection_reason is None.
     If allowed is False → rejection_reason describes which filter triggered.
-
-    When a product is rejected by the category filter the caller must NOT
-    include the category field in the final API response.
     """
     if apply_keyword_filter:
-        restricted, matched_kw = is_title_restricted(title)
-        if restricted:
+        blocked, matched_kw = is_title_restricted(title)
+        if blocked:
             return False, f"title matches restricted keyword: '{matched_kw}'"
 
     if apply_category_filter:
-        restricted, reason = is_category_restricted(category)
-        if restricted:
+        blocked, reason = is_category_restricted(category)
+        if blocked:
             return False, reason
 
     return True, None
@@ -303,7 +347,7 @@ def filter_products(
     Returns:
         (allowed_products, rejected_products)
 
-    rejected_products include an extra '_rejection_reason' key for logging.
+    rejected_products have an extra '_rejection_reason' key for logging.
     """
     allowed  = []
     rejected = []
