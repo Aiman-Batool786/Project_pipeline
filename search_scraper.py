@@ -347,7 +347,6 @@ def _scrape_one_page(page, url: str) -> Tuple[List[Dict], bool]:
         }""")
 
         products = _extract_from_init_data(scripts or '')
-
         # ── Strategy 2: intercepted XHR responses ────────────────────────
         if not products and intercepted:
             seen = set()
