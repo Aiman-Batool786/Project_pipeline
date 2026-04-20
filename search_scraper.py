@@ -384,7 +384,7 @@ def _scrape_one_page(page, url: str) -> Tuple[List[Dict], bool]:
 
 def scrape_search_results(
     search_url: str,
-    max_pages: Optional[int] = 2,
+    max_pages: Optional[int] = 5,
     delay: float = 1.5,
 ) -> List[Dict]:
     """
@@ -392,27 +392,27 @@ def scrape_search_results(
 
     Args:
         search_url:  Any valid AliExpress search URL.
-        max_pages:   Stop after this many pages (default: 2).
+        max_pages:   Stop after this many pages (default: 5).
         delay:       Seconds to wait between pages (polite minimum: 1.0).
 
     Returns:
         List of dicts: {product_id, product_url, title}
         Deduplicated by product_id.
+
+    IMPORTANT: Never stops early on has_next — always completes all max_pages
+    to avoid the "33 products" truncation issue caused by lazy pagination rendering.
     """
     all_products: List[Dict] = []
     seen_ids: set = set()
     ua = random.choice(USER_AGENTS)
 
     print(f"\n{'='*60}")
-    print(f"🔍  AliExpress Search Scraper (Optimized)")
+    print(f"🔍  AliExpress Search Scraper")
     print(f"    URL       : {search_url}")
-    print(f"    Max pages : {max_pages or 'unlimited'}")
+    print(f"    Max pages : {max_pages}")
     print(f"    Strategy  : JSON interception + HTML fallback")
     print(f"{'='*60}\n")
 
-    # ── SINGLE browser instance for ALL pages ─────────────────────────────
-    # Original code opened a new browser PER PAGE — this is the #1 perf issue.
-    # Camoufox startup costs ~5–10 seconds each time.
     with Camoufox(headless=True, os='windows') as browser:
         context = browser.new_context(
             viewport={'width': 1440, 'height': 900},
@@ -433,7 +433,7 @@ def scrape_search_results(
                 print(f"✋  Reached max_pages limit ({max_pages})")
                 break
 
-            print(f"📄  Page {page_num} → {current_url}")
+            print(f"📄  Page {page_num}/{max_pages} → {current_url}")
             t0 = time.time()
 
             products, has_next = _scrape_one_page(page, current_url)
@@ -446,27 +446,29 @@ def scrape_search_results(
                     all_products.append(p)
                     new_count += 1
 
-            print(f"   ✅  {new_count} new products  |  {len(all_products)} total  |  {elapsed:.1f}s")
+            print(f"   ✅  {new_count} new  |  {len(all_products)} total  |  {elapsed:.1f}s  |  has_next={has_next}")
 
+            # Only stop early if the page returned zero products at all
+            # (CAPTCHA, blocked, or genuine end of catalogue)
             if not products:
                 print("   ⚠️  No products found — possible CAPTCHA or end of results")
                 break
 
-            if not has_next:
-                print("   🏁  No next page — done")
-                break
+            # NOTE: has_next is logged above for diagnostics but does NOT
+            # cause early exit — AliExpress often renders pagination lazily,
+            # causing has_next=False even when more pages exist.
+            # We always continue until max_pages is reached.
 
             page_num += 1
-            # Paginate using URL parameter (faster than clicking the next button)
             current_url = paginate_url(search_url, page_num)
 
-            # Polite delay
+            # Polite delay between pages
             sleep_time = random.uniform(delay, delay * 1.5)
             time.sleep(sleep_time)
 
         context.close()
 
     print(f"\n{'='*60}")
-    print(f"✅  DONE — {len(all_products)} unique products scraped")
+    print(f"✅  DONE — {len(all_products)} unique products from {page_num - 1} pages")
     print(f"{'='*60}\n")
     return all_products
