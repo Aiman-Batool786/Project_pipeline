@@ -381,7 +381,6 @@ def filter_products(
             allowed.append(product)
         else:
             rejected.append({**product, "_rejection_reason": reason})
-
     logger.info(
         f"[filter] {len(allowed)} allowed / {len(rejected)} rejected "
         f"out of {len(products)} products"
