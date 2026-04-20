@@ -1,25 +1,15 @@
 """
-FastAPI Server - HYBRID APPROACH v2.9
+FastAPI Server - HYBRID APPROACH v2.8
 Pipeline: Scrape → Store → Enhance → Categorize → Map → Excel
 
-Key changes vs v2.8:
-  ─────────────────────────────────────────────────────────────────────────
-  POST /scrape-products
-    • Returns ALL products (restricted + accepted) — no silent skips
-    • Applies keyword filter on ORIGINAL title
-    • Restricted shape:  { product_id, product_url, title (ORIGINAL),
-                           status:"rejected",
-                           message:"Title not fetched due to restricted keyword" }
-    • Accepted shape:    { product_id, product_url, title (ORIGINAL),
-                           status:"accepted" }
-    • title is ALWAYS the original scraped title — never enhanced
-
-  POST /generate-product / POST /generate-products
-    • Category confidence < 0.75 → set category = "Uncategorized"
-    • Accepted response includes both original_title and enhanced_title
-    • Rejected response: { status:"rejected",
-                           reason:"Title has restricted keyword" }
-  ─────────────────────────────────────────────────────────────────────────
+Key changes vs v2.7:
+  - /scrape-products now defaults to 5 pages (was 2)
+  - Keyword filter: uses filter_restricted_keywords(title) — string match only
+    Output: "Title has restricted keyword"
+  - Category filter: applied on category.leaf via embedding
+    Output: "Category blocked due to restriction"
+  - No description field used in filtering
+  - Both filter messages are printed by product_filter.py (not by main.py)
 """
 
 from fastapi import FastAPI, HTTPException
@@ -28,6 +18,7 @@ from pydantic import BaseModel
 import os
 import sqlite3
 import logging
+import json
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -37,6 +28,7 @@ from product_filter import (
     filter_products,
     filter_restricted_keywords,
     validate_category_confidence,
+    apply_category_confidence,
     reload_filter_data,
 )
 
@@ -48,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Octopia Template Pipeline",
-    version="2.9.0"
+    version="2.8.0"
 )
 
 app.add_middleware(
@@ -96,13 +88,18 @@ class BulkProductRequest(BaseModel):
 
 class SearchScrapeRequest(BaseModel):
     """
-    Request body for POST /scrape-products.
+    Request model for the /scrape-products endpoint.
 
-    Scrapes up to max_pages (default 5) of AliExpress search results.
-    ALL products are returned — both accepted and keyword-restricted ones.
+    Scrapes AliExpress search pages and returns:
+      - product_id
+      - product_url
+      - title
+
+    Pagination defaults to 5 pages. Keyword + category filters are NOT
+    applied at this stage (they require a full product scrape).
     """
     search_url: str
-    max_pages: Optional[int] = None
+    max_pages: Optional[int] = None          # defaults to 5 inside the endpoint
     delay_between_requests: float = 1.0
 
     class Config:
@@ -118,8 +115,15 @@ class SearchScrapeRequest(BaseModel):
         }
 
 
+class SearchProductInfo(BaseModel):
+    """Product info extracted from search results."""
+    product_id:  str
+    product_url: str
+    title:       str
+
+
 # =============================================================================
-# DB HELPERS
+# DATABASE HELPERS
 # =============================================================================
 
 def get_db_connection():
@@ -129,7 +133,7 @@ def get_db_connection():
 
 
 # =============================================================================
-# STARTUP
+# STARTUP EVENT
 # =============================================================================
 
 @app.on_event("startup")
@@ -137,47 +141,47 @@ def startup_event():
     try:
         from db import create_all_tables
         create_all_tables()
-        logger.info("✅ API Ready — v2.9.0")
+        logger.info("✅ API Ready")
+        logger.info("📋 Available endpoints:")
+        logger.info("   POST /scrape-products   - Search scraping (5 pages default)")
+        logger.info("   POST /generate-product  - Single product scraping + filtering")
+        logger.info("   POST /generate-products - Bulk product scraping + filtering")
+        logger.info("   POST /reload-filters    - Hot-reload filter data from DB")
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
 
 # =============================================================================
-# INFO
+# INFO ENDPOINTS
 # =============================================================================
 
 @app.get("/", tags=["Info"])
 def root():
     return {
-        "status":  "running",
+        "status": "running",
         "service": "Octopia Template Pipeline",
-        "version": "2.9.0",
+        "version": "2.8.0",
         "endpoints": {
-            "POST /scrape-products":   "Search scraping — 5 pages, ALL products (accepted + restricted)",
-            "POST /generate-product":  "Single product full pipeline + filtering",
-            "POST /generate-products": "Bulk product pipeline + filtering (max 20)",
-            "POST /reload-filters":    "Hot-reload filter data from DB",
+            "GET /":                  "This info",
+            "GET /health":            "Health check",
+            "POST /scrape-products":  "Scrape search results — returns product_id, product_url, title (5 pages default)",
+            "POST /generate-product": "Scrape + keyword/category filter (single product)",
+            "POST /generate-products":"Scrape + filter (bulk, max 20)",
+            "POST /reload-filters":   "Hot-reload keyword + category filter data",
         },
-        "scraping_rules": {
-            "max_pages":      5,
-            "pagination":     "Direct URL navigation — never stops early",
-            "deduplication":  True,
-        },
-        "filter_rules": {
+        "filter_behaviour": {
             "keyword_filter": {
-                "field":   "ORIGINAL title only",
-                "method":  "partial case-insensitive match",
+                "applies_to":    "title only",
+                "method":        "string match (case-insensitive, word-boundary)",
+                "blocked_msg":   "Title has restricted keyword",
             },
-            "category_confidence": {
-                "accept_threshold": "≥ 0.75",
-                "reject_below":     "< 0.75 → set Uncategorized",
-            },
-            "category_embedding": {
-                "block":   "> 0.85",
-                "review":  "0.60–0.85",
-                "allow":   "< 0.60",
-            },
-        },
+            "category_filter": {
+                "applies_to":    "category.leaf only",
+                "method":        "embedding cosine similarity",
+                "thresholds":    {"BLOCK": "> 0.85", "REVIEW": "0.60–0.85", "ALLOW": "< 0.60"},
+                "blocked_msg":   "Category blocked due to restriction",
+            }
+        }
     }
 
 
@@ -192,7 +196,7 @@ def health_check():
 
 
 # =============================================================================
-# MAIN PROCESSING FUNCTION  (single product full pipeline)
+# MAIN PROCESSING FUNCTION
 # =============================================================================
 
 def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[str, Any]:
@@ -234,40 +238,54 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
         ]:
             if os.path.exists(candidate):
                 TEMPLATE_PATH = candidate
+                logger.info(f"📄 Template found: {candidate}")
                 break
 
+        if not TEMPLATE_PATH:
+            logger.warning("⚠️  Template file not found — Excel will be skipped")
+
         # ── STEP 1: SCRAPE ───────────────────────────────────────────────
+        logger.info("📥 Scraping with Camoufox...")
         scraped_data = get_product_info(url, extract_compliance=extract_compliance)
 
         if not scraped_data:
             return {"success": False, "url": url, "error": "Scraping failed",
                     "timestamp": datetime.now().isoformat()}
 
-        original_title = scraped_data.get("title", "")
-        description    = scraped_data.get("description", "")
+        title       = scraped_data.get("title", "")
+        description = scraped_data.get("description", "")
 
-        if not original_title:
+        if not title:
             return {"success": False, "url": url, "error": "No title extracted",
                     "timestamp": datetime.now().isoformat()}
 
+        scraped_specs_count = len([k for k in SPEC_FIELDS if scraped_data.get(k)])
+        logger.info(f"✅ Extracted {len(scraped_data)} attributes ({scraped_specs_count} spec fields)")
+
         # ── STEP 2: STORE ────────────────────────────────────────────────
+        logger.info("💾 Storing scraped data...")
         product_id = insert_scraped_product(url, scraped_data)
+
         if not product_id:
             return {"success": False, "url": url, "error": "Failed to store scraped data",
                     "timestamp": datetime.now().isoformat()}
 
         log_processing(product_id, url, "scraping", "success")
-        insert_seller_info(product_id, {k: scraped_data.get(k, '') for k in SELLER_FIELDS})
+
+        seller_data = {k: scraped_data.get(k, '') for k in SELLER_FIELDS}
+        insert_seller_info(product_id, seller_data)
         log_processing(product_id, url, "seller_info", "success")
 
         compliance_data = scraped_data.get('compliance', {})
         if compliance_data:
+            logger.info(f"🔒 Storing compliance info: {list(compliance_data.keys())}")
             insert_compliance_info(product_id, compliance_data)
             log_processing(product_id, url, "compliance_info", "success")
 
         insert_original_specifications(product_id, scraped_data)
 
         # ── STEP 3: ENHANCE ──────────────────────────────────────────────
+        logger.info("🤖 Enhancing content with OpenAI...")
         product_data_for_llm = {
             k: v for k, v in scraped_data.items()
             if k not in SELLER_FIELDS and k != 'compliance'
@@ -275,7 +293,7 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
 
         try:
             enhanced = improve_product_content(
-                title=original_title,
+                title=title,
                 description=description,
                 specifications=product_data_for_llm,
                 category=None
@@ -285,26 +303,26 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
         except Exception as e:
             logger.warning(f"Enhancement skipped: {e}")
             enhanced = {
-                "title":                   original_title,
+                "title":                   title,
                 "description":             description,
                 "bullet_points":           scraped_data.get("bullet_points", []),
                 "html_description":        "",
                 "specifications_enhanced": {}
             }
 
-        enhanced_title = enhanced.get("title", original_title)
         specs_enhanced = enhanced.get("specifications_enhanced", {})
         insert_enhanced_specifications(product_id, specs_enhanced)
 
-        enriched_data                   = scraped_data.copy()
-        enriched_data['title']          = enhanced_title
-        enriched_data['description']    = enhanced.get('description', description)
-        enriched_data['bullet_points']  = enhanced.get('bullet_points', [])
+        enriched_data = scraped_data.copy()
+        enriched_data['title']            = enhanced.get('title', title)
+        enriched_data['description']      = enhanced.get('description', description)
+        enriched_data['bullet_points']    = enhanced.get('bullet_points', [])
         enriched_data['html_description'] = enhanced.get('html_description', '')
 
         for field in SPEC_FIELDS:
             enh_val = specs_enhanced.get(field, '')
             enriched_data[field] = enh_val if (enh_val and enh_val.strip()) else ""
+
         for field in SELLER_FIELDS:
             enriched_data[field] = scraped_data.get(field, '')
 
@@ -312,10 +330,14 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
         log_all_spec_audits(product_id, scraped_data, specs_enhanced, enriched_data)
 
         # ── STEP 4: CATEGORIZE ───────────────────────────────────────────
+        logger.info("🏷️  Categorizing...")
         scraper_category = resolve_category(scraped_data)
 
         try:
-            category = assign_category(enhanced_title, enhanced.get("description", description))
+            category = assign_category(
+                enhanced.get("title", title),
+                enhanced.get("description", description)
+            )
             if scraper_category['confidence'] >= 0.9 and scraper_category['category_id'] != '0':
                 category = scraper_category
         except Exception as e:
@@ -325,28 +347,16 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
                 "category_leaf": "Unknown", "confidence": 0.0
             }
 
-        # ── Apply confidence threshold: < 0.75 → Uncategorized ──────────
-        confidence = float(category.get("confidence", 0.0))
-        conf_accepted, conf_reason = validate_category_confidence(confidence)
-        if not conf_accepted:
-            logger.info(f"[categorize] Confidence {confidence:.2f} < 0.75 → Uncategorized. {conf_reason}")
-            category = {
-                "category_id":   "0",
-                "category_name": "Uncategorized",
-                "category_leaf": "Uncategorized",
-                "category_path": "",
-                "confidence":    confidence,
-            }
-
         insert_category_assignment(
             product_id,
-            category.get("category_id", "0"), category.get("category_name", "Uncategorized"),
-            category.get("category_id", "0"), category.get("category_name", "Uncategorized"),
-            confidence
+            category.get("category_id", "0"), category.get("category_name", "Unknown"),
+            category.get("category_id", "0"), category.get("category_name", "Unknown"),
+            category.get("confidence", 0.0)
         )
         log_processing(product_id, url, "categorization", "success")
 
         # ── STEP 5: MAP ──────────────────────────────────────────────────
+        logger.info("🗺️  Mapping to template columns...")
         mapped_data = {}
         is_valid    = False
 
@@ -360,13 +370,15 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
             log_processing(product_id, url, "mapping", "error", str(e))
 
         # ── STEP 6: EXCEL ────────────────────────────────────────────────
+        logger.info("📋 Generating Excel template...")
         template_file = None
+
         if TEMPLATE_PATH:
             try:
                 template_file = fill_template_for_product(
                     TEMPLATE_PATH, mapped_data, product_id, FILLED_TEMPLATES_DIR,
                     category_id=category.get("category_id", "0"),
-                    category_name=category.get("category_leaf", "Uncategorized")
+                    category_name=category.get("category_leaf", "Unknown")
                 )
                 if template_file and os.path.exists(template_file):
                     insert_template_output(
@@ -379,17 +391,14 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
                 log_processing(product_id, url, "template_fill", "error", str(e))
 
         return {
-            "success":        True,
-            "product_id":     product_id,
-            "url":            url,
-            # Carry both titles for downstream use
-            "original_title": original_title,
-            "enhanced_title": enhanced_title,
+            "success":    True,
+            "product_id": product_id,
+            "url":        url,
             "original": {
-                "title":       original_title,
+                "title": title,
                 "description": (description[:200] + "..." if len(description) > 200 else description),
                 **{f: scraped_data.get(f, "") for f in SPEC_FIELDS},
-                "images":      sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}"))
+                "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}"))
             },
             "seller":     {f: scraped_data.get(f, "") for f in SELLER_FIELDS},
             "compliance": compliance_data,
@@ -398,10 +407,10 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
                 "name":       category.get("category_name", ""),
                 "leaf":       category.get("category_leaf", ""),
                 "path":       category.get("category_path", ""),
-                "confidence": round(confidence, 2)
+                "confidence": round(category.get("confidence", 0.0), 2)
             },
             "enhanced": {
-                "title":                   enhanced_title,
+                "title":                   enhanced.get("title", ""),
                 "description":             (enhanced.get("description", "")[:200] + "..."
                                             if enhanced.get("description") else ""),
                 "bullet_points":           enhanced.get("bullet_points", [])[:3],
@@ -413,6 +422,12 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
                 "columns_mapped": len(mapped_data),
                 "fields_valid":   is_valid,
             },
+            "extracted": {
+                "specifications":  sum(1 for k in SPEC_FIELDS if enriched_data.get(k)),
+                "images":          sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}")),
+                "seller_fields":   len([k for k in SELLER_FIELDS if scraped_data.get(k)]),
+                "compliance_fields": len(compliance_data),
+            },
             "timestamp": datetime.now().isoformat()
         }
 
@@ -423,121 +438,25 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
 
 
 # =============================================================================
-# SEARCH SCRAPING ENDPOINT
-# =============================================================================
-
-@app.post("/scrape-products", tags=["Product Processing"])
-def scrape_search_products(request: SearchScrapeRequest):
-    """
-    Scrape product IDs, URLs, and ORIGINAL titles from AliExpress search results.
-
-    Scraping rules:
-      • Always scrapes ALL max_pages (default 5) via direct URL navigation
-      • Never stops early — visits every page even without pagination DOM
-      • Deduplication by product_id
-
-    Output: ALL products with status field:
-
-    RESTRICTED (keyword found in original title):
-      {
-        "product_id":  "...",
-        "product_url": "...",
-        "title":       "<ORIGINAL scraped title>",
-        "status":      "rejected",
-        "message":     "Title not fetched due to restricted keyword"
-      }
-
-    ACCEPTED:
-      {
-        "product_id":  "...",
-        "product_url": "...",
-        "title":       "<ORIGINAL scraped title>",
-        "status":      "accepted"
-      }
-
-    ⚠️  title is ALWAYS the original raw scraped title — never LLM-enhanced.
-    """
-    if not request.search_url:
-        raise HTTPException(status_code=400, detail="search_url is required")
-    if 'aliexpress.com' not in request.search_url.lower():
-        raise HTTPException(status_code=400, detail="Invalid AliExpress URL")
-
-    max_pages = request.max_pages if request.max_pages is not None else 5
-    max_pages = min(max_pages, MAX_SEARCH_PAGES)
-
-    try:
-        logger.info(f"🔍 Search scrape started: {request.search_url}")
-        logger.info(f"   Max pages: {max_pages}")
-
-        raw = scrape_search_results(
-            search_url=request.search_url,
-            max_pages=max_pages,
-            delay=request.delay_between_requests,
-        )
-
-        products = raw.get("products", []) if isinstance(raw, dict) else (raw or [])
-
-        logger.info(
-            f"✅ Scraped {len(products)} products from "
-            f"{raw.get('pages_scraped', '?') if isinstance(raw, dict) else '?'} pages"
-        )
-
-        # Apply keyword filter on original title — return ALL products with status
-        result = []
-        accepted_count  = 0
-        rejected_count  = 0
-
-        for p in products:
-            if not p.get("product_id"):
-                continue
-
-            original_title = p.get("title", "")
-            is_restricted  = filter_restricted_keywords(original_title)
-
-            if is_restricted:
-                result.append({
-                    "product_id":  str(p["product_id"]),
-                    "product_url": p["product_url"],
-                    "title":       original_title,  # ORIGINAL title always
-                    "status":      "rejected",
-                    "message":     "Title not fetched due to restricted keyword",
-                })
-                rejected_count += 1
-            else:
-                result.append({
-                    "product_id":  str(p["product_id"]),
-                    "product_url": p["product_url"],
-                    "title":       original_title,  # ORIGINAL title always
-                    "status":      "accepted",
-                })
-                accepted_count += 1
-
-        logger.info(f"   accepted={accepted_count} | rejected={rejected_count} | total={len(result)}")
-        return result
-
-    except Exception as e:
-        logger.error(f"❌ Search scrape failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Scraping failed: {str(e)}")
-
-
-# =============================================================================
-# GENERATE-PRODUCT ENDPOINT
+# PRODUCT PROCESSING ENDPOINTS
 # =============================================================================
 
 @app.post("/generate-product", tags=["Product Processing"])
 def generate_product(req: ProductURLRequest):
     """
-    Full pipeline for a single product URL.
+    Scrape and process a single product URL.
 
-    Filter logic (on ORIGINAL title):
-      1. Keyword filter (partial match on original title)
-      2. Category confidence < 0.75 → Uncategorized
-      3. Category embedding check on leaf
+    Filters applied in order:
+      1. Keyword filter  — checks ORIGINAL title only (partial match)
+      2. Category confidence — confidence < 0.75 → category = "Uncategorized"
+      3. Category embedding  — cosine similarity on category.leaf
 
-    REJECTED response:
+    Output for ACCEPTED products:
+      { "status": "accepted", "original_title": "...", "enhanced_title": "...",
+        "category": "...", "confidence": ... }
+
+    Output for REJECTED products:
       { "status": "rejected", "reason": "Title has restricted keyword" }
-
-    ACCEPTED response includes both original_title and enhanced_title.
     """
     if not req.url:
         raise HTTPException(status_code=400, detail="URL cannot be empty")
@@ -547,158 +466,243 @@ def generate_product(req: ProductURLRequest):
     if not result.get("success"):
         return result
 
-    # Use the ORIGINAL title for keyword filter (not enhanced)
-    original_title = result.get("original_title", "")
-    raw_category   = result.get("category")
+    # Extract original (scraped) and enhanced titles
+    original_title = result.get("original", {}).get("title", "")
+    enhanced_title = result.get("enhanced", {}).get("title", "") or original_title
+    raw_category   = result.get("category", {})
 
-    # ── Keyword filter on original title ────────────────────────────────
-    if filter_restricted_keywords(original_title):
+    # ── Step 1: Keyword filter on ORIGINAL title ─────────────────────────────
+    kw_blocked = filter_restricted_keywords(original_title)
+    if kw_blocked:
+        logger.info(f"[endpoint] /generate-product keyword-blocked: {req.url}")
         return {
-            "status":         "rejected",
-            "reason":         "Title has restricted keyword",
-            "product_id":     result.get("product_id"),
-            "original_title": original_title,
-            "url":            req.url,
-            "timestamp":      datetime.now().isoformat(),
+            "status": "rejected",
+            "reason": "Title has restricted keyword",
         }
 
-    # ── Category embedding filter ─────────────────────────────────────
-    from product_filter import is_category_restricted
-    cat_blocked, cat_reason = is_category_restricted(raw_category)
-    if cat_blocked:
+    # ── Step 2: Category confidence validation ────────────────────────────────
+    # Modifies raw_category in-place — sets to Uncategorized if < 0.75
+    validated_category = apply_category_confidence(raw_category)
+    confidence         = validated_category.get("confidence", 0.0)
+    category_name      = validated_category.get("name", "Uncategorized")
+
+    # ── Step 3: Category embedding filter (on leaf) ───────────────────────────
+    allowed, reason = filter_product(
+        original_title,
+        validated_category,
+        apply_keyword_filter=False,
+        apply_category_filter=True,
+    )
+    if not allowed:
+        logger.info(f"[endpoint] /generate-product category-blocked: {req.url}")
         return {
-            "status":         "rejected",
-            "reason":         cat_reason,
-            "product_id":     result.get("product_id"),
-            "original_title": original_title,
-            "url":            req.url,
-            "timestamp":      datetime.now().isoformat(),
+            "status": "rejected",
+            "reason": reason or "Category blocked due to restriction",
         }
 
-    # ── Accepted ──────────────────────────────────────────────────────
+    # ── Accepted ──────────────────────────────────────────────────────────────
     return {
         "status":         "accepted",
+        "original_title": original_title,
+        "enhanced_title": enhanced_title,
+        "category":       category_name,
+        "confidence":     round(confidence, 4),
+        # Full detail still available for downstream use
         "product_id":     result.get("product_id"),
         "url":            req.url,
-        "original_title": original_title,
-        "enhanced_title": result.get("enhanced_title", ""),
-        "category":       result.get("category", {}).get("name", ""),
-        "confidence":     result.get("category", {}).get("confidence", 0.0),
-        "enhanced":       result.get("enhanced", {}),
         "seller":         result.get("seller", {}),
         "compliance":     result.get("compliance", {}),
+        "enhanced":       result.get("enhanced", {}),
+        "original":       result.get("original", {}),
         "template":       result.get("template", {}),
         "timestamp":      result.get("timestamp"),
     }
 
 
-# =============================================================================
-# GENERATE-PRODUCTS ENDPOINT
-# =============================================================================
-
 @app.post("/generate-products", tags=["Product Processing"])
 def generate_products(req: BulkProductRequest):
     """
-    Full pipeline for multiple product URLs (max 20).
+    Scrape and process multiple product URLs (max 20).
 
-    Returns all products with their status and both titles.
+    Both keyword and category filters applied to every product.
+    Both accepted AND rejected products are included in 'results'.
 
-    REJECTED:
-      { "status": "rejected", "reason": "...", "original_title": "...", "url": "..." }
-
-    ACCEPTED:
-      { "status": "accepted", "original_title": "...", "enhanced_title": "...",
-        "category": "...", "confidence": ..., ... }
+    Per-product output shape:
+      Accepted: { "status": "accepted", "original_title": "...", "enhanced_title": "...",
+                  "category": "...", "confidence": ... }
+      Rejected: { "status": "rejected", "reason": "..." }
     """
     if not req.urls:
         raise HTTPException(status_code=400, detail="URLs list cannot be empty")
     if len(req.urls) > 20:
         raise HTTPException(status_code=400, detail="Maximum 20 URLs per request")
 
-    from product_filter import is_category_restricted
-
-    results    = []
-    successful = 0
-    rejected   = 0
-    failed     = 0
+    results        = []
+    successful     = 0
+    failed         = 0
+    filtered_count = 0
 
     for url in req.urls:
         result = process_product_complete(url, extract_compliance=req.extract_compliance)
 
         if not result.get("success"):
             failed += 1
+            results.append({"status": "error", "url": url,
+                             "reason": result.get("error", "Processing failed")})
+            continue
+
+        original_title = result.get("original", {}).get("title", "")
+        enhanced_title = result.get("enhanced", {}).get("title", "") or original_title
+        raw_category   = result.get("category", {})
+
+        # Keyword filter
+        kw_blocked = filter_restricted_keywords(original_title)
+        if kw_blocked:
+            filtered_count += 1
+            logger.info(f"[filter] Keyword-blocked: {url}")
             results.append({
-                "status":  "error",
-                "url":     url,
-                "reason":  result.get("error", "Unknown error"),
-                "timestamp": datetime.now().isoformat(),
+                "status": "rejected",
+                "reason": "Title has restricted keyword",
+                "url":    url,
             })
             continue
 
-        original_title = result.get("original_title", "")
-        raw_category   = result.get("category")
-
-        # Keyword filter on ORIGINAL title
-        if filter_restricted_keywords(original_title):
-            rejected += 1
-            results.append({
-                "status":         "rejected",
-                "reason":         "Title has restricted keyword",
-                "original_title": original_title,
-                "url":            url,
-                "timestamp":      datetime.now().isoformat(),
-            })
-            continue
+        # Category confidence validation
+        validated_category = apply_category_confidence(raw_category)
+        confidence         = validated_category.get("confidence", 0.0)
+        category_name      = validated_category.get("name", "Uncategorized")
 
         # Category embedding filter
-        cat_blocked, cat_reason = is_category_restricted(raw_category)
-        if cat_blocked:
-            rejected += 1
+        allowed, reason = filter_product(
+            original_title,
+            validated_category,
+            apply_keyword_filter=False,
+            apply_category_filter=True,
+        )
+        if not allowed:
+            filtered_count += 1
+            logger.info(f"[filter] Category-blocked ({reason}): {url}")
             results.append({
-                "status":         "rejected",
-                "reason":         cat_reason,
-                "original_title": original_title,
-                "url":            url,
-                "timestamp":      datetime.now().isoformat(),
+                "status": "rejected",
+                "reason": reason or "Category blocked due to restriction",
+                "url":    url,
             })
             continue
 
-        # Accepted
         successful += 1
         results.append({
             "status":         "accepted",
+            "original_title": original_title,
+            "enhanced_title": enhanced_title,
+            "category":       category_name,
+            "confidence":     round(confidence, 4),
             "product_id":     result.get("product_id"),
             "url":            url,
-            "original_title": original_title,
-            "enhanced_title": result.get("enhanced_title", ""),
-            "category":       result.get("category", {}).get("name", ""),
-            "confidence":     result.get("category", {}).get("confidence", 0.0),
-            "enhanced":       result.get("enhanced", {}),
-            "seller":         result.get("seller", {}),
-            "compliance":     result.get("compliance", {}),
-            "template":       result.get("template", {}),
-            "timestamp":      result.get("timestamp"),
         })
 
     return {
         "total":      len(req.urls),
         "successful": successful,
-        "rejected":   rejected,
         "failed":     failed,
+        "filtered":   filtered_count,
         "results":    results,
         "timestamp":  datetime.now().isoformat(),
     }
 
-
-# =============================================================================
-# RELOAD FILTERS
-# =============================================================================
 
 @app.post("/reload-filters", tags=["Product Processing"])
 def reload_filters():
     """Hot-reload keyword + category filter data from DB."""
     reload_filter_data()
     return {"status": "ok", "message": "Filter data reloaded from DB"}
+
+
+# =============================================================================
+# SEARCH SCRAPING ENDPOINT
+# =============================================================================
+
+@app.post("/scrape-products", tags=["Product Processing"])
+def scrape_search_products(request: SearchScrapeRequest):
+    """
+    Scrape product IDs, URLs, and titles from AliExpress search results.
+
+    Always scrapes up to max_pages (default 5) — never stops early on has_next.
+
+    Per-product output (per spec):
+      Restricted: { "product_id": "...", "product_url": "...", "title": "ORIGINAL",
+                    "status": "rejected",
+                    "message": "Title not fetched due to restricted keyword" }
+      Accepted:   { "product_id": "...", "product_url": "...", "title": "ORIGINAL",
+                    "status": "accepted" }
+
+    IMPORTANT: uses ORIGINAL scraped title only — no enhancement applied here.
+    Keyword filter IS applied; category filter is NOT (no full product scrape here).
+    """
+    if not request.search_url:
+        raise HTTPException(status_code=400, detail="search_url is required")
+
+    if 'aliexpress.com' not in request.search_url.lower():
+        raise HTTPException(status_code=400, detail="Invalid AliExpress URL")
+
+    max_pages = request.max_pages if request.max_pages is not None else 5
+    max_pages = min(max_pages, MAX_SEARCH_PAGES)
+
+    try:
+        logger.info(f"🔍 Starting search scrape: {request.search_url}")
+        logger.info(f"   Max pages: {max_pages}")
+
+        raw = scrape_search_results(
+            search_url=request.search_url,
+            max_pages=max_pages,
+            delay=request.delay_between_requests,
+        )
+
+        # scraper.py returns Dict; search_scraper.py returns List — handle both
+        if isinstance(raw, dict):
+            products = raw.get("products", [])
+        else:
+            products = raw or []
+
+        if not products:
+            logger.info("No products found")
+            return []
+
+        pages_info = raw.get("pages_scraped", max_pages) if isinstance(raw, dict) else max_pages
+        logger.info(f"✅ Scraped {len(products)} products from {pages_info} pages")
+
+        # Apply keyword filter to each product — return ALL products including rejected
+        output = []
+        for p in products:
+            if not p.get("product_id"):
+                continue
+            original_title = p.get("title", "")
+            kw_blocked     = filter_restricted_keywords(original_title)
+
+            if kw_blocked:
+                output.append({
+                    "product_id":  str(p["product_id"]),
+                    "product_url": p["product_url"],
+                    "title":       original_title,   # ORIGINAL title, never enhanced
+                    "status":      "rejected",
+                    "message":     "Title not fetched due to restricted keyword",
+                })
+            else:
+                output.append({
+                    "product_id":  str(p["product_id"]),
+                    "product_url": p["product_url"],
+                    "title":       original_title,   # ORIGINAL title, never enhanced
+                    "status":      "accepted",
+                })
+
+        accepted = sum(1 for p in output if p["status"] == "accepted")
+        rejected = sum(1 for p in output if p["status"] == "rejected")
+        logger.info(f"   accepted={accepted}  rejected(keyword)={rejected}")
+
+        return output
+
+    except Exception as e:
+        logger.error(f"❌ Search scrape failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Scraping failed: {str(e)}")
 
 
 # =============================================================================
@@ -812,6 +816,6 @@ def view_processing_logs(limit: int = 500):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v2.9")
+    logger.info("🚀 Octopia Template Pipeline v2.8")
     logger.info(f"📡 Server: http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
