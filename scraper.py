@@ -749,20 +749,49 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
             def handle_response(response):
                 try:
                     resp_url = response.url
-                    if (('mtop.aliexpress.pdp.pc.query' in resp_url or
-                         'mtop.aliexpress.itemdetail' in resp_url or
-                         'pdp.pc.query' in resp_url) and
-                            response.status == 200):
-                        body = response.body()
-                        if len(body) < 1000:
-                            return
-                        text = body.decode('utf-8', errors='replace')
-                        if any(x in text for x in [
-                            'titleModule', 'storeModule', 'SHOP_CARD_PC',
-                            'imageModule', 'priceModule', '"subject"', '"storeName"'
-                        ]):
-                            captured.append(text)
-                            print(f"[scraper] Captured API ({len(text):,} bytes)")
+                    if response.status != 200:
+                        return
+
+                    # Deliberately broad — pl./de./fr. storefronts fire different
+                    # endpoint names than www.aliexpress.com
+                    is_api = any(x in resp_url for x in [
+                        'mtop.aliexpress',
+                        'pdp.pc.query',
+                        'pdp.pc.get',
+                        'item.detail',
+                        'itemdetail',
+                        'ae.page.detail',
+                        'page.detail',
+                        'gsp.aliexpress',
+                        'api.aliexpress',
+                        '/fn/detail',
+                        '/fn/product',
+                        'product.info',
+                        'aliexpress.com/fn/',
+                        'datahub',
+                    ])
+                    if not is_api:
+                        return
+
+                    body = response.body()
+                    if len(body) < 500:
+                        return
+                    text = body.decode('utf-8', errors='replace')
+
+                    # Accept any response that looks like product data
+                    has_data = any(x in text for x in [
+                        'titleModule', 'TITLE', '"subject"',
+                        'imageModule', 'IMAGE', 'imagePathList',
+                        'priceModule', 'PRICE',
+                        'storeModule', 'SHOP_CARD_PC', '"storeName"',
+                        'productInfoComponent', 'commonModule',
+                        'webEnv', 'metaModule', 'pageData',
+                    ])
+                    if not has_data:
+                        return
+
+                    captured.append(text)
+                    print(f"[scraper] Captured API ({len(text):,} bytes) ← {resp_url[8:70]}")
                 except Exception:
                     pass
 
@@ -1409,8 +1438,9 @@ def scrape_search_results(
                         _dismiss_banners(page)
                         page.wait_for_timeout(800)
                 except Exception as e:
-                    print(f"[search_scraper] Navigation error page {page_num}: {e}")
-                    break
+                    print(f"[search_scraper] Navigation error page {page_num}: {e} — skipping")
+                    pages_scraped = page_num
+                    continue
 
                 # Extract BEFORE scrolling (avoids context-destroyed errors)
                 page_products = _extract_products_from_page(page)
@@ -1432,24 +1462,26 @@ def scrape_search_results(
                 pages_scraped = page_num
                 print(f"[search_scraper] Page {page_num}: +{new_count} new | total={len(all_products)}")
 
-                # Stopping conditions
+                # Only hard stop: optional products cap
                 if max_products > 0 and len(all_products) >= max_products:
                     print(f"[search_scraper] Max products ({max_products}) reached")
                     break
 
-                if not _has_next_page(page):
-                    print(f"[search_scraper] No next-page button — stopping after page {page_num}")
-                    break
-
+                # Log pagination info for diagnostics — but NEVER stop early on it.
+                # AliExpress renders the next-page button lazily; checking it here
+                # causes premature termination (the "0 products / stops at page 1" bug).
+                has_next    = _has_next_page(page)
                 total_pages = _get_total_pages(page)
-                if page_num >= total_pages:
-                    print(f"[search_scraper] Reached last page ({total_pages})")
-                    break
+                print(
+                    f"[search_scraper] Pagination: has_next={has_next} "
+                    f"total_pages={total_pages} — continuing to page {page_num + 1}"
+                )
 
                 # Polite inter-page delay
-                sleep_time = random.uniform(delay, delay * 1.5)
-                print(f"[search_scraper] Waiting {sleep_time:.1f}s before next page...")
-                time.sleep(sleep_time)
+                if page_num < max_pages:
+                    sleep_time = random.uniform(delay, delay * 1.5)
+                    print(f"[search_scraper] Waiting {sleep_time:.1f}s before next page...")
+                    time.sleep(sleep_time)
 
             page.close()
             context.close()
