@@ -562,20 +562,19 @@ def _delivery_days_from_text(delivery_text: str) -> dict:
 
 def _extract_shipping_by_countries(page, countries: dict = None) -> dict:
     """
-    For each target country (PL, DE, CZ, AT, BG), click the Delivery Method
-    popup and extract cost + delivery time from .dynamic-shipping-table.
-
-    Task 4 note: If delivery > 16 days, note field says "Delivery above 16 days".
-
-    Args:
-        page:      Playwright page (already loaded on product detail URL)
-        countries: dict of {country_code: country_name} to check.
-                   Defaults to SHIPPING_TARGET_COUNTRIES.
+    For each target country (PL, DE, CZ, AT, BG):
+      1. Navigate to the product URL with ?shipToCountry=XX
+      2. Read 'div.dynamic-shipping-line' elements (always visible on page — no popup needed)
+         These carry "Free shipping · Ships from Germany" style text.
+      3. Read 'table.dynamic-shipping-table' rows for cost + delivery time.
+      4. If table is hidden, try clicking the shipping/delivery section to expand it.
+      5. Apply Task-4 16-day check on the parsed delivery date.
 
     Returns:
         {
-          "PL": {"cost": "Free delivery", "delivery_time": "...", "within_16_days": True,  "note": "...", "raw": "..."},
-          "DE": {...},
+          "PL": {"country": "Poland", "cost": "Free delivery", "ships_from": "Germany",
+                 "delivery_time": "Pick up by ...", "max_delivery_days": 4,
+                 "within_16_days": True, "note": "Delivery OK (4 days)"},
           ...
         }
     """
@@ -583,113 +582,138 @@ def _extract_shipping_by_countries(page, countries: dict = None) -> dict:
         countries = SHIPPING_TARGET_COUNTRIES
 
     shipping_results = {}
+    # Capture the base URL before we start mutating it per country
+    base_url = page.url
 
     for country_code, country_name in countries.items():
         try:
-            print(f"[scraper] Extracting shipping for {country_code} ({country_name})")
+            print(f"[scraper] Extracting shipping → {country_code} ({country_name})")
 
-            # ── Step 1: Navigate to product URL with ship-to country ──────
-            current_url = page.url
-            # Inject / replace shipToCountry param
-            if re.search(r'[?&]shipToCountry=[A-Z]+', current_url):
-                nav_url = re.sub(r'(shipToCountry=)[A-Z]+', rf'\g<1>{country_code}', current_url)
+            # ── Step 1: navigate with shipToCountry param ─────────────────
+            if re.search(r'[?&]shipToCountry=[A-Z]+', base_url):
+                nav_url = re.sub(r'(shipToCountry=)[A-Z]+', rf'\g<1>{country_code}', base_url)
             else:
-                sep     = '&' if '?' in current_url else '?'
-                nav_url = f"{current_url}{sep}shipToCountry={country_code}"
+                sep     = '&' if '?' in base_url else '?'
+                nav_url = f"{base_url}{sep}shipToCountry={country_code}"
 
             page.goto(nav_url, timeout=PAGE_TIMEOUT, wait_until='domcontentloaded')
-            page.wait_for_timeout(3000)
+            # Wait for shipping section to appear
+            try:
+                page.wait_for_selector(
+                    'div.dynamic-shipping-line, table.dynamic-shipping-table',
+                    timeout=12_000
+                )
+            except Exception:
+                page.wait_for_timeout(5000)
 
-            # ── Step 2: Try to open the "Delivery method" popup ───────────
-            popup_opened = False
-            popup_selectors = [
-                'div[class*="delivery"] span:has-text("Delivery method")',
-                'span:has-text("Delivery method")',
-                'div:has-text("Service guarantee")',
-                '[data-spm-anchor-id*="i27"]',
-                '[data-spm-anchor-id*="i14"]',
-                '.comet-icon-tachometer ~ span',
-            ]
-            for sel in popup_selectors:
-                try:
-                    el = page.locator(sel).first
-                    if el.count() > 0 and el.is_visible(timeout=2000):
-                        el.click(timeout=3000)
-                        page.wait_for_timeout(1500)
-                        popup_opened = True
-                        break
-                except Exception:
-                    continue
-
-            # ── Step 3: Extract from .dynamic-shipping-table ─────────────
-            cost          = ""
+            cost       = ""
+            ships_from = ""
             delivery_time = ""
 
-            # Try from popup modal first
-            modal_sel = '.comet-v2-modal, .comet-modal, [class*="modal"]'
+            # ── Step 2: read dynamic-shipping-line divs (no popup required) ──
+            # These contain inline text like "Free shipping · Ships from Germany"
             try:
-                modal = page.locator(modal_sel).first
-                if modal.count() > 0:
-                    table = modal.locator('table.dynamic-shipping-table').first
-                    if table.count() > 0:
-                        rows = table.locator('tr').all()
-                        for row in rows:
-                            th_text = row.locator('th').inner_text().strip().lower() if row.locator('th').count() > 0 else ''
-                            td_text = row.locator('td').inner_text().strip()         if row.locator('td').count() > 0 else ''
-                            if 'cost' in th_text or 'price' in th_text or 'free' in td_text.lower():
-                                cost = td_text
-                            elif 'delivery' in th_text or 'time' in th_text or 'pick' in td_text.lower():
-                                delivery_time = td_text
-            except Exception:
-                pass
+                lines = page.locator('div.dynamic-shipping-line').all()
+                for line in lines[:8]:
+                    try:
+                        raw_text = line.inner_text().strip()
+                        raw_text = re.sub(r'\s+', ' ', raw_text).strip()
+                        if not raw_text:
+                            continue
+                        # Grab cost/free-shipping info from title-layout line
+                        classes = line.get_attribute('class') or ''
+                        if 'titleLayout' in classes or 'title' in classes.lower():
+                            if not cost:
+                                cost = raw_text
+                        # Grab "Ships from" country
+                        m = re.search(r'ships?\s+from\s+([A-Za-z ]+)', raw_text, re.IGNORECASE)
+                        if m and not ships_from:
+                            ships_from = m.group(1).strip()
+                        # Also try to grab delivery date inline
+                        if re.search(r'(pick up|deliver|arrival|expected)', raw_text, re.IGNORECASE):
+                            if not delivery_time:
+                                delivery_time = raw_text
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"[scraper] dynamic-shipping-line error ({country_code}): {e}")
 
-            # Fallback: scrape directly from page (no popup needed)
-            if not cost and not delivery_time:
+            # ── Step 3: read dynamic-shipping-table (structured rows) ─────
+            def _read_shipping_table(scope):
+                """Read cost + delivery_time from table rows within `scope`."""
+                nonlocal cost, delivery_time
                 try:
-                    tables = page.locator('table.dynamic-shipping-table').all()
-                    for table in tables[:3]:
-                        rows = table.locator('tr').all()
+                    tables = scope.locator('table.dynamic-shipping-table').all()
+                    for tbl in tables[:5]:
+                        rows = tbl.locator('tr').all()
                         for row in rows:
-                            th_text = row.locator('th').inner_text().strip().lower() if row.locator('th').count() > 0 else ''
-                            td_text = row.locator('td').inner_text().strip()         if row.locator('td').count() > 0 else ''
-                            if ('cost' in th_text or 'price' in th_text) and td_text:
-                                cost = td_text
-                            elif ('delivery' in th_text or 'time' in th_text) and td_text:
-                                delivery_time = td_text
-                    if cost or delivery_time:
-                        break
+                            th_el = row.locator('th')
+                            td_el = row.locator('td')
+                            if th_el.count() == 0 or td_el.count() == 0:
+                                continue
+                            th_text = re.sub(r'\s+', ' ', th_el.inner_text()).strip().lower()
+                            td_text = re.sub(r'\s+', ' ', td_el.inner_text()).strip()
+                            if not td_text:
+                                continue
+                            if 'cost' in th_text or 'price' in th_text or 'fee' in th_text:
+                                if not cost:
+                                    cost = td_text
+                            elif ('delivery' in th_text or 'time' in th_text
+                                  or 'arrival' in th_text or 'pick' in th_text.lower()):
+                                if not delivery_time:
+                                    delivery_time = td_text
                 except Exception:
                     pass
 
-            # Clean up text (strip HTML font tags)
+            _read_shipping_table(page)
+
+            # ── Step 4: if still missing, try expanding shipping section ──
+            if not delivery_time:
+                expand_selectors = [
+                    # Clicking the first "Delivery method" text row expands the table
+                    'div.dynamic-shipping-contentLayout',
+                    'div[class*="dynamic-shipping"] div[class*="content"]',
+                    'div[class*="shippingInfo"]',
+                    'div[class*="delivery-info"]',
+                    '[data-spm-anchor-id*="i27"]',
+                    '[data-spm-anchor-id*="i4"]',
+                ]
+                for sel in expand_selectors:
+                    try:
+                        el = page.locator(sel).first
+                        if el.count() > 0 and el.is_visible(timeout=1500):
+                            el.click(timeout=2000)
+                            page.wait_for_timeout(1500)
+                            _read_shipping_table(page)
+                            if delivery_time:
+                                break
+                    except Exception:
+                        continue
+
+            # ── Step 5: clean + Task-4 check ─────────────────────────────
             cost          = re.sub(r'<[^>]+>', '', cost).strip()
             delivery_time = re.sub(r'<[^>]+>', '', delivery_time).strip()
 
-            # ── Step 4: Task 4 — 16-day check ────────────────────────────
             delivery_info = _delivery_days_from_text(delivery_time)
 
             shipping_results[country_code] = {
-                "country":        country_name,
-                "cost":           cost          or "N/A",
-                "delivery_time":  delivery_time or "N/A",
+                "country":           country_name,
+                "cost":              cost          or "N/A",
+                "ships_from":        ships_from    or "N/A",
+                "delivery_time":     delivery_time or "N/A",
                 "max_delivery_days": delivery_info["max_delivery_days"],
                 "within_16_days":    delivery_info["within_16_days"],
                 "note":              delivery_info["note"],
             }
-
-            # Close popup if open
-            try:
-                page.locator('.comet-v2-modal-close, .comet-modal-close, [aria-label="Close"]').first.click(timeout=2000)
-                page.wait_for_timeout(500)
-            except Exception:
-                pass
+            print(f"[scraper] Shipping {country_code}: cost='{cost}' | delivery='{delivery_time}'")
 
         except Exception as exc:
             print(f"[scraper] Shipping extraction error for {country_code}: {exc}")
             shipping_results[country_code] = {
-                "country":        country_name,
-                "cost":           "N/A",
-                "delivery_time":  "N/A",
+                "country":           country_name,
+                "cost":              "N/A",
+                "ships_from":        "N/A",
+                "delivery_time":     "N/A",
                 "max_delivery_days": None,
                 "within_16_days":    None,
                 "note":              f"Error: {exc}",
@@ -1026,130 +1050,236 @@ def _find_item_list_recursive(data, depth: int = 0) -> Optional[list]:
 
 def _extract_products_from_page(page) -> List[Dict]:
     """
-    3-layer extraction: init_data JSON → DOM anchors → HTML regex.
-    Returns list with keys: product_id, product_url, title
+    4-layer extraction: multi-path JSON → DOM card divs → DOM anchors → HTML regex.
+    Returns list with keys: product_id, product_url, title, rating, sold_count
+
+    KEY FIXES:
+    - Tries window.__INIT_DATA__, window.runParams, window._dida_config_._init_data_
+      so Polish/EU AliExpress pages (which don't use _dida_config_) are covered.
+    - Does NOT return early from JSON layer unless 10+ products found — falls through
+      to DOM layers to combine results when JSON only returns sponsored/partial set.
+    - Layer 2 uses 'div.lw_v' card structure (the real search card on pl.aliexpress.com).
+    - Extracts rating (.lw_km) and sold count (.lw_kk) from DOM.
     """
-    products = []
+    products: List[Dict] = []
     seen_ids: set = set()
 
-    # Layer 1: init_data JSON
+    # ── Helper: parse one JSON item dict ─────────────────────────────────────
+    def _parse_item(item: dict) -> Optional[Dict]:
+        if not isinstance(item, dict):
+            return None
+        pid = str(
+            item.get('productId', '') or item.get('redirectedId', '') or
+            item.get('itemId', '')    or item.get('id', '')
+        ).strip()
+        if not pid or pid in seen_ids:
+            return None
+
+        title_raw = (
+            _safe_get(item, 'title', 'displayTitle') or
+            _safe_get(item, 'title', 'seoTitle')     or
+            item.get('title') or item.get('productTitle') or item.get('name') or ''
+        )
+        if isinstance(title_raw, dict):
+            title_raw = title_raw.get('displayTitle', '') or title_raw.get('title', '')
+        title = _clean_title(str(title_raw).strip())
+
+        # Task 5: rating from JSON
+        rating_raw = (
+            _safe_get(item, 'starRating')             or
+            _safe_get(item, 'averageStar')            or
+            _safe_get(item, 'feedback', 'starRating') or
+            _safe_get(item, 'trade', 'starRating')    or
+            _safe_get(item, 'ratings', 'averageScore') or ''
+        )
+        # Task 6 (search): sold count from JSON
+        sold_raw = (
+            _safe_get(item, 'trade', 'tradeCount') or
+            _safe_get(item, 'tradeCount')          or
+            _safe_get(item, 'sold')                or
+            _safe_get(item, 'salesCount')          or ''
+        )
+        seen_ids.add(pid)
+        return {
+            'product_id':  pid,
+            'product_url': _normalize_product_url(pid),
+            'title':       title,
+            'rating':      _s(rating_raw),
+            'sold_count':  _s(sold_raw),
+        }
+
+    # ── Layer 1: JSON — try ALL three window-level data sources ──────────────
+    json_js = """() => {
+        const results = {};
+        try {
+            if (window.__INIT_DATA__) results.INIT_DATA = JSON.stringify(window.__INIT_DATA__);
+        } catch(e) {}
+        try {
+            if (window.runParams) results.runParams = JSON.stringify(window.runParams);
+        } catch(e) {}
+        try {
+            const cfg = window._dida_config_;
+            if (cfg && cfg._init_data_) results.dida = JSON.stringify(cfg._init_data_);
+        } catch(e) {}
+        return JSON.stringify(results);
+    }"""
     try:
-        init_data_json = page.evaluate("""() => {
-            try {
-                const cfg = window._dida_config_;
-                if (cfg && cfg._init_data_) return JSON.stringify(cfg._init_data_);
-            } catch(e) {}
-            return null;
-        }""")
-        if init_data_json:
-            init_data = json.loads(init_data_json)
-            item_list = (
-                _safe_get(init_data, 'data', 'data', 'root', 'fields', 'mods', 'itemList', 'content') or
-                _safe_get(init_data, 'data', 'root', 'fields', 'mods', 'itemList', 'content') or
-                _find_item_list_recursive(init_data) or []
-            )
-            for item in item_list:
-                if not isinstance(item, dict):
-                    continue
-                pid = str(
-                    item.get('productId', '') or
-                    item.get('redirectedId', '') or
-                    item.get('itemId', '')
-                ).strip()
-                if not pid or pid in seen_ids:
-                    continue
+        raw_sources = page.evaluate(json_js)
+        sources = json.loads(raw_sources) if raw_sources else {}
 
-                title_raw = (
-                    _safe_get(item, 'title', 'displayTitle') or
-                    _safe_get(item, 'title', 'seoTitle') or
-                    item.get('title') or ''
-                )
-                if isinstance(title_raw, dict):
-                    title_raw = title_raw.get('displayTitle', '') or title_raw.get('title', '')
-                title = _clean_title(str(title_raw).strip())
-
-                # Task 5: extract rating from JSON
-                rating_raw = (
-                    _safe_get(item, 'starRating')          or
-                    _safe_get(item, 'averageStar')         or
-                    _safe_get(item, 'feedback', 'starRating') or
-                    _safe_get(item, 'trade', 'starRating') or
-                    _safe_get(item, 'ratings', 'averageScore') or
-                    ''
-                )
-                rating = _s(rating_raw)
-
-                seen_ids.add(pid)
-                products.append({
-                    'product_id':  pid,
-                    'product_url': _normalize_product_url(pid),
-                    'title':       title,
-                    'rating':      rating,
-                })
-
-            if products:
-                print(f"[search_scraper] init_data: {len(products)} products")
-                return products
-    except Exception as e:
-        print(f"[search_scraper] init_data error: {e}")
-
-    # Layer 2: DOM anchors
-    try:
-        anchors = page.locator(
-            'a.search-card-item, a.lw_b.h7_ic.search-card-item, [class*="search-card-item"]'
-        ).all()
-        for anchor in anchors:
+        for src_name, src_json in sources.items():
+            if not src_json:
+                continue
             try:
-                href = anchor.get_attribute('href') or ''
-                pid  = _extract_product_id(href)
-                if not pid or pid in seen_ids:
-                    continue
-                title = ''
-                for title_sel in ['h3.lw_k4', '[role="heading"] h3', '[class*="lw_k4"]']:
-                    try:
-                        te = anchor.locator(title_sel).first
-                        if te.count() > 0:
-                            raw = te.inner_text().strip()
-                            if raw:
-                                title = _clean_title(raw)
-                                break
-                    except Exception:
-                        pass
-                if not title:
-                    title = _clean_title(anchor.get_attribute('aria-label') or '')
-
-                # Task 5: try to read rating from .lw_km span inside anchor
-                rating = ''
-                try:
-                    rating_el = anchor.locator('.lw_km, [class*="lw_km"]').first
-                    if rating_el.count() > 0:
-                        rating = rating_el.inner_text().strip()
-                except Exception:
-                    pass
-
-                seen_ids.add(pid)
-                products.append({
-                    'product_id':  pid,
-                    'product_url': _normalize_product_url(pid),
-                    'title':       title[:300],
-                    'rating':      rating,
-                })
+                data = json.loads(src_json)
             except Exception:
                 continue
+
+            item_list = (
+                _safe_get(data, 'data', 'root', 'fields', 'mods', 'itemList', 'content') or
+                _safe_get(data, 'data', 'data', 'root', 'fields', 'mods', 'itemList', 'content') or
+                _safe_get(data, 'result', 'mods', 'itemList', 'content') or
+                _safe_get(data, 'itemList', 'content') or
+                _safe_get(data, 'data', 'itemList', 'content') or
+                _find_item_list_recursive(data) or []
+            )
+            for item in item_list:
+                p = _parse_item(item)
+                if p:
+                    products.append(p)
+
+            if products:
+                print(f"[search_scraper] JSON ({src_name}): {len(products)} products")
+                break  # found items — no need to try next source
+
+    except Exception as e:
+        print(f"[search_scraper] JSON layer error: {e}")
+
+    # Only skip DOM layers if JSON gave a full page (≥ 10 products)
+    if len(products) >= 10:
+        return products
+
+    # ── Layer 2: DOM — div.lw_v cards + classic anchor selectors ─────────────
+    # Scroll first so lazy-loaded cards are rendered
+    try:
+        for _ in range(3):
+            page.mouse.wheel(0, 1200)
+            page.wait_for_timeout(400)
+        page.mouse.wheel(0, -9999)   # back to top so links are reachable
+        page.wait_for_timeout(600)
+    except Exception:
+        pass
+
+    try:
+        # Primary: product-card wrappers that contain an item link
+        card_selectors = [
+            # Polish / EU AliExpress search card
+            'div.lw_v',
+            # Classic selector
+            'a.search-card-item, a.lw_b.h7_ic.search-card-item, [class*="search-card-item"]',
+        ]
+
+        for card_sel in card_selectors:
+            cards = page.locator(card_sel).all()
+            if not cards:
+                continue
+
+            for card in cards:
+                try:
+                    # Find the product link inside / as the card itself
+                    href = ''
+                    pid  = ''
+
+                    # If card is an <a>, use it directly
+                    tag = card.evaluate('el => el.tagName').lower()
+                    if tag == 'a':
+                        href = card.get_attribute('href') or ''
+                        pid  = _extract_product_id(href)
+                    else:
+                        # Otherwise find the first item anchor inside
+                        for link_sel in [
+                            'a[href*="/item/"]',
+                            'a[href*="aliexpress.com/item/"]',
+                            'a',
+                        ]:
+                            link = card.locator(link_sel).first
+                            if link.count() > 0:
+                                href = link.get_attribute('href') or ''
+                                pid  = _extract_product_id(href)
+                                if pid:
+                                    break
+
+                    if not pid or pid in seen_ids:
+                        continue
+
+                    # Title
+                    title = ''
+                    for title_sel in [
+                        'h3.lw_k4', '[class*="lw_k4"]',
+                        '[role="heading"] h3', 'h3',
+                        '[class*="title"]',
+                    ]:
+                        try:
+                            te = card.locator(title_sel).first
+                            if te.count() > 0:
+                                raw = te.inner_text().strip()
+                                if raw:
+                                    title = _clean_title(raw)
+                                    break
+                        except Exception:
+                            pass
+                    if not title:
+                        title = _clean_title(card.get_attribute('aria-label') or '')
+
+                    # Rating (.lw_km)
+                    rating = ''
+                    try:
+                        rel = card.locator('.lw_km, [class*="lw_km"]').first
+                        if rel.count() > 0:
+                            rating = rel.inner_text().strip()
+                    except Exception:
+                        pass
+
+                    # Sold count (.lw_kk) — Task 6 (search level)
+                    sold_count = ''
+                    try:
+                        sel_el = card.locator('.lw_kk, [class*="lw_kk"]').first
+                        if sel_el.count() > 0:
+                            raw_sold = sel_el.inner_text().strip()
+                            # "81 sold" → keep as-is; also handle "373 sold"
+                            m_sold = re.search(r'(\d[\d,]*)\s*sold', raw_sold, re.IGNORECASE)
+                            sold_count = m_sold.group(1).replace(',', '') if m_sold else raw_sold
+                    except Exception:
+                        pass
+
+                    seen_ids.add(pid)
+                    products.append({
+                        'product_id':  pid,
+                        'product_url': _normalize_product_url(pid),
+                        'title':       title[:300],
+                        'rating':      rating,
+                        'sold_count':  sold_count,
+                    })
+                except Exception:
+                    continue
+
+            if len(products) >= 10:
+                break  # got enough from this selector set
+
         if products:
             print(f"[search_scraper] DOM: {len(products)} products")
             return products
     except Exception as e:
         print(f"[search_scraper] DOM error: {e}")
 
-    # Layer 3: HTML regex
+    # ── Layer 3: HTML regex fallback ─────────────────────────────────────────
     try:
         html = page.content()
         for pat in [
-            r'href=["\'](?:https?:)?//[^"\']*?aliexpress\.com/item/(\d{10,20})\.html',
-            r'href=[^"\']*?/item/(\d{10,20})\.html',
-            r'"productId"\s*:\s*"(\d{10,20})"',
-            r'"redirectedId"\s*:\s*"(\d{10,20})"',
+            r'href=["\'](?:https?:)?//[^"\']*?aliexpress\\.com/item/(\\d{10,20})\\.html',
+            r'href=[^"\']*?/item/(\\d{10,20})\\.html',
+            r'"productId"\\s*:\\s*"(\\d{10,20})"',
+            r'"redirectedId"\\s*:\\s*"(\\d{10,20})"',
         ]:
             for pid in re.findall(pat, html):
                 if pid not in seen_ids:
@@ -1159,6 +1289,7 @@ def _extract_products_from_page(page) -> List[Dict]:
                         'product_url': _normalize_product_url(pid),
                         'title':       '',
                         'rating':      '',
+                        'sold_count':  '',
                     })
         if products:
             print(f"[search_scraper] HTML regex: {len(products)} products")
@@ -1278,6 +1409,7 @@ def scrape_search_results(
                         'product_url': prod['product_url'],
                         'title':       prod.get('title', ''),
                         'rating':      prod.get('rating', ''),
+                        'sold_count':  prod.get('sold_count', ''),
                     })
                     new_count += 1
 
