@@ -60,6 +60,15 @@ PAGE_TIMEOUT      = 90_000
 SEARCH_TIMEOUT    = 30_000
 SCROLL_PAUSE      = 600
 
+# ── Task 3: Target countries for shipping extraction ──────────────────────────
+SHIPPING_TARGET_COUNTRIES = {
+    "PL": "Poland",
+    "DE": "Germany",
+    "CZ": "Czech Republic",
+    "AT": "Austria",
+    "BG": "Bulgaria",
+}
+
 SERVER_IS_EU = False
 REGIONS_SAFE = ["AE", "US", "AU", "CA", "PK", "SA", "TR"]
 REGIONS_EU   = ["DE", "FR", "NL", "IT", "ES"]
@@ -280,6 +289,25 @@ def parse_mtop_response(text: str) -> dict | None:
             extracted['rating']  = _s(fb.get('trialRating') or fb.get('averageStar'))
             extracted['reviews'] = _s(fb.get('trialNum') or fb.get('totalCount'))
 
+        # ── Task 6: Stock remaining ───────────────────────────────────────
+        stock_found = False
+        for sk in ['quantityModule', 'QUANTITY', 'stockModule', 'tradeModule', 'TRADE']:
+            sb = result.get(sk, {})
+            if isinstance(sb, dict):
+                stock_val = (
+                    sb.get('availStock') or sb.get('totalStock') or
+                    sb.get('stockCount') or sb.get('quantity') or
+                    sb.get('inventory') or sb.get('availableQuantity') or
+                    _safe(sb, 'skuStocks', 0, 'quantity')
+                )
+                if stock_val is not None:
+                    extracted['stock_remaining'] = _s(stock_val)
+                    stock_found = True
+                    print(f"[scraper] Stock from '{sk}': {stock_val}")
+                    break
+        if not stock_found:
+            extracted.setdefault('stock_remaining', '')
+
         dm = result.get('descriptionModule') or result.get('DESCRIPTION') or {}
         if isinstance(dm, dict):
             du = _s(dm.get('descriptionUrl'))
@@ -424,8 +452,252 @@ def _extract_compliance_info(page) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BANNER HELPERS
+# TASK 4 — DELIVERY DAYS CALCULATOR
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _delivery_days_from_text(delivery_text: str) -> dict:
+    """
+    Parse a delivery-time string like 'Pick up by Sunday, April 22 - 26'
+    and return the max delivery days from today plus a within-16-days flag.
+
+    Returns:
+        {
+          "raw":              "Pick up by Sunday, April 22 - 26",
+          "max_delivery_days": 4,
+          "within_16_days":   True,
+          "note":             "Delivery OK (4 days)"    # or "Delivery above 16 days (X days)"
+        }
+    """
+    import datetime
+    result = {
+        "raw": delivery_text,
+        "max_delivery_days": None,
+        "within_16_days": None,
+        "note": "",
+    }
+    if not delivery_text:
+        return result
+
+    today = datetime.date.today()
+    text  = delivery_text.strip()
+
+    # Pattern: "April 22 - 26"  or  "Apr 22-26"  or  "April 22"
+    month_names = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        "january": 1, "february": 2, "march": 3, "april": 4, "june": 6,
+        "july": 7, "august": 8, "september": 9, "october": 10,
+        "november": 11, "december": 12,
+    }
+
+    # Try "Month DD - DD"
+    m = re.search(
+        r'([A-Za-z]+)\s+(\d{1,2})\s*[-–]\s*(\d{1,2})',
+        text
+    )
+    if m:
+        month_str = m.group(1).lower()
+        day_start = int(m.group(2))
+        day_end   = int(m.group(3))
+        month_num = month_names.get(month_str)
+        if month_num:
+            year = today.year
+            try:
+                end_date = datetime.date(year, month_num, day_end)
+                if end_date < today:
+                    end_date = datetime.date(year + 1, month_num, day_end)
+                days = (end_date - today).days
+                result["max_delivery_days"] = days
+                result["within_16_days"]    = days <= 16
+                if days <= 16:
+                    result["note"] = f"Delivery OK ({days} days)"
+                else:
+                    result["note"] = f"Delivery above 16 days ({days} days)"
+                return result
+            except ValueError:
+                pass
+
+    # Try "Month DD" (single date)
+    m = re.search(r'([A-Za-z]+)\s+(\d{1,2})(?!\s*[-–]\s*\d)', text)
+    if m:
+        month_str = m.group(1).lower()
+        day       = int(m.group(2))
+        month_num = month_names.get(month_str)
+        if month_num:
+            year = today.year
+            try:
+                end_date = datetime.date(year, month_num, day)
+                if end_date < today:
+                    end_date = datetime.date(year + 1, month_num, day)
+                days = (end_date - today).days
+                result["max_delivery_days"] = days
+                result["within_16_days"]    = days <= 16
+                if days <= 16:
+                    result["note"] = f"Delivery OK ({days} days)"
+                else:
+                    result["note"] = f"Delivery above 16 days ({days} days)"
+                return result
+            except ValueError:
+                pass
+
+    # Fallback: look for "X days" or "X-Y days"
+    m = re.search(r'(\d+)\s*[-–]?\s*(\d*)\s*days?', text, re.IGNORECASE)
+    if m:
+        days = int(m.group(2) or m.group(1))
+        result["max_delivery_days"] = days
+        result["within_16_days"]    = days <= 16
+        if days <= 16:
+            result["note"] = f"Delivery OK ({days} days)"
+        else:
+            result["note"] = f"Delivery above 16 days ({days} days)"
+        return result
+
+    result["note"] = "Could not parse delivery date"
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TASK 3 — SHIPPING EXTRACTION FOR TARGET COUNTRIES (PL, DE, CZ, AT, BG)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_shipping_by_countries(page, countries: dict = None) -> dict:
+    """
+    For each target country (PL, DE, CZ, AT, BG), click the Delivery Method
+    popup and extract cost + delivery time from .dynamic-shipping-table.
+
+    Task 4 note: If delivery > 16 days, note field says "Delivery above 16 days".
+
+    Args:
+        page:      Playwright page (already loaded on product detail URL)
+        countries: dict of {country_code: country_name} to check.
+                   Defaults to SHIPPING_TARGET_COUNTRIES.
+
+    Returns:
+        {
+          "PL": {"cost": "Free delivery", "delivery_time": "...", "within_16_days": True,  "note": "...", "raw": "..."},
+          "DE": {...},
+          ...
+        }
+    """
+    if countries is None:
+        countries = SHIPPING_TARGET_COUNTRIES
+
+    shipping_results = {}
+
+    for country_code, country_name in countries.items():
+        try:
+            print(f"[scraper] Extracting shipping for {country_code} ({country_name})")
+
+            # ── Step 1: Navigate to product URL with ship-to country ──────
+            current_url = page.url
+            # Inject / replace shipToCountry param
+            if re.search(r'[?&]shipToCountry=[A-Z]+', current_url):
+                nav_url = re.sub(r'(shipToCountry=)[A-Z]+', rf'\g<1>{country_code}', current_url)
+            else:
+                sep     = '&' if '?' in current_url else '?'
+                nav_url = f"{current_url}{sep}shipToCountry={country_code}"
+
+            page.goto(nav_url, timeout=PAGE_TIMEOUT, wait_until='domcontentloaded')
+            page.wait_for_timeout(3000)
+
+            # ── Step 2: Try to open the "Delivery method" popup ───────────
+            popup_opened = False
+            popup_selectors = [
+                'div[class*="delivery"] span:has-text("Delivery method")',
+                'span:has-text("Delivery method")',
+                'div:has-text("Service guarantee")',
+                '[data-spm-anchor-id*="i27"]',
+                '[data-spm-anchor-id*="i14"]',
+                '.comet-icon-tachometer ~ span',
+            ]
+            for sel in popup_selectors:
+                try:
+                    el = page.locator(sel).first
+                    if el.count() > 0 and el.is_visible(timeout=2000):
+                        el.click(timeout=3000)
+                        page.wait_for_timeout(1500)
+                        popup_opened = True
+                        break
+                except Exception:
+                    continue
+
+            # ── Step 3: Extract from .dynamic-shipping-table ─────────────
+            cost          = ""
+            delivery_time = ""
+
+            # Try from popup modal first
+            modal_sel = '.comet-v2-modal, .comet-modal, [class*="modal"]'
+            try:
+                modal = page.locator(modal_sel).first
+                if modal.count() > 0:
+                    table = modal.locator('table.dynamic-shipping-table').first
+                    if table.count() > 0:
+                        rows = table.locator('tr').all()
+                        for row in rows:
+                            th_text = row.locator('th').inner_text().strip().lower() if row.locator('th').count() > 0 else ''
+                            td_text = row.locator('td').inner_text().strip()         if row.locator('td').count() > 0 else ''
+                            if 'cost' in th_text or 'price' in th_text or 'free' in td_text.lower():
+                                cost = td_text
+                            elif 'delivery' in th_text or 'time' in th_text or 'pick' in td_text.lower():
+                                delivery_time = td_text
+            except Exception:
+                pass
+
+            # Fallback: scrape directly from page (no popup needed)
+            if not cost and not delivery_time:
+                try:
+                    tables = page.locator('table.dynamic-shipping-table').all()
+                    for table in tables[:3]:
+                        rows = table.locator('tr').all()
+                        for row in rows:
+                            th_text = row.locator('th').inner_text().strip().lower() if row.locator('th').count() > 0 else ''
+                            td_text = row.locator('td').inner_text().strip()         if row.locator('td').count() > 0 else ''
+                            if ('cost' in th_text or 'price' in th_text) and td_text:
+                                cost = td_text
+                            elif ('delivery' in th_text or 'time' in th_text) and td_text:
+                                delivery_time = td_text
+                    if cost or delivery_time:
+                        break
+                except Exception:
+                    pass
+
+            # Clean up text (strip HTML font tags)
+            cost          = re.sub(r'<[^>]+>', '', cost).strip()
+            delivery_time = re.sub(r'<[^>]+>', '', delivery_time).strip()
+
+            # ── Step 4: Task 4 — 16-day check ────────────────────────────
+            delivery_info = _delivery_days_from_text(delivery_time)
+
+            shipping_results[country_code] = {
+                "country":        country_name,
+                "cost":           cost          or "N/A",
+                "delivery_time":  delivery_time or "N/A",
+                "max_delivery_days": delivery_info["max_delivery_days"],
+                "within_16_days":    delivery_info["within_16_days"],
+                "note":              delivery_info["note"],
+            }
+
+            # Close popup if open
+            try:
+                page.locator('.comet-v2-modal-close, .comet-modal-close, [aria-label="Close"]').first.click(timeout=2000)
+                page.wait_for_timeout(500)
+            except Exception:
+                pass
+
+        except Exception as exc:
+            print(f"[scraper] Shipping extraction error for {country_code}: {exc}")
+            shipping_results[country_code] = {
+                "country":        country_name,
+                "cost":           "N/A",
+                "delivery_time":  "N/A",
+                "max_delivery_days": None,
+                "within_16_days":    None,
+                "note":              f"Error: {exc}",
+            }
+
+    return shipping_results
+
+
 
 def _dismiss_gdpr_banner(page) -> bool:
     selectors = [
@@ -550,6 +822,13 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
             if try_compliance:
                 compliance = _extract_compliance_info(page)
 
+            # ── Task 3 & 4: Extract shipping info for target EU countries ─
+            shipping_by_country = {}
+            try:
+                shipping_by_country = _extract_shipping_by_countries(page)
+            except Exception as _ship_exc:
+                print(f"[scraper] Shipping-by-country extraction failed: {_ship_exc}")
+
             html = page.content()
             page.close()
             context.close()
@@ -560,7 +839,8 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
         traceback.print_exc()
 
     return {'captured': captured, 'html': html,
-            'dom_seller': dom_seller, 'compliance': compliance}
+            'dom_seller': dom_seller, 'compliance': compliance,
+            'shipping_by_country': shipping_by_country}
 
 
 def _scrape_with_retry(url: str, try_compliance: bool = False) -> dict:
@@ -665,6 +945,10 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
     if data.get('compliance'):
         extracted['compliance'] = data['compliance']
 
+    # Task 3: attach shipping-by-country data collected during browser session
+    if data.get('shipping_by_country'):
+        extracted['shipping_by_country'] = data['shipping_by_country']
+
     desc_url = extracted.pop('_description_url', '')
     if desc_url and not extracted.get('description'):
         extracted['description'] = fetch_description(desc_url)
@@ -683,6 +967,10 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
         'seller_total_reviews': '', 'seller_positive_num': '', 'is_top_rated': '',
         'category_id': '', 'category_name': '', 'category_path': '',
         'compliance': {},
+        # Task 6: stock
+        'stock_remaining': '',
+        # Task 3: shipping per country (populated after DOM phase)
+        'shipping_by_country': {},
     }
     for key, default in defaults.items():
         extracted.setdefault(key, default)
@@ -780,11 +1068,23 @@ def _extract_products_from_page(page) -> List[Dict]:
                     title_raw = title_raw.get('displayTitle', '') or title_raw.get('title', '')
                 title = _clean_title(str(title_raw).strip())
 
+                # Task 5: extract rating from JSON
+                rating_raw = (
+                    _safe_get(item, 'starRating')          or
+                    _safe_get(item, 'averageStar')         or
+                    _safe_get(item, 'feedback', 'starRating') or
+                    _safe_get(item, 'trade', 'starRating') or
+                    _safe_get(item, 'ratings', 'averageScore') or
+                    ''
+                )
+                rating = _s(rating_raw)
+
                 seen_ids.add(pid)
                 products.append({
                     'product_id':  pid,
                     'product_url': _normalize_product_url(pid),
                     'title':       title,
+                    'rating':      rating,
                 })
 
             if products:
@@ -817,11 +1117,22 @@ def _extract_products_from_page(page) -> List[Dict]:
                         pass
                 if not title:
                     title = _clean_title(anchor.get_attribute('aria-label') or '')
+
+                # Task 5: try to read rating from .lw_km span inside anchor
+                rating = ''
+                try:
+                    rating_el = anchor.locator('.lw_km, [class*="lw_km"]').first
+                    if rating_el.count() > 0:
+                        rating = rating_el.inner_text().strip()
+                except Exception:
+                    pass
+
                 seen_ids.add(pid)
                 products.append({
                     'product_id':  pid,
                     'product_url': _normalize_product_url(pid),
                     'title':       title[:300],
+                    'rating':      rating,
                 })
             except Exception:
                 continue
@@ -847,6 +1158,7 @@ def _extract_products_from_page(page) -> List[Dict]:
                         'product_id':  pid,
                         'product_url': _normalize_product_url(pid),
                         'title':       '',
+                        'rating':      '',
                     })
         if products:
             print(f"[search_scraper] HTML regex: {len(products)} products")
@@ -965,6 +1277,7 @@ def scrape_search_results(
                         'product_id':  prod['product_id'],
                         'product_url': prod['product_url'],
                         'title':       prod.get('title', ''),
+                        'rating':      prod.get('rating', ''),
                     })
                     new_count += 1
 
