@@ -517,6 +517,7 @@ def scrape_search_products(request: SearchScrapeRequest):
                     "product_url": p["product_url"],
                     "title":       original_title,
                     "rating":      product_rating,
+                    "sold_count":  p.get("sold_count", ""),
                     "status":      "rejected",
                     "message":     "Title not fetched due to restricted keyword",
                 })
@@ -527,6 +528,7 @@ def scrape_search_products(request: SearchScrapeRequest):
                     "product_url": p["product_url"],
                     "title":       original_title,
                     "rating":      product_rating,
+                    "sold_count":  p.get("sold_count", ""),
                     "status":      "rejected",
                     "message":     f"Rating {rating_float:.1f} is below minimum 4.0",
                 })
@@ -537,6 +539,7 @@ def scrape_search_products(request: SearchScrapeRequest):
                     "product_url": p["product_url"],
                     "title":       original_title,
                     "rating":      product_rating,
+                    "sold_count":  p.get("sold_count", ""),
                     "status":      "accepted",
                 })
                 accepted_count += 1
