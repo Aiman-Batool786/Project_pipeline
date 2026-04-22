@@ -393,6 +393,10 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
             },
             "seller":     {f: scraped_data.get(f, "") for f in SELLER_FIELDS},
             "compliance": compliance_data,
+            # Task 3 & 4: shipping per country (extracted during browser session)
+            "shipping_by_country": scraped_data.get("shipping_by_country", {}),
+            # Task 6: stock remaining
+            "stock_remaining": scraped_data.get("stock_remaining", ""),
             "category": {
                 "id":         category.get("category_id", ""),
                 "name":       category.get("category_name", ""),
@@ -494,20 +498,45 @@ def scrape_search_products(request: SearchScrapeRequest):
             original_title = p.get("title", "")
             is_restricted  = filter_restricted_keywords(original_title)
 
+            # Task 5: Rating filter — reject products with rating < 4.0
+            # (products with no rating from search page are kept and evaluated later)
+            product_rating     = p.get("rating", "")
+            rating_float       = 0.0
+            rating_filter_fail = False
+            if product_rating:
+                try:
+                    rating_float = float(str(product_rating).strip())
+                    if rating_float < 4.0:
+                        rating_filter_fail = True
+                except (ValueError, TypeError):
+                    pass  # unparseable rating → don't reject yet
+
             if is_restricted:
                 result.append({
                     "product_id":  str(p["product_id"]),
                     "product_url": p["product_url"],
-                    "title":       original_title,  # ORIGINAL title always
+                    "title":       original_title,
+                    "rating":      product_rating,
                     "status":      "rejected",
                     "message":     "Title not fetched due to restricted keyword",
+                })
+                rejected_count += 1
+            elif rating_filter_fail:
+                result.append({
+                    "product_id":  str(p["product_id"]),
+                    "product_url": p["product_url"],
+                    "title":       original_title,
+                    "rating":      product_rating,
+                    "status":      "rejected",
+                    "message":     f"Rating {rating_float:.1f} is below minimum 4.0",
                 })
                 rejected_count += 1
             else:
                 result.append({
                     "product_id":  str(p["product_id"]),
                     "product_url": p["product_url"],
-                    "title":       original_title,  # ORIGINAL title always
+                    "title":       original_title,
+                    "rating":      product_rating,
                     "status":      "accepted",
                 })
                 accepted_count += 1
@@ -587,6 +616,10 @@ def generate_product(req: ProductURLRequest):
         "enhanced":       result.get("enhanced", {}),
         "seller":         result.get("seller", {}),
         "compliance":     result.get("compliance", {}),
+        # Task 3 & 4: shipping per country with 16-day check
+        "shipping_by_country": result.get("shipping_by_country", {}),
+        # Task 6: stock remaining
+        "stock_remaining": result.get("stock_remaining", ""),
         "template":       result.get("template", {}),
         "timestamp":      result.get("timestamp"),
     }
