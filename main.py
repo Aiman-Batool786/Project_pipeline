@@ -393,10 +393,13 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
             },
             "seller":     {f: scraped_data.get(f, "") for f in SELLER_FIELDS},
             "compliance": compliance_data,
-            # Task 3 & 4: shipping per country (extracted during browser session)
-            "shipping_by_country": scraped_data.get("shipping_by_country", {}),
-            # Task 6: stock remaining
-            "stock_remaining": scraped_data.get("stock_remaining", ""),
+            # Detail page extracted fields
+            "shipment_country": scraped_data.get("shipment_country"),
+            "delivery_start":   scraped_data.get("delivery_start"),
+            "delivery_end":     scraped_data.get("delivery_end"),
+            "delivery_days":    scraped_data.get("delivery_days"),
+            "remaining_stock":  scraped_data.get("remaining_stock"),
+            "rating":           scraped_data.get("rating", ""),
             "category": {
                 "id":         category.get("category_id", ""),
                 "name":       category.get("category_name", ""),
@@ -616,13 +619,15 @@ def generate_product(req: ProductURLRequest):
         "enhanced_title": result.get("enhanced_title", ""),
         "category":       result.get("category", {}).get("name", ""),
         "confidence":     result.get("category", {}).get("confidence", 0.0),
+        "rating":         result.get("rating", ""),
+        "shipment_country": result.get("shipment_country"),
+        "delivery_start":   result.get("delivery_start"),
+        "delivery_end":     result.get("delivery_end"),
+        "delivery_days":    result.get("delivery_days"),
+        "remaining_stock":  result.get("remaining_stock"),
         "enhanced":       result.get("enhanced", {}),
         "seller":         result.get("seller", {}),
         "compliance":     result.get("compliance", {}),
-        # Task 3 & 4: shipping per country with 16-day check
-        "shipping_by_country": result.get("shipping_by_country", {}),
-        # Task 6: stock remaining
-        "stock_remaining": result.get("stock_remaining", ""),
         "template":       result.get("template", {}),
         "timestamp":      result.get("timestamp"),
     }
