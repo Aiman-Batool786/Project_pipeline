@@ -14,8 +14,7 @@ Two independent filters:
   2. CATEGORY CONFIDENCE FILTER — threshold on the confidence score.
      Rules:
        < 0.50  → Strong reject  → set category = "Uncategorized"
-       0.50–0.75 → Borderline   → reject, set category = "Uncategorized"
-       ≥ 0.75  → Accept
+       ≥ 0.50  → Accept  (threshold lowered from 0.75 to 0.50)
 
      Additionally, embedding-based check against restricted categories DB:
        > 0.85  → BLOCK
@@ -50,7 +49,8 @@ DB_PATH     = os.getenv("DB_PATH", "products.db")
 EMBED_MODEL = "text-embedding-3-small"
 
 # Category confidence acceptance threshold
-CONFIDENCE_ACCEPT_THRESHOLD = float(os.getenv("CONFIDENCE_ACCEPT_THRESHOLD", "0.75"))
+# Changed from 0.75 → 0.50: products with confidence ≥ 0.50 now keep their real category
+CONFIDENCE_ACCEPT_THRESHOLD = float(os.getenv("CONFIDENCE_ACCEPT_THRESHOLD", "0.50"))
 
 # Restricted-category embedding thresholds
 BLOCK_THRESHOLD  = float(os.getenv("CATEGORY_BLOCK_THRESHOLD",  "0.85"))
@@ -216,16 +216,13 @@ def validate_category_confidence(confidence: float) -> Tuple[bool, str]:
 
     Rules:
       < 0.50  → Strong reject  → category = "Uncategorized"
-      0.50–0.75 → Borderline   → category = "Uncategorized"
-      ≥ 0.75  → Accept
+      ≥ 0.50  → Accept  (threshold lowered from 0.75 → 0.50)
 
     Returns:
         (accepted: bool, reason: str)
     """
     if confidence < 0.50:
-        return False, f"Confidence {confidence:.2f} < 0.50 (strong reject)"
-    elif confidence < CONFIDENCE_ACCEPT_THRESHOLD:
-        return False, f"Confidence {confidence:.2f} in borderline range [0.50, 0.75) — rejected"
+        return False, f"Confidence {confidence:.2f} < 0.50 (strong reject → Uncategorized)"
     else:
         return True, f"Confidence {confidence:.2f} accepted (≥ {CONFIDENCE_ACCEPT_THRESHOLD})"
 
