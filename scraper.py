@@ -996,12 +996,13 @@ def fetch_description(url: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
-    captured   = []
-    html       = ''
-    dom_seller = {}
-    compliance = {}
-    ua         = random.choice(USER_AGENTS)
-    is_eu      = _is_eu_url(url)
+    captured     = []
+    html         = ''
+    dom_seller   = {}
+    compliance   = {}
+    detail_fields = {}          # ← must be initialised here so return never fails
+    ua           = random.choice(USER_AGENTS)
+    is_eu        = _is_eu_url(url)
 
     try:
         with Camoufox(headless=True, os='windows') as browser:
@@ -1103,10 +1104,16 @@ def _scrape_with_retry(url: str, try_compliance: bool = False) -> dict:
             parsed = parse_mtop_response(text)
             if parsed and parsed.get('title'):
                 result['best_parsed'] = parsed
+                # Carry detail_fields even on early return
+                if not result.get('detail_fields') and best.get('detail_fields'):
+                    result['detail_fields'] = best['detail_fields']
                 return result
 
         if len(result['captured']) >= len(best['captured']):
             best = result
+        # Always keep the best detail_fields we've seen across attempts
+        if result.get('detail_fields') and not best.get('detail_fields'):
+            best['detail_fields'] = result['detail_fields']
 
     return best
 
