@@ -869,7 +869,11 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
             page.on('response', handle_response)
             page.goto(url, timeout=90_000, wait_until='domcontentloaded')
 
-            detected_eu = _detect_eu_page(page.url, page.content()[:5000]) or is_eu
+            try:
+                _page_snippet = page.content()[:5000]
+            except Exception:
+                _page_snippet = ''
+            detected_eu = _detect_eu_page(page.url, _page_snippet) or is_eu
             if detected_eu:
                 page.wait_for_timeout(2000)
                 _dismiss_gdpr_banner(page)
@@ -880,6 +884,14 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
                 page.mouse.wheel(0, random.randint(400, 800))
                 page.wait_for_timeout(random.randint(500, 900))
             page.wait_for_timeout(2000)
+
+            # If API still not captured, scroll back to top — AliExpress re-fires
+            # the mtop PDP query when the page regains focus at the top
+            if not captured:
+                page.mouse.wheel(0, -9999)
+                page.wait_for_timeout(3000)
+                page.mouse.wheel(0, 600)
+                page.wait_for_timeout(2000)
 
             # Simple seller extraction from href
             try:
