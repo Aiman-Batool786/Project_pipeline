@@ -732,6 +732,82 @@ def generate_products(req: BulkProductRequest):
 
 
 # =============================================================================
+# PRODUCT INFO BY ID ENDPOINT
+# =============================================================================
+
+@app.get("/product-info/{product_id}", tags=["Product Processing"])
+def get_product_info_by_id(product_id: str, extract_compliance: bool = False):
+    """
+    Full pipeline for a single product by AliExpress product ID.
+
+    Always uses EUR currency URL:
+      https://www.aliexpress.com/item/{id}.html?language=en&currency=EUR&gatewayAdapt=pol2glo
+
+    Returns same shape as POST /generate-product (accepted response).
+    """
+    if not product_id or not product_id.isdigit():
+        raise HTTPException(status_code=400, detail="product_id must be numeric")
+
+    eur_url = (
+        f"https://www.aliexpress.com/item/{product_id}.html"
+        f"?language=en&currency=EUR&gatewayAdapt=pol2glo"
+    )
+
+    result = process_product_complete(eur_url, extract_compliance=extract_compliance)
+
+    if not result.get("success"):
+        return result
+
+    original_title = result.get("original_title", "")
+
+    # Keyword filter
+    if filter_restricted_keywords(original_title):
+        return {
+            "status":         "rejected",
+            "reason":         "Title has restricted keyword",
+            "product_id":     result.get("product_id"),
+            "original_title": original_title,
+            "url":            eur_url,
+            "timestamp":      datetime.now().isoformat(),
+        }
+
+    # Category embedding filter
+    from product_filter import is_category_restricted
+    cat_blocked, cat_reason = is_category_restricted(result.get("category"))
+    if cat_blocked:
+        return {
+            "status":         "rejected",
+            "reason":         cat_reason,
+            "product_id":     result.get("product_id"),
+            "original_title": original_title,
+            "url":            eur_url,
+            "timestamp":      datetime.now().isoformat(),
+        }
+
+    return {
+        "status":           "accepted",
+        "product_id":       result.get("product_id"),
+        "aliexpress_id":    product_id,
+        "url":              eur_url,
+        "original_title":   original_title,
+        "enhanced_title":   result.get("enhanced_title", ""),
+        "category":         result.get("category", {}).get("name", ""),
+        "confidence":       result.get("category", {}).get("confidence", 0.0),
+        "rating":           result.get("rating", ""),
+        "shipment_country": result.get("shipment_country"),
+        "delivery_start":   result.get("delivery_start"),
+        "delivery_end":     result.get("delivery_end"),
+        "delivery_days":    result.get("delivery_days"),
+        "remaining_stock":  result.get("remaining_stock"),
+        "enhanced":         result.get("enhanced", {}),
+        "seller":           result.get("seller", {}),
+        "compliance":       result.get("compliance", {}),
+        "template":         result.get("template", {}),
+        "timestamp":        result.get("timestamp"),
+    }
+
+
+# =============================================================================
 # RELOAD FILTERS
 # =============================================================================
 
