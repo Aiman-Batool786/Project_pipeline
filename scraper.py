@@ -560,218 +560,6 @@ def _delivery_days_from_text(delivery_text: str) -> dict:
 # TASK 3 — SHIPPING EXTRACTION FOR TARGET COUNTRIES (PL, DE, CZ, AT, BG)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_detail_page_fields(page, url: str) -> dict:
-    """
-    Extract 4 specific fields directly from the already-loaded product detail page.
-
-    Fields extracted (using exact selectors from the provided HTML):
-      1. shipment_country  — "Ships from Germany" in div.dynamic-shipping-line
-                             fallback: infer from AliExpress subdomain (pl.→Poland etc.)
-      2. delivery_start    — "Apr 30" from "Delivery: Apr 30 - May 09"
-         delivery_end      — "May 09"
-         delivery_days     — 9  (end − start in days)
-      3. detail_rating     — 5.0 from [data-spm-anchor-id*="detail.0.i22"]
-      4. remaining_stock   — 161 from div.quantity--info--jnoo_pD "161 available"
-
-    Returns dict with all 4 fields (None when not found).
-    """
-    import datetime
-
-    result = {
-        'shipment_country': None,
-        'delivery_start':   None,
-        'delivery_end':     None,
-        'delivery_days':    None,
-        'detail_rating':    None,
-        'remaining_stock':  None,
-    }
-
-    # ── 1. Shipment country ───────────────────────────────────────────────────
-    # Selector: div.dynamic-shipping-line (all shipping line divs on the page)
-    # Looks for "Ships from Germany" / "Free shipping · Ships from Germany"
-    try:
-        lines = page.locator('div.dynamic-shipping-line').all()
-        for line in lines[:10]:
-            try:
-                text = re.sub(r'\s+', ' ', line.inner_text()).strip()
-                m = re.search(r'ships?\s+from\s+([A-Za-z][A-Za-z ]{1,30})', text, re.IGNORECASE)
-                if m:
-                    result['shipment_country'] = m.group(1).strip().rstrip('.')
-                    print(f"[scraper] shipment_country from DOM: {result['shipment_country']}")
-                    break
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"[scraper] shipment_country DOM error: {e}")
-
-    # Fallback: infer from AliExpress subdomain
-    if not result['shipment_country']:
-        domain_country_map = {
-            'pl.aliexpress.com': 'Poland',
-            'de.aliexpress.com': 'Germany',
-            'fr.aliexpress.com': 'France',
-            'it.aliexpress.com': 'Italy',
-            'es.aliexpress.com': 'Spain',
-            'nl.aliexpress.com': 'Netherlands',
-            'cz.aliexpress.com': 'Czech Republic',
-            'at.aliexpress.com': 'Austria',
-            'bg.aliexpress.com': 'Bulgaria',
-        }
-        current_url = page.url.lower()
-        for domain, country in domain_country_map.items():
-            if domain in current_url:
-                result['shipment_country'] = country
-                print(f"[scraper] shipment_country from domain: {country}")
-                break
-
-    # ── 2. Delivery dates ─────────────────────────────────────────────────────
-    # Selector: div.dynamic-shipping-line.dynamic-shipping-contentLayout
-    # Text: "Delivery: Apr 30 - May 09"
-    MONTH_MAP = {
-        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
-        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
-    }
-
-    def _parse_month_day(s: str, fallback_month: str = '') -> Optional[datetime.date]:
-        s = s.strip()
-        parts = s.split()
-        if len(parts) == 2:
-            mon_str = parts[0].lower()[:3]
-            mon_num = MONTH_MAP.get(mon_str)
-            try:
-                day = int(parts[1])
-            except ValueError:
-                return None
-        elif len(parts) == 1 and fallback_month:
-            mon_num = MONTH_MAP.get(fallback_month.lower()[:3])
-            try:
-                day = int(parts[0])
-            except ValueError:
-                return None
-        else:
-            return None
-        if not mon_num:
-            return None
-        today = datetime.date.today()
-        yr = today.year
-        try:
-            d = datetime.date(yr, mon_num, day)
-            if d < today:
-                d = datetime.date(yr + 1, mon_num, day)
-            return d
-        except ValueError:
-            return None
-
-    try:
-        content_lines = page.locator(
-            'div.dynamic-shipping-line.dynamic-shipping-contentLayout'
-        ).all()
-        for line in content_lines[:5]:
-            try:
-                text = re.sub(r'\s+', ' ', line.inner_text()).strip()
-                # Match: "Delivery: Apr 30 - May 09" or "Delivery Apr 30 - May 09"
-                # Also handles "Delivery: Apr 30 - 09" (no month on end)
-                m = re.search(
-                    r'Delivery[:\s]+([A-Za-z]+\s+\d{1,2})\s*[-–]\s*([A-Za-z]*\s*\d{1,2})',
-                    text, re.IGNORECASE
-                )
-                if m:
-                    start_str = m.group(1).strip()
-                    end_raw   = m.group(2).strip()
-                    # If end has no month, borrow from start
-                    start_month_m = re.match(r'^([A-Za-z]+)', start_str)
-                    start_month   = start_month_m.group(1) if start_month_m else ''
-                    if re.match(r'^\d{1,2}$', end_raw) and start_month:
-                        end_str = f"{start_month} {end_raw}"
-                    else:
-                        end_str = end_raw
-
-                    result['delivery_start'] = start_str
-                    result['delivery_end']   = end_str
-
-                    d_start = _parse_month_day(start_str)
-                    d_end   = _parse_month_day(end_str, start_month)
-                    if d_start and d_end:
-                        result['delivery_days'] = abs((d_end - d_start).days)
-
-                    print(f"[scraper] delivery: {start_str} → {end_str} = {result['delivery_days']} days")
-                    break
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"[scraper] delivery date extraction error: {e}")
-
-    # ── 3. Rating ─────────────────────────────────────────────────────────────
-    # Exact selector from HTML: data-spm-anchor-id="a2g0o.detail.0.i22.*"
-    # Pattern: [data-spm-anchor-id*="detail.0.i22"]
-    try:
-        rating_el = page.locator('[data-spm-anchor-id*="detail.0.i22"]').first
-        if rating_el.count() > 0:
-            raw = rating_el.inner_text().strip()
-            raw = re.sub(r'[^\d.]', '', raw)
-            if raw:
-                result['detail_rating'] = float(raw)
-                print(f"[scraper] detail_rating (i22): {result['detail_rating']}")
-    except Exception:
-        pass
-
-    # Fallbacks for rating if i22 selector fails
-    if result['detail_rating'] is None:
-        fallback_rating_sels = [
-            '.pdp-review-summary .score',
-            '[class*="review"] [class*="score"]',
-            '[class*="rating--average"]',
-            '[class*="overview-rating-average"]',
-            '.product-review-average',
-        ]
-        for sel in fallback_rating_sels:
-            try:
-                el = page.locator(sel).first
-                if el.count() > 0:
-                    raw = re.sub(r'[^\d.]', '', el.inner_text().strip())
-                    if raw and re.match(r'^\d+(\.\d+)?$', raw):
-                        result['detail_rating'] = float(raw)
-                        print(f"[scraper] detail_rating (fallback {sel}): {result['detail_rating']}")
-                        break
-            except Exception:
-                continue
-
-    # ── 4. Remaining stock ────────────────────────────────────────────────────
-    # Exact selector from HTML: div.quantity--info--jnoo_pD → "161 available"
-    try:
-        stock_el = page.locator('div.quantity--info--jnoo_pD').first
-        if stock_el.count() > 0:
-            raw = re.sub(r'\s+', ' ', stock_el.inner_text()).strip()
-            m = re.search(r'(\d[\d,]*)\s+available', raw, re.IGNORECASE)
-            if m:
-                result['remaining_stock'] = int(m.group(1).replace(',', ''))
-                print(f"[scraper] remaining_stock (exact): {result['remaining_stock']}")
-    except Exception:
-        pass
-
-    # Fallbacks for stock
-    if result['remaining_stock'] is None:
-        fallback_stock_sels = [
-            '[class*="quantity--info"]',
-            '[class*="quantityInfo"]',
-            '[class*="stock--info"]',
-            '[class*="product-quantity"]',
-        ]
-        for sel in fallback_stock_sels:
-            try:
-                el = page.locator(sel).first
-                if el.count() > 0:
-                    raw = el.inner_text().strip()
-                    m = re.search(r'(\d[\d,]*)\s+available', raw, re.IGNORECASE)
-                    if m:
-                        result['remaining_stock'] = int(m.group(1).replace(',', ''))
-                        print(f"[scraper] remaining_stock (fallback): {result['remaining_stock']}")
-                        break
-            except Exception:
-                continue
-
-    return result
-
 def _dismiss_gdpr_banner(page) -> bool:
     selectors = [
         'button:has-text("Accept All")', 'button:has-text("Accept all cookies")',
@@ -833,13 +621,12 @@ def fetch_description(url: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
-    captured     = []
-    html         = ''
-    dom_seller   = {}
-    compliance   = {}
-    detail_fields = {}          # ← must be initialised here so return never fails
-    ua           = random.choice(USER_AGENTS)
-    is_eu        = _is_eu_url(url)
+    captured   = []
+    html       = ''
+    dom_seller = {}
+    compliance = {}
+    ua         = random.choice(USER_AGENTS)
+    is_eu      = _is_eu_url(url)
 
     try:
         with Camoufox(headless=True, os='windows') as browser:
@@ -869,11 +656,7 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
             page.on('response', handle_response)
             page.goto(url, timeout=90_000, wait_until='domcontentloaded')
 
-            try:
-                _page_snippet = page.content()[:5000]
-            except Exception:
-                _page_snippet = ''
-            detected_eu = _detect_eu_page(page.url, _page_snippet) or is_eu
+            detected_eu = _detect_eu_page(page.url, page.content()[:5000]) or is_eu
             if detected_eu:
                 page.wait_for_timeout(2000)
                 _dismiss_gdpr_banner(page)
@@ -884,14 +667,6 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
                 page.mouse.wheel(0, random.randint(400, 800))
                 page.wait_for_timeout(random.randint(500, 900))
             page.wait_for_timeout(2000)
-
-            # If API still not captured, scroll back to top — AliExpress re-fires
-            # the mtop PDP query when the page regains focus at the top
-            if not captured:
-                page.mouse.wheel(0, -9999)
-                page.wait_for_timeout(3000)
-                page.mouse.wheel(0, 600)
-                page.wait_for_timeout(2000)
 
             # Simple seller extraction from href
             try:
@@ -908,13 +683,6 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
             if try_compliance:
                 compliance = _extract_compliance_info(page)
 
-            # Extract 4 required detail fields directly from the DOM
-            detail_fields = {}
-            try:
-                detail_fields = _extract_detail_page_fields(page, url)
-            except Exception as _df_exc:
-                print(f"[scraper] detail_fields extraction failed: {_df_exc}")
-
             html = page.content()
             page.close()
             context.close()
@@ -925,12 +693,12 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
         traceback.print_exc()
 
     return {'captured': captured, 'html': html,
-            'dom_seller': dom_seller, 'compliance': compliance,
-            'detail_fields': detail_fields}
+            'dom_seller': dom_seller, 'compliance': compliance}
+
 
 
 def _scrape_with_retry(url: str, try_compliance: bool = False) -> dict:
-    best = {'captured': [], 'html': '', 'dom_seller': {}, 'compliance': {}, 'detail_fields': {}}
+    best = {'captured': [], 'html': '', 'dom_seller': {}, 'compliance': {}}
 
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n[scraper] Attempt {attempt}/{MAX_RETRIES}")
@@ -953,16 +721,10 @@ def _scrape_with_retry(url: str, try_compliance: bool = False) -> dict:
             parsed = parse_mtop_response(text)
             if parsed and parsed.get('title'):
                 result['best_parsed'] = parsed
-                # Carry detail_fields even on early return
-                if not result.get('detail_fields') and best.get('detail_fields'):
-                    result['detail_fields'] = best['detail_fields']
                 return result
 
         if len(result['captured']) >= len(best['captured']):
             best = result
-        # Always keep the best detail_fields we've seen across attempts
-        if result.get('detail_fields') and not best.get('detail_fields'):
-            best['detail_fields'] = result['detail_fields']
 
     return best
 
@@ -988,6 +750,189 @@ def resolve_category(extracted: dict) -> dict:
 
 
 resolve_category_from_init_data = resolve_category
+
+
+def _extract_detail_fields_from_html(html: str, page_url: str = '') -> dict:
+    """
+    Extract the 4 required fields from raw HTML string using regex.
+    Runs AFTER the browser closes — zero timing/race issues.
+
+    Fields:
+      shipment_country  — from "Ships from Germany" in dynamic-shipping-line divs
+      delivery_start    — "Apr 30" from "Delivery: Apr 30 - May 09"
+      delivery_end      — "May 09"
+      delivery_days     — abs(end - start) in calendar days
+      detail_rating     — 5.0 from data-spm-anchor-id*="detail.0.i22"
+      remaining_stock   — 161 from "161 available" in quantity--info block
+    """
+    import datetime
+
+    result = {
+        'shipment_country': None,
+        'delivery_start':   None,
+        'delivery_end':     None,
+        'delivery_days':    None,
+        'detail_rating':    None,
+        'remaining_stock':  None,
+    }
+
+    if not html:
+        return result
+
+    # Strip all tags helper
+    def _strip_tags(s):
+        return re.sub(r'<[^>]+>', ' ', s)
+
+    def _clean(s):
+        return re.sub(r'\s+', ' ', _strip_tags(s)).strip()
+
+    # ── 1. Shipment country ───────────────────────────────────────────────────
+    # Find all div.dynamic-shipping-line blocks and look for "Ships from X"
+    shipping_blocks = re.findall(
+        r'<div[^>]+class="[^"]*dynamic-shipping-line[^"]*"[^>]*>(.*?)</div>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+    for block in shipping_blocks[:15]:
+        text = _clean(block)
+        m = re.search(r'[Ss]hips?\s+from\s+([A-Za-z][A-Za-z ]{1,30}?)(?:\s*[<·&]|$)', text)
+        if m:
+            result['shipment_country'] = m.group(1).strip()
+            print(f"[scraper] shipment_country from HTML: {result['shipment_country']}")
+            break
+
+    # Fallback: infer from page URL subdomain
+    if not result['shipment_country'] and page_url:
+        domain_map = {
+            'pl.aliexpress': 'Poland',   'de.aliexpress': 'Germany',
+            'fr.aliexpress': 'France',   'it.aliexpress': 'Italy',
+            'es.aliexpress': 'Spain',    'nl.aliexpress': 'Netherlands',
+            'cz.aliexpress': 'Czech Republic',
+            'at.aliexpress': 'Austria',  'bg.aliexpress': 'Bulgaria',
+        }
+        for domain, country in domain_map.items():
+            if domain in page_url:
+                result['shipment_country'] = country
+                print(f"[scraper] shipment_country from URL: {country}")
+                break
+
+    # ── 2. Delivery dates ─────────────────────────────────────────────────────
+    # Look for "Delivery: Apr 30 - May 09" in dynamic-shipping-contentLayout divs
+    # Also handles "Pick up by Apr 30 - May 09" and similar
+    MONTH_MAP = {
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+    }
+
+    # First try contentLayout divs (most specific)
+    content_blocks = re.findall(
+        r'<div[^>]+class="[^"]*dynamic-shipping-contentLayout[^"]*"[^>]*>(.*?)</div>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+    # Also try the full shipping section if contentLayout not found
+    if not content_blocks:
+        content_blocks = re.findall(
+            r'<div[^>]+class="[^"]*dynamic-shipping[^"]*"[^>]*>(.*?)</div>',
+            html, re.DOTALL | re.IGNORECASE
+        )
+
+    delivery_text = ''
+    for block in content_blocks[:10]:
+        text = _clean(block)
+        # Patterns: "Delivery: Apr 30 - May 09", "Pick up by Apr 30 - May 09"
+        m = re.search(
+            r'(?:Delivery[:\s]+|Pick.up\s+by\s+\w+,?\s*)'
+            r'([A-Za-z]+\s+\d{1,2})\s*[-–]\s*([A-Za-z]*\s*\d{1,2})',
+            text, re.IGNORECASE
+        )
+        if m:
+            delivery_text = text
+            start_str = m.group(1).strip()
+            end_raw   = m.group(2).strip()
+            # Borrow month from start if end has only a day number
+            start_month_m = re.match(r'^([A-Za-z]+)', start_str)
+            start_month   = start_month_m.group(1) if start_month_m else ''
+            if re.match(r'^\d{1,2}$', end_raw) and start_month:
+                end_str = f"{start_month} {end_raw}"
+            else:
+                end_str = end_raw.strip()
+
+            result['delivery_start'] = start_str
+            result['delivery_end']   = end_str
+
+            # Calculate days
+            def _to_date(s, fb_month=''):
+                parts = s.strip().split()
+                if len(parts) == 2:
+                    mon = MONTH_MAP.get(parts[0].lower()[:3])
+                    day = int(parts[1]) if parts[1].isdigit() else None
+                elif len(parts) == 1 and fb_month:
+                    mon = MONTH_MAP.get(fb_month.lower()[:3])
+                    day = int(parts[0]) if parts[0].isdigit() else None
+                else:
+                    return None
+                if not mon or not day:
+                    return None
+                today = datetime.date.today()
+                try:
+                    d = datetime.date(today.year, mon, day)
+                    return d if d >= today else datetime.date(today.year + 1, mon, day)
+                except ValueError:
+                    return None
+
+            d_start = _to_date(start_str)
+            d_end   = _to_date(end_str, start_month)
+            if d_start and d_end:
+                result['delivery_days'] = abs((d_end - d_start).days)
+            print(f"[scraper] delivery from HTML: {start_str} → {end_str} = {result['delivery_days']} days")
+            break
+
+    # ── 3. Rating ─────────────────────────────────────────────────────────────
+    # Selector: data-spm-anchor-id containing "detail.0.i22"
+    # HTML: <font ... data-spm-anchor-id="a2g0o.detail.0.i22.xxx">5.0</font>
+    m = re.search(
+        r'data-spm-anchor-id="[^"]*detail\.0\.i22[^"]*"[^>]*>([^<]{1,10})<',
+        html
+    )
+    if m:
+        raw = re.sub(r'[^\d.]', '', m.group(1).strip())
+        if raw and re.match(r'^\d+(\.\d+)?$', raw):
+            result['detail_rating'] = float(raw)
+            print(f"[scraper] detail_rating from HTML (i22): {result['detail_rating']}")
+
+    # Fallback: look for rating patterns in review/feedback area
+    if result['detail_rating'] is None:
+        # "averageStar":"4.8" or "trialRating":"4.8" in inline JSON
+        m2 = re.search(r'"(?:averageStar|trialRating|starRating)"\s*:\s*"?([\d.]+)"?', html)
+        if m2:
+            raw = m2.group(1)
+            try:
+                result['detail_rating'] = float(raw)
+                print(f"[scraper] detail_rating from JSON inline: {result['detail_rating']}")
+            except ValueError:
+                pass
+
+    # ── 4. Remaining stock ────────────────────────────────────────────────────
+    # Exact selector: div.quantity--info--jnoo_pD → "161 available"
+    # Also handles dynamic class suffix changes via partial match
+    stock_block = re.search(
+        r'<div[^>]+class="[^"]*quantity--info[^"]*"[^>]*>(.*?)</div>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+    if stock_block:
+        text = _clean(stock_block.group(1))
+        m = re.search(r'(\d[\d,]*)\s+available', text, re.IGNORECASE)
+        if m:
+            result['remaining_stock'] = int(m.group(1).replace(',', ''))
+            print(f"[scraper] remaining_stock from HTML: {result['remaining_stock']}")
+
+    # Fallback: search whole HTML for "availStock" in JSON
+    if result['remaining_stock'] is None:
+        m2 = re.search(r'"availStock"\s*:\s*(\d+)', html)
+        if m2:
+            result['remaining_stock'] = int(m2.group(1))
+            print(f"[scraper] remaining_stock from JSON inline: {result['remaining_stock']}")
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1037,14 +982,14 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
     if data.get('compliance'):
         extracted['compliance'] = data['compliance']
 
-    # Attach the 4 detail-page fields extracted from DOM
-    df = data.get('detail_fields') or {}
+    # Extract 4 detail fields from the captured HTML (no browser needed — pure regex)
+    df = _extract_detail_fields_from_html(data.get('html', ''), url)
     extracted['shipment_country'] = df.get('shipment_country')
     extracted['delivery_start']   = df.get('delivery_start')
     extracted['delivery_end']     = df.get('delivery_end')
     extracted['delivery_days']    = df.get('delivery_days')
     extracted['remaining_stock']  = df.get('remaining_stock')
-    # detail_rating overwrites the API rating if present
+    # detail_rating overwrites the API rating only if more specific
     if df.get('detail_rating') is not None:
         extracted['rating'] = str(df['detail_rating'])
 
