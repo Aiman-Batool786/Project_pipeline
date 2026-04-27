@@ -1,20 +1,23 @@
 """
-scraper.py v6.5
+scraper.py v6.8
 ────────────────
-Key changes vs v6.4:
-  - scrape_search_results: ALWAYS navigates all max_pages via URL — never
-    stops early due to missing pagination DOM. The _has_next_page / total_pages
-    checks were the root cause of the "33 products" early-stop bug.
-  - Each page now uses direct URL navigation (_build_page_url) so pages
-    1 → 5 are always visited even when pagination buttons are not rendered.
-  - Pagination DOM checks are kept as SOFT logging only, not hard stops.
-  - Deduplication guaranteed across all pages.
+Key changes vs v6.5:
+  - _extract_detail_fields_from_html: pure HTML-regex extraction of 4 fields
+    (shipment_country, delivery dates, rating, remaining_stock).
+    Runs AFTER the browser closes — zero timing/modal issues.
+  - delivery_start / delivery_end / delivery_days extracted from
+    dynamic-shipping-contentLayout divs in the saved HTML.
+  - rating extracted from data-spm-anchor-id*="detail.0.i22" element,
+    with fallback to JSON inline patterns.
+  - remaining_stock extracted from quantity--info div.
+  - All other v6.5 logic (search scraper, mtop parser, retry, etc.) unchanged.
 """
 
 import re
 import json
 import random
 import time
+import datetime
 import urllib.request
 import concurrent.futures
 from typing import List, Dict, Optional
@@ -54,11 +57,19 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
-MAX_RETRIES       = 3
-MAX_SEARCH_PAGES  = 50
-PAGE_TIMEOUT      = 90_000
-SEARCH_TIMEOUT    = 30_000
-SCROLL_PAUSE      = 600
+MAX_RETRIES      = 3
+MAX_SEARCH_PAGES = 50
+PAGE_TIMEOUT     = 90_000
+SEARCH_TIMEOUT   = 30_000
+SCROLL_PAUSE     = 600
+
+SHIPPING_TARGET_COUNTRIES = {
+    "PL": "Poland",
+    "DE": "Germany",
+    "CZ": "Czech Republic",
+    "AT": "Austria",
+    "BG": "Bulgaria",
+}
 
 SERVER_IS_EU = False
 REGIONS_SAFE = ["AE", "US", "AU", "CA", "PK", "SA", "TR"]
@@ -73,6 +84,14 @@ CATEGORY_ID_MAP = {
     '200000346': "Men's Clothing",
     '200003655': 'Tablets',
     '100006654': 'Smart Watches',
+}
+
+MONTH_MAP = {
+    'jan': 1,  'feb': 2,  'mar': 3,  'apr': 4,  'may': 5,  'jun': 6,
+    'jul': 7,  'aug': 8,  'sep': 9,  'oct': 10, 'nov': 11, 'dec': 12,
+    'january': 1, 'february': 2, 'march': 3, 'april': 4, 'june': 6,
+    'july': 7, 'august': 8, 'september': 9, 'october': 10,
+    'november': 11, 'december': 12,
 }
 
 
@@ -280,6 +299,25 @@ def parse_mtop_response(text: str) -> dict | None:
             extracted['rating']  = _s(fb.get('trialRating') or fb.get('averageStar'))
             extracted['reviews'] = _s(fb.get('trialNum') or fb.get('totalCount'))
 
+        # ── Stock from mtop API ───────────────────────────────────────────────
+        stock_found = False
+        for sk in ['quantityModule', 'QUANTITY', 'stockModule', 'tradeModule', 'TRADE']:
+            sb = result.get(sk, {})
+            if isinstance(sb, dict):
+                stock_val = (
+                    sb.get('availStock') or sb.get('totalStock') or
+                    sb.get('stockCount') or sb.get('quantity') or
+                    sb.get('inventory') or sb.get('availableQuantity') or
+                    _safe(sb, 'skuStocks', 0, 'quantity')
+                )
+                if stock_val is not None:
+                    extracted['stock_remaining'] = _s(stock_val)
+                    stock_found = True
+                    print(f"[scraper] Stock from '{sk}': {stock_val}")
+                    break
+        if not stock_found:
+            extracted.setdefault('stock_remaining', '')
+
         dm = result.get('descriptionModule') or result.get('DESCRIPTION') or {}
         if isinstance(dm, dict):
             du = _s(dm.get('descriptionUrl'))
@@ -325,7 +363,7 @@ def _extract_from_html_init_data(html: str) -> dict:
             assign = block.find('window._dida_config_._init_data_=')
             if assign != -1:
                 json_start = block.index('{', assign)
-                depth = 0
+                depth    = 0
                 json_end = json_start
                 for i, ch in enumerate(block[json_start:], json_start):
                     if ch == '{':
@@ -369,7 +407,7 @@ def _parse_compliance_text(text: str) -> dict:
 
     result['manufacturer_name']    = extract_field(['Name', 'Manufacturer Name'], text)
     result['manufacturer_address'] = extract_field(['Address', 'Adres'], text,
-                                                    stop_patterns=['Email', 'Telephone', 'Phone'])
+                                                   stop_patterns=['Email', 'Telephone', 'Phone'])
     result['manufacturer_email']   = extract_field(['Email address', 'Email'], text)
     result['manufacturer_phone']   = extract_field(['Telephone number', 'Phone', 'Tel'], text)
 
@@ -381,7 +419,7 @@ def _parse_compliance_text(text: str) -> dict:
         eu_text = text[eu_match.start():]
         result['eu_responsible_name']    = extract_field(['Name', 'Nazwa'], eu_text)
         result['eu_responsible_address'] = extract_field(['Address', 'Adres'], eu_text,
-                                                          stop_patterns=['Email', 'Telephone'])
+                                                         stop_patterns=['Email', 'Telephone'])
         result['eu_responsible_email']   = extract_field(['Email address', 'Email'], eu_text)
         result['eu_responsible_phone']   = extract_field(['Telephone number', 'Phone'], eu_text)
 
@@ -424,6 +462,79 @@ def _extract_compliance_info(page) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DELIVERY DAYS CALCULATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _delivery_days_from_text(delivery_text: str) -> dict:
+    """
+    Parse delivery string like 'Pick up by Sunday, April 22 - 26'.
+    Returns max_delivery_days (days from TODAY to end date) + within_16_days flag.
+    """
+    result = {
+        'raw':               delivery_text,
+        'max_delivery_days': None,
+        'within_16_days':    None,
+        'note':              '',
+    }
+    if not delivery_text:
+        return result
+
+    today = datetime.date.today()
+    text  = delivery_text.strip()
+
+    # "Month DD - DD"
+    m = re.search(r'([A-Za-z]+)\s+(\d{1,2})\s*[-–]\s*(\d{1,2})', text)
+    if m:
+        month_num = MONTH_MAP.get(m.group(1).lower()[:3])
+        day_end   = int(m.group(3))
+        if month_num:
+            try:
+                end_date = datetime.date(today.year, month_num, day_end)
+                if end_date < today:
+                    end_date = datetime.date(today.year + 1, month_num, day_end)
+                days = (end_date - today).days
+                result['max_delivery_days'] = days
+                result['within_16_days']    = days <= 16
+                result['note'] = (f"Delivery OK ({days} days)" if days <= 16
+                                  else f"Delivery above 16 days ({days} days)")
+                return result
+            except ValueError:
+                pass
+
+    # "Month DD" single date
+    m = re.search(r'([A-Za-z]+)\s+(\d{1,2})(?!\s*[-–]\s*\d)', text)
+    if m:
+        month_num = MONTH_MAP.get(m.group(1).lower()[:3])
+        day       = int(m.group(2))
+        if month_num:
+            try:
+                end_date = datetime.date(today.year, month_num, day)
+                if end_date < today:
+                    end_date = datetime.date(today.year + 1, month_num, day)
+                days = (end_date - today).days
+                result['max_delivery_days'] = days
+                result['within_16_days']    = days <= 16
+                result['note'] = (f"Delivery OK ({days} days)" if days <= 16
+                                  else f"Delivery above 16 days ({days} days)")
+                return result
+            except ValueError:
+                pass
+
+    # Fallback: "X days" or "X-Y days"
+    m = re.search(r'(\d+)\s*[-–]?\s*(\d*)\s*days?', text, re.IGNORECASE)
+    if m:
+        days = int(m.group(2) or m.group(1))
+        result['max_delivery_days'] = days
+        result['within_16_days']    = days <= 16
+        result['note'] = (f"Delivery OK ({days} days)" if days <= 16
+                          else f"Delivery above 16 days ({days} days)")
+        return result
+
+    result['note'] = 'Could not parse delivery date'
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BANNER HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -462,249 +573,6 @@ def _detect_eu_page(url: str, html_snippet: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DOMAIN → COUNTRY MAP (for shipment country inference)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_DOMAIN_COUNTRY_MAP = {
-    'pl.aliexpress.com':  'Poland',
-    'de.aliexpress.com':  'Germany',
-    'fr.aliexpress.com':  'France',
-    'it.aliexpress.com':  'Italy',
-    'es.aliexpress.com':  'Spain',
-    'nl.aliexpress.com':  'Netherlands',
-    'pt.aliexpress.com':  'Portugal',
-    'ru.aliexpress.com':  'Russia',
-    'tr.aliexpress.com':  'Turkey',
-    'ar.aliexpress.com':  'Spain',           # Spanish Latin America
-    'id.aliexpress.com':  'Indonesia',
-    'ja.aliexpress.com':  'Japan',
-    'ko.aliexpress.com':  'South Korea',
-    'th.aliexpress.com':  'Thailand',
-    'vi.aliexpress.com':  'Vietnam',
-    'www.aliexpress.com': 'China',           # default
-}
-
-_MONTH_MAP = {
-    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
-    'may': 5, 'jun': 6, 'jul': 7, 'aug': 8,
-    'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
-}
-
-
-def _infer_shipment_country_from_url(url: str) -> str:
-    """Return country name inferred from AliExpress subdomain."""
-    for domain, country in _DOMAIN_COUNTRY_MAP.items():
-        if domain in url:
-            return country
-    return ''
-
-
-def _parse_delivery_dates(delivery_text: str):
-    """
-    Parse delivery date range like 'Delivery: Apr 30 - May 09'.
-    Returns (start_str, end_str, days_count) or (None, None, None).
-    """
-    try:
-        # Match patterns like: Apr 30 - May 09  or  30 Apr - 9 May
-        pat1 = r'([A-Za-z]+)\s+(\d{1,2})\s*[-–]\s*([A-Za-z]+)\s+(\d{1,2})'
-        pat2 = r'(\d{1,2})\s+([A-Za-z]+)\s*[-–]\s*(\d{1,2})\s+([A-Za-z]+)'
-
-        m = re.search(pat1, delivery_text)
-        if m:
-            m1_str, d1, m2_str, d2 = m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
-            start_str = f"{m1_str} {d1:02d}"
-            end_str   = f"{m2_str} {d2:02d}"
-        else:
-            m = re.search(pat2, delivery_text)
-            if not m:
-                return None, None, None
-            d1, m1_str, d2, m2_str = int(m.group(1)), m.group(2), int(m.group(3)), m.group(4)
-            start_str = f"{m1_str} {d1:02d}"
-            end_str   = f"{m2_str} {d2:02d}"
-
-        mo1 = _MONTH_MAP.get(m1_str.lower()[:3])
-        mo2 = _MONTH_MAP.get(m2_str.lower()[:3])
-        if not mo1 or not mo2:
-            return start_str, end_str, None
-
-        import datetime
-        year = datetime.date.today().year
-        try:
-            s_date = datetime.date(year, mo1, d1)
-            e_date = datetime.date(year, mo2, d2)
-        except ValueError:
-            return start_str, end_str, None
-
-        if e_date < s_date:
-            e_date = datetime.date(year + 1, mo2, d2)
-
-        days = (e_date - s_date).days
-        return start_str, end_str, days
-
-    except Exception as ex:
-        print(f"[scraper] Delivery date parse error: {ex}")
-        return None, None, None
-
-
-def _extract_dom_extra_fields(page, html: str, page_url: str) -> dict:
-    """
-    Extract 4 extra fields from live product page DOM + raw HTML:
-      - shipment_country
-      - delivery_start, delivery_end, delivery_days
-      - rating  (DOM fallback — overrides mtop value if found)
-      - remaining_stock
-
-    All selectors are derived exactly from the HTML block provided.
-    Falls back gracefully to None if any field is missing.
-    """
-    extra = {
-        'shipment_country': None,
-        'delivery_start':   None,
-        'delivery_end':     None,
-        'delivery_days':    None,
-        'rating':           None,
-        'remaining_stock':  None,
-    }
-
-    # ── 1. SHIPMENT COUNTRY ──────────────────────────────────────────────────
-    # Try to find explicit "Ships from" text first
-    try:
-        for sel in [
-            '[class*="ship-from"]',
-            '[class*="shipFrom"]',
-            'span:has-text("Ships from")',
-            'div:has-text("Ships from")',
-        ]:
-            try:
-                el = page.locator(sel).first
-                if el.count() > 0:
-                    txt = el.inner_text().strip()
-                    # e.g. "Ships from: China" or just "China"
-                    m = re.search(r'Ships?\s*from[:\s]+([A-Za-z\s]+)', txt, re.IGNORECASE)
-                    if m:
-                        extra['shipment_country'] = m.group(1).strip()
-                        break
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # If still empty, infer from subdomain
-    if not extra['shipment_country']:
-        extra['shipment_country'] = _infer_shipment_country_from_url(page_url) or None
-
-    # Fallback: try from raw HTML
-    if not extra['shipment_country'] and html:
-        m = re.search(r'Ships?\s*from[:\s]+([A-Za-z\s]{2,30})', html, re.IGNORECASE)
-        if m:
-            extra['shipment_country'] = m.group(1).strip()
-
-    # ── 2. DELIVERY DATES ────────────────────────────────────────────────────
-    # Target: <font data-spm-anchor-id="a2g0o.detail.0.i11...">Delivery: Apr 30 - May 09</font>
-    delivery_text = ''
-    try:
-        for sel in [
-            '[data-spm-anchor-id*="i11"] font',
-            '[data-spm-anchor-id*="i11"]',
-            '.dynamic-shipping-contentLayout span',
-            '.dynamic-shipping-line.dynamic-shipping-contentLayout',
-        ]:
-            try:
-                el = page.locator(sel).first
-                if el.count() > 0:
-                    txt = el.inner_text().strip()
-                    if 'Delivery' in txt or re.search(r'[A-Za-z]{3}\s+\d{1,2}', txt):
-                        delivery_text = txt
-                        break
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # HTML fallback — look for Delivery: pattern anywhere on page
-    if not delivery_text and html:
-        m = re.search(r'Delivery[:\s]+([A-Za-z]{3}\s+\d{1,2}\s*[-–]\s*[A-Za-z]{3}\s+\d{1,2})',
-                      html, re.IGNORECASE)
-        if m:
-            delivery_text = 'Delivery: ' + m.group(1)
-
-    if delivery_text:
-        s, e, d = _parse_delivery_dates(delivery_text)
-        extra['delivery_start'] = s
-        extra['delivery_end']   = e
-        extra['delivery_days']  = d
-
-    # ── 3. RATING ────────────────────────────────────────────────────────────
-    # Target: <font data-spm-anchor-id="a2g0o.detail.0.i22...">5.0</font>
-    try:
-        for sel in [
-            '[data-spm-anchor-id*="i22"]',
-            '[class*="rating--"] span',
-            '[class*="score--"] span',
-            '.review--score--xrn_dk7',
-            '[class*="review"] [class*="score"]',
-            '.reviewer--reviews--ez90Dg span',
-        ]:
-            try:
-                el = page.locator(sel).first
-                if el.count() > 0:
-                    txt = el.inner_text().strip()
-                    m = re.match(r'^(\d+(?:\.\d+)?)$', txt)
-                    if m:
-                        extra['rating'] = float(m.group(1))
-                        break
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # HTML fallback
-    if extra['rating'] is None and html:
-        m = re.search(
-            r'data-spm-anchor-id=["\'][^"\']*i22[^"\']*["\'][^>]*>([0-9]+(?:\.[0-9]+)?)<',
-            html
-        )
-        if m:
-            try:
-                extra['rating'] = float(m.group(1))
-            except ValueError:
-                pass
-
-    # ── 4. REMAINING STOCK ───────────────────────────────────────────────────
-    # Target: <div class="quantity--info--jnoo_pD">...<font>161 available</font>
-    try:
-        for sel in [
-            '.quantity--info--jnoo_pD',
-            '[class*="quantity--info"]',
-            '[data-spm-anchor-id*="i12"]',
-            'div:has-text("available")',
-        ]:
-            try:
-                el = page.locator(sel).first
-                if el.count() > 0:
-                    txt = el.inner_text().strip()
-                    m = re.search(r'(\d[\d,]*)\s+available', txt, re.IGNORECASE)
-                    if m:
-                        extra['remaining_stock'] = int(m.group(1).replace(',', ''))
-                        break
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # HTML fallback
-    if extra['remaining_stock'] is None and html:
-        m = re.search(r'(\d[\d,]+)\s+available', html, re.IGNORECASE)
-        if m:
-            try:
-                extra['remaining_stock'] = int(m.group(1).replace(',', ''))
-            except ValueError:
-                pass
-
-    return extra
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # DESCRIPTION FETCHER
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -724,6 +592,249 @@ def fetch_description(url: str) -> str:
     except Exception as e:
         print(f"[scraper] Description fetch failed: {e}")
         return ''
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML-REGEX DETAIL FIELDS EXTRACTOR  (NEW v6.8 — no live DOM required)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_detail_fields_from_html(html: str, page_url: str = '') -> dict:
+    """
+    Extract 4 required fields from the saved HTML using pure regex.
+    Runs AFTER the browser closes — zero timing / modal-popup issues.
+
+    Fields returned:
+      shipment_country  — from "Ships from Germany" in dynamic-shipping-line divs
+                          or from the shipping modal table
+      delivery_start    — "Apr 30"  (from "Delivery: Apr 30 - May 09")
+      delivery_end      — "May 09"
+      delivery_days     — abs(end - start) in calendar days (window span)
+      detail_rating     — 5.0  from data-spm-anchor-id*="detail.0.i22" element
+                          OR from inline JSON (averageStar / trialRating)
+      remaining_stock   — 4946  from "4946 available" in quantity--info div
+    """
+    result = {
+        'shipment_country': None,
+        'delivery_start':   None,
+        'delivery_end':     None,
+        'delivery_days':    None,
+        'detail_rating':    None,
+        'remaining_stock':  None,
+    }
+
+    if not html:
+        return result
+
+    def _strip_tags(s: str) -> str:
+        return re.sub(r'<[^>]+>', ' ', s)
+
+    def _clean(s: str) -> str:
+        return re.sub(r'\s+', ' ', _strip_tags(s)).strip()
+
+    # ── 1. Shipment country ───────────────────────────────────────────────────
+    # Source A: shipping modal table — confirmed HTML:
+    #   <div class="dynamic-shipping-tableOthersLayout">
+    #     ... Shipping from Germany ...
+    #   </div>
+    # Source B: any dynamic-shipping-line div (inline, non-modal)
+    # Pattern matches: "Ships from Germany", "Shipping from Germany"
+
+    shipping_blocks = re.findall(
+        r'<div[^>]+class="[^"]*dynamic-shipping[^"]*"[^>]*>(.*?)</div>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+    for block in shipping_blocks[:20]:
+        text = _clean(block)
+        m = re.search(
+            r'[Ss]hipp?(?:ing)?\s+from\s+([A-Za-z][A-Za-z ]{1,30}?)(?:\s*[<·&\n]|$)',
+            text
+        )
+        if m:
+            result['shipment_country'] = m.group(1).strip()
+            print(f"[scraper] shipment_country (HTML div): {result['shipment_country']}")
+            break
+
+    # Fallback: infer from page URL subdomain
+    if not result['shipment_country'] and page_url:
+        domain_map = {
+            'pl.aliexpress': 'Poland',
+            'de.aliexpress': 'Germany',
+            'fr.aliexpress': 'France',
+            'it.aliexpress': 'Italy',
+            'es.aliexpress': 'Spain',
+            'nl.aliexpress': 'Netherlands',
+            'cz.aliexpress': 'Czech Republic',
+            'at.aliexpress': 'Austria',
+            'bg.aliexpress': 'Bulgaria',
+        }
+        for domain, country in domain_map.items():
+            if domain in page_url:
+                result['shipment_country'] = country
+                print(f"[scraper] shipment_country (URL subdomain): {country}")
+                break
+
+    # ── 2. Delivery dates ─────────────────────────────────────────────────────
+    # Primary source: shipping modal table
+    #   Confirmed HTML: <th>Delivery time</th><td>...<strong>Apr 26 - May 04</strong>...</td>
+    # Fallback source: div.dynamic-shipping-contentLayout
+    #   Confirmed HTML: "Delivery: Apr 30 - May 09"
+
+    delivery_text = ''
+
+    # Try modal table: find <tr> with "Delivery time" th, extract td content
+    modal_rows = re.findall(
+        r'<tr[^>]*>(.*?)</tr>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+    for row in modal_rows[:30]:
+        row_text = _clean(row)
+        if re.search(r'delivery\s+time', row_text, re.IGNORECASE):
+            # Find the <td> in this row
+            td_match = re.search(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+            if td_match:
+                delivery_text = _clean(td_match.group(1))
+                print(f"[scraper] delivery text (modal table): {delivery_text}")
+                break
+
+    # Fallback: dynamic-shipping-contentLayout divs
+    if not delivery_text:
+        content_blocks = re.findall(
+            r'<div[^>]+class="[^"]*dynamic-shipping-contentLayout[^"]*"[^>]*>(.*?)</div>',
+            html, re.DOTALL | re.IGNORECASE
+        )
+        # Also try any dynamic-shipping div if contentLayout not found
+        if not content_blocks:
+            content_blocks = re.findall(
+                r'<div[^>]+class="[^"]*dynamic-shipping[^"]*"[^>]*>(.*?)</div>',
+                html, re.DOTALL | re.IGNORECASE
+            )
+        for block in content_blocks[:10]:
+            text = _clean(block)
+            if re.search(r'delivery|pick\s*up', text, re.IGNORECASE):
+                delivery_text = text
+                print(f"[scraper] delivery text (inline div): {delivery_text}")
+                break
+
+    # Parse the delivery text we found
+    if delivery_text:
+        # Pattern: "Apr 26 - May 04"  or  "Delivery: Apr 30 - May 09"
+        # Also: "Pick up by Sunday, April 22 - 26"  (same-month range)
+        m = re.search(
+            r'([A-Za-z]+)\s+(\d{1,2})\s*[-–]\s*(?:([A-Za-z]+)\s+)?(\d{1,2})',
+            delivery_text
+        )
+        if m:
+            start_month_str = m.group(1)
+            start_day       = int(m.group(2))
+            end_month_str   = m.group(3) or m.group(1)   # borrow start month if absent
+            end_day         = int(m.group(4))
+
+            start_month_num = MONTH_MAP.get(start_month_str.lower()[:3])
+            end_month_num   = MONTH_MAP.get(end_month_str.lower()[:3])
+
+            if start_month_num and end_month_num:
+                today = datetime.date.today()
+                try:
+                    d_start = datetime.date(today.year, start_month_num, start_day)
+                    d_end   = datetime.date(today.year, end_month_num, end_day)
+                    # Roll over year boundary
+                    if d_end < d_start:
+                        d_end = datetime.date(today.year + 1, end_month_num, end_day)
+                    # Normalise: if start is in the past, advance both by 1 year
+                    if d_start < today:
+                        d_start = datetime.date(today.year + 1, start_month_num, start_day)
+                        d_end   = datetime.date(today.year + 1, end_month_num, end_day)
+
+                    result['delivery_start'] = d_start.strftime('%b %d').lstrip('0').replace(' 0', ' ')
+                    result['delivery_end']   = d_end.strftime('%b %d').lstrip('0').replace(' 0', ' ')
+                    result['delivery_days']  = abs((d_end - d_start).days)
+                    print(f"[scraper] delivery: {result['delivery_start']} → "
+                          f"{result['delivery_end']} = {result['delivery_days']} days")
+                except ValueError:
+                    pass
+
+    # ── 3. Rating ─────────────────────────────────────────────────────────────
+    # Confirmed HTML: <font dir="auto" ... data-spm-anchor-id="a2g0o.detail.0.i22.xxx">5.0</font>
+    # The i18 anchor (inside reviewer--box strong) also works.
+
+    # Primary: spm anchor i22 (confirmed selector from HTML)
+    m = re.search(
+        r'data-spm-anchor-id="[^"]*detail\.0\.i22[^"]*"[^>]*>([^<]{1,10})<',
+        html
+    )
+    if m:
+        raw = re.sub(r'[^\d.]', '', m.group(1).strip())
+        if raw and re.match(r'^\d+(\.\d+)?$', raw):
+            rv = float(raw)
+            if 0.0 < rv <= 5.0:
+                result['detail_rating'] = rv
+                print(f"[scraper] detail_rating (i22 spm): {result['detail_rating']}")
+
+    # Secondary: spm anchor i18
+    if result['detail_rating'] is None:
+        m = re.search(
+            r'data-spm-anchor-id="[^"]*detail\.0\.i18[^"]*"[^>]*>([^<]{1,10})<',
+            html
+        )
+        if m:
+            raw = re.sub(r'[^\d.]', '', m.group(1).strip())
+            if raw and re.match(r'^\d+(\.\d+)?$', raw):
+                rv = float(raw)
+                if 0.0 < rv <= 5.0:
+                    result['detail_rating'] = rv
+                    print(f"[scraper] detail_rating (i18 spm): {result['detail_rating']}")
+
+    # Fallback: inline JSON fields (averageStar / trialRating / starRating)
+    if result['detail_rating'] is None:
+        m2 = re.search(
+            r'"(?:averageStar|trialRating|starRating)"\s*:\s*"?([\d.]+)"?',
+            html
+        )
+        if m2:
+            try:
+                rv = float(m2.group(1))
+                if 0.0 < rv <= 5.0:
+                    result['detail_rating'] = rv
+                    print(f"[scraper] detail_rating (inline JSON): {result['detail_rating']}")
+            except ValueError:
+                pass
+
+    # ── 4. Remaining stock ────────────────────────────────────────────────────
+    # Confirmed HTML structure:
+    #   <div class="quantity--info--jnoo_pD">
+    #     <div data-spm-anchor-id="a2g0o.detail.0.i2.ac84...">
+    #       <span><font>4946 available</font></span>
+    #     </div>
+    #   </div>
+    # We match the outer div by partial class, then look inside for "N available"
+
+    # Primary: exact class match
+    stock_block = re.search(
+        r'<div[^>]+class="[^"]*quantity--info[^"]*"[^>]*>(.*?)</div\s*>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+    if stock_block:
+        text = _clean(stock_block.group(1))
+        m = re.search(r'(\d[\d,]*)\s+available', text, re.IGNORECASE)
+        if m:
+            result['remaining_stock'] = int(m.group(1).replace(',', ''))
+            print(f"[scraper] remaining_stock (quantity--info div): {result['remaining_stock']}")
+
+    # Fallback A: any "N available" text in the page HTML
+    if result['remaining_stock'] is None:
+        m2 = re.search(r'(\d[\d,]+)\s+available', html, re.IGNORECASE)
+        if m2:
+            result['remaining_stock'] = int(m2.group(1).replace(',', ''))
+            print(f"[scraper] remaining_stock (HTML scan): {result['remaining_stock']}")
+
+    # Fallback B: JSON inline availStock
+    if result['remaining_stock'] is None:
+        m3 = re.search(r'"availStock"\s*:\s*(\d+)', html)
+        if m3:
+            result['remaining_stock'] = int(m3.group(1))
+            print(f"[scraper] remaining_stock (availStock JSON): {result['remaining_stock']}")
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -778,6 +889,13 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
                 page.wait_for_timeout(random.randint(500, 900))
             page.wait_for_timeout(2000)
 
+            # Scroll-to-top retry when API not yet captured
+            if not captured:
+                page.mouse.wheel(0, -9999)
+                page.wait_for_timeout(3000)
+                page.mouse.wheel(0, 600)
+                page.wait_for_timeout(2000)
+
             # Simple seller extraction from href
             try:
                 for link in page.locator('a[href*="/store/"]').all()[:5]:
@@ -785,7 +903,9 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
                     m = re.search(r'/store/(\d+)', href)
                     if m:
                         dom_seller['store_id'] = m.group(1)
-                        dom_seller['store_url'] = f"https://www.aliexpress.com/store/{m.group(1)}"
+                        dom_seller['store_url'] = (
+                            f"https://www.aliexpress.com/store/{m.group(1)}"
+                        )
                         break
             except Exception:
                 pass
@@ -794,10 +914,6 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
                 compliance = _extract_compliance_info(page)
 
             html = page.content()
-
-            # ── NEW: extract extra DOM fields (rating, stock, delivery, country)
-            dom_extra = _extract_dom_extra_fields(page, html, url)
-
             page.close()
             context.close()
 
@@ -806,13 +922,16 @@ def _scrape_in_thread(url: str, try_compliance: bool = False) -> dict:
         import traceback
         traceback.print_exc()
 
-    return {'captured': captured, 'html': html,
-            'dom_seller': dom_seller, 'compliance': compliance,
-            'dom_extra': dom_extra if 'dom_extra' in locals() else {}}
+    return {
+        'captured':   captured,
+        'html':       html,
+        'dom_seller': dom_seller,
+        'compliance': compliance,
+    }
 
 
 def _scrape_with_retry(url: str, try_compliance: bool = False) -> dict:
-    best = {'captured': [], 'html': '', 'dom_seller': {}, 'compliance': {}, 'dom_extra': {}}
+    best = {'captured': [], 'html': '', 'dom_seller': {}, 'compliance': {}}
 
     for attempt in range(1, MAX_RETRIES + 1):
         print(f"\n[scraper] Attempt {attempt}/{MAX_RETRIES}")
@@ -913,16 +1032,16 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
     if data.get('compliance'):
         extracted['compliance'] = data['compliance']
 
-    # ── Merge DOM extra fields (rating override, stock, delivery, country) ──
-    dom_extra = data.get('dom_extra', {})
-    if dom_extra:
-        # rating: DOM value wins over mtop (more reliable on product page)
-        if dom_extra.get('rating') is not None:
-            extracted['rating'] = str(dom_extra['rating'])
-        for field in ('shipment_country', 'delivery_start', 'delivery_end',
-                      'delivery_days', 'remaining_stock'):
-            if dom_extra.get(field) is not None:
-                extracted[field] = dom_extra[field]
+    # ── Extract 4 detail fields from saved HTML (pure regex, no browser needed)
+    df = _extract_detail_fields_from_html(data.get('html', ''), url)
+    extracted['shipment_country'] = df.get('shipment_country')
+    extracted['delivery_start']   = df.get('delivery_start')
+    extracted['delivery_end']     = df.get('delivery_end')
+    extracted['delivery_days']    = df.get('delivery_days')
+    extracted['remaining_stock']  = df.get('remaining_stock')
+    # detail_rating overwrites mtop API rating only when present
+    if df.get('detail_rating') is not None:
+        extracted['rating'] = str(df['detail_rating'])
 
     desc_url = extracted.pop('_description_url', '')
     if desc_url and not extracted.get('description'):
@@ -942,12 +1061,14 @@ def get_product_info(url: str, extract_compliance: bool = True) -> dict | None:
         'seller_total_reviews': '', 'seller_positive_num': '', 'is_top_rated': '',
         'category_id': '', 'category_name': '', 'category_path': '',
         'compliance': {},
-        # New extra fields
+        # Detail fields
         'shipment_country': None,
-        'delivery_start': None,
-        'delivery_end': None,
-        'delivery_days': None,
-        'remaining_stock': None,
+        'delivery_start':   None,
+        'delivery_end':     None,
+        'delivery_days':    None,
+        'remaining_stock':  None,
+        # mtop API stock (backward compat)
+        'stock_remaining': '',
     }
     for key, default in defaults.items():
         extracted.setdefault(key, default)
@@ -1003,166 +1124,198 @@ def _find_item_list_recursive(data, depth: int = 0) -> Optional[list]:
 
 def _extract_products_from_page(page) -> List[Dict]:
     """
-    3-layer extraction: init_data JSON → DOM anchors → HTML regex.
-    Returns list with keys: product_id, product_url, title
+    4-layer extraction: multi-path JSON → DOM card divs → DOM anchors → HTML regex.
+    Returns list with keys: product_id, product_url, title, rating, sold_count.
     """
-    products = []
+    products: List[Dict] = []
     seen_ids: set = set()
 
-    # Layer 1: init_data JSON
+    def _parse_item(item: dict) -> Optional[Dict]:
+        if not isinstance(item, dict):
+            return None
+        pid = str(
+            item.get('productId', '') or item.get('redirectedId', '') or
+            item.get('itemId', '')    or item.get('id', '')
+        ).strip()
+        if not pid or pid in seen_ids:
+            return None
+
+        title_raw = (
+            _safe_get(item, 'title', 'displayTitle') or
+            _safe_get(item, 'title', 'seoTitle')     or
+            item.get('title') or item.get('productTitle') or item.get('name') or ''
+        )
+        if isinstance(title_raw, dict):
+            title_raw = title_raw.get('displayTitle', '') or title_raw.get('title', '')
+        title = _clean_title(str(title_raw).strip())
+
+        rating_raw = (
+            _safe_get(item, 'starRating')              or
+            _safe_get(item, 'averageStar')             or
+            _safe_get(item, 'feedback', 'starRating')  or
+            _safe_get(item, 'trade', 'starRating')     or
+            _safe_get(item, 'ratings', 'averageScore') or ''
+        )
+        sold_raw = (
+            _safe_get(item, 'trade', 'tradeCount') or
+            _safe_get(item, 'tradeCount')          or
+            _safe_get(item, 'sold')                or
+            _safe_get(item, 'salesCount')          or ''
+        )
+        seen_ids.add(pid)
+        return {
+            'product_id':  pid,
+            'product_url': _normalize_product_url(pid),
+            'title':       title,
+            'rating':      _s(rating_raw),
+            'sold_count':  _s(sold_raw),
+        }
+
+    # ── Layer 1: JSON — all three window-level data sources ──────────────────
+    json_js = """() => {
+        const results = {};
+        try {
+            if (window.__INIT_DATA__) results.INIT_DATA = JSON.stringify(window.__INIT_DATA__);
+        } catch(e) {}
+        try {
+            if (window.runParams) results.runParams = JSON.stringify(window.runParams);
+        } catch(e) {}
+        try {
+            const cfg = window._dida_config_;
+            if (cfg && cfg._init_data_) results.dida = JSON.stringify(cfg._init_data_);
+        } catch(e) {}
+        return JSON.stringify(results);
+    }"""
     try:
-        init_data_json = page.evaluate("""() => {
-            try {
-                const cfg = window._dida_config_;
-                if (cfg && cfg._init_data_) return JSON.stringify(cfg._init_data_);
-            } catch(e) {}
-            return null;
-        }""")
-        if init_data_json:
-            init_data = json.loads(init_data_json)
-            item_list = (
-                _safe_get(init_data, 'data', 'data', 'root', 'fields', 'mods', 'itemList', 'content') or
-                _safe_get(init_data, 'data', 'root', 'fields', 'mods', 'itemList', 'content') or
-                _find_item_list_recursive(init_data) or []
-            )
-            for item in item_list:
-                if not isinstance(item, dict):
-                    continue
-                pid = str(
-                    item.get('productId', '') or
-                    item.get('redirectedId', '') or
-                    item.get('itemId', '')
-                ).strip()
-                if not pid or pid in seen_ids:
-                    continue
-
-                title_raw = (
-                    _safe_get(item, 'title', 'displayTitle') or
-                    _safe_get(item, 'title', 'seoTitle') or
-                    item.get('title') or ''
-                )
-                if isinstance(title_raw, dict):
-                    title_raw = title_raw.get('displayTitle', '') or title_raw.get('title', '')
-                title = _clean_title(str(title_raw).strip())
-
-                # Extract rating and sold_count from init_data item
-                rating_val = None
-                sold_count_val = None
-                try:
-                    # rating: item.starRating.averageStar or item.trade.realTradeSoldCount
-                    sr = item.get('starRating') or {}
-                    if isinstance(sr, dict):
-                        rv = _s(sr.get('averageStar') or sr.get('star'))
-                        if rv:
-                            rating_val = rv
-                    if not rating_val:
-                        for rk in ['averageStar', 'score', 'rating', 'starRating']:
-                            rv = _s(item.get(rk))
-                            if rv:
-                                rating_val = rv
-                                break
-                    trade = item.get('trade') or {}
-                    if isinstance(trade, dict):
-                        sv = _s(trade.get('realTradeSoldCount') or trade.get('tradeSoldCount')
-                                or trade.get('soldCount'))
-                        if sv:
-                            sold_count_val = sv
-                    if not sold_count_val:
-                        for sk in ['soldCount', 'tradeCount', 'realTradeSoldCount', 'sold']:
-                            sv = _s(item.get(sk))
-                            if sv:
-                                sold_count_val = sv
-                                break
-                except Exception:
-                    pass
-
-                seen_ids.add(pid)
-                products.append({
-                    'product_id':  pid,
-                    'product_url': _normalize_product_url(pid),
-                    'title':       title,
-                    'rating':      rating_val,
-                    'sold_count':  sold_count_val,
-                })
-
-            if products:
-                print(f"[search_scraper] init_data: {len(products)} products")
-                return products
-    except Exception as e:
-        print(f"[search_scraper] init_data error: {e}")
-
-    # Layer 2: DOM anchors
-    try:
-        anchors = page.locator(
-            'a.search-card-item, a.lw_b.h7_ic.search-card-item, [class*="search-card-item"]'
-        ).all()
-        for anchor in anchors:
+        raw_sources = page.evaluate(json_js)
+        sources = json.loads(raw_sources) if raw_sources else {}
+        for src_name, src_json in sources.items():
+            if not src_json:
+                continue
             try:
-                href = anchor.get_attribute('href') or ''
-                pid  = _extract_product_id(href)
-                if not pid or pid in seen_ids:
-                    continue
-                title = ''
-                for title_sel in ['h3.lw_k4', '[role="heading"] h3', '[class*="lw_k4"]']:
-                    try:
-                        te = anchor.locator(title_sel).first
-                        if te.count() > 0:
-                            raw = te.inner_text().strip()
-                            if raw:
-                                title = _clean_title(raw)
-                                break
-                    except Exception:
-                        pass
-                if not title:
-                    title = _clean_title(anchor.get_attribute('aria-label') or '')
-
-                # Extract rating and sold_count from card DOM
-                card_rating = None
-                card_sold   = None
-                try:
-                    for rsel in ['[class*="rating"] span', '[class*="star"] span',
-                                 '[class*="score"]', '[class*="review--averageStar"]']:
-                        try:
-                            re_el = anchor.locator(rsel).first
-                            if re_el.count() > 0:
-                                rtxt = re_el.inner_text().strip()
-                                if re.match(r'^[0-9]+(?:\.[0-9]+)?$', rtxt):
-                                    card_rating = rtxt
-                                    break
-                        except Exception:
-                            pass
-                    for ssel in ['[class*=trade]', '[class*=sold]',
-                                 '[class*=realTrade]', '[class*=order]']:
-                        try:
-                            se_el = anchor.locator(ssel).first
-                            if se_el.count() > 0:
-                                stxt = se_el.inner_text().strip()
-                                sm = re.search(r'(\d[\d,.]+)', stxt)
-                                if sm:
-                                    card_sold = sm.group(1).replace(',', '')
-                                    break
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                seen_ids.add(pid)
-                products.append({
-                    'product_id':  pid,
-                    'product_url': _normalize_product_url(pid),
-                    'title':       title[:300],
-                    'rating':      card_rating,
-                    'sold_count':  card_sold,
-                })
+                data = json.loads(src_json)
             except Exception:
                 continue
+            item_list = (
+                _safe_get(data, 'data', 'root', 'fields', 'mods', 'itemList', 'content') or
+                _safe_get(data, 'data', 'data', 'root', 'fields', 'mods', 'itemList', 'content') or
+                _safe_get(data, 'result', 'mods', 'itemList', 'content') or
+                _safe_get(data, 'itemList', 'content') or
+                _safe_get(data, 'data', 'itemList', 'content') or
+                _find_item_list_recursive(data) or []
+            )
+            for item in item_list:
+                p = _parse_item(item)
+                if p:
+                    products.append(p)
+            if products:
+                print(f"[search_scraper] JSON ({src_name}): {len(products)} products")
+                break
+    except Exception as e:
+        print(f"[search_scraper] JSON layer error: {e}")
+
+    if len(products) >= 10:
+        return products
+
+    # ── Layer 2: DOM cards ────────────────────────────────────────────────────
+    try:
+        for _ in range(3):
+            page.mouse.wheel(0, 1200)
+            page.wait_for_timeout(400)
+        page.mouse.wheel(0, -9999)
+        page.wait_for_timeout(600)
+    except Exception:
+        pass
+
+    try:
+        card_selectors = [
+            'div.lw_v',
+            'a.search-card-item',
+            'a.lw_b.h7_ic.search-card-item',
+            '[class*="search-card-item"]',
+        ]
+        for card_sel in card_selectors:
+            cards = page.locator(card_sel).all()
+            if not cards:
+                continue
+            for card in cards:
+                try:
+                    tag  = card.evaluate('el => el.tagName').lower()
+                    href = ''
+                    pid  = ''
+                    if tag == 'a':
+                        href = card.get_attribute('href') or ''
+                        pid  = _extract_product_id(href)
+                    else:
+                        for link_sel in [
+                            'a[href*="/item/"]',
+                            'a[href*="aliexpress.com/item/"]',
+                            'a',
+                        ]:
+                            link = card.locator(link_sel).first
+                            if link.count() > 0:
+                                href = link.get_attribute('href') or ''
+                                pid  = _extract_product_id(href)
+                                if pid:
+                                    break
+                    if not pid or pid in seen_ids:
+                        continue
+
+                    title = ''
+                    for title_sel in [
+                        'h3.lw_k4', '[class*="lw_k4"]',
+                        '[role="heading"] h3', 'h3', '[class*="title"]',
+                    ]:
+                        try:
+                            te = card.locator(title_sel).first
+                            if te.count() > 0:
+                                raw = te.inner_text().strip()
+                                if raw:
+                                    title = _clean_title(raw)
+                                    break
+                        except Exception:
+                            pass
+                    if not title:
+                        title = _clean_title(card.get_attribute('aria-label') or '')
+
+                    rating = ''
+                    try:
+                        rel = card.locator('.lw_km, [class*="lw_km"]').first
+                        if rel.count() > 0:
+                            rating = rel.inner_text().strip()
+                    except Exception:
+                        pass
+
+                    sold_count = ''
+                    try:
+                        sel_el = card.locator('.lw_kk, [class*="lw_kk"]').first
+                        if sel_el.count() > 0:
+                            raw_sold = sel_el.inner_text().strip()
+                            m_sold = re.search(r'(\d[\d,]*)\s*sold', raw_sold, re.IGNORECASE)
+                            sold_count = m_sold.group(1).replace(',', '') if m_sold else raw_sold
+                    except Exception:
+                        pass
+
+                    seen_ids.add(pid)
+                    products.append({
+                        'product_id':  pid,
+                        'product_url': _normalize_product_url(pid),
+                        'title':       title[:300],
+                        'rating':      rating,
+                        'sold_count':  sold_count,
+                    })
+                except Exception:
+                    continue
+            if len(products) >= 10:
+                break
+
         if products:
             print(f"[search_scraper] DOM: {len(products)} products")
             return products
     except Exception as e:
         print(f"[search_scraper] DOM error: {e}")
 
-    # Layer 3: HTML regex
+    # ── Layer 3: HTML regex ───────────────────────────────────────────────────
     try:
         html = page.content()
         for pat in [
@@ -1178,6 +1331,8 @@ def _extract_products_from_page(page) -> List[Dict]:
                         'product_id':  pid,
                         'product_url': _normalize_product_url(pid),
                         'title':       '',
+                        'rating':      '',
+                        'sold_count':  '',
                     })
         if products:
             print(f"[search_scraper] HTML regex: {len(products)} products")
@@ -1188,12 +1343,7 @@ def _extract_products_from_page(page) -> List[Dict]:
 
 
 def _build_page_url(base_url: str, page_num: int) -> str:
-    """
-    Build paginated URL for any page number.
-    Replaces existing page= param or appends one.
-    """
     if page_num == 1:
-        # Remove any existing page= so page 1 is canonical
         url = re.sub(r'[?&]page=\d+', '', base_url).rstrip('?&')
         return url
     if re.search(r'[?&]page=\d+', base_url):
@@ -1229,20 +1379,7 @@ def scrape_search_results(
 ) -> Dict:
     """
     Scrape AliExpress search pages via DIRECT URL NAVIGATION for every page.
-
-    CRITICAL DESIGN: This function ALWAYS navigates all max_pages by building
-    the URL explicitly (_build_page_url). It does NOT rely on pagination DOM
-    buttons, which was the root cause of the "33 products / early stop" bug.
-    The _has_next_page check is removed as a hard stop — all pages are visited
-    unless they genuinely return zero products (indicating the site ran out).
-
-    Returns:
-        {
-          "products":       List[{product_id, product_url, title}],
-          "total_products": int,
-          "pages_scraped":  int,
-          "search_url":     str,
-        }
+    Returns products with: product_id, product_url, title, rating, sold_count.
     """
     max_pages     = min(max_pages, MAX_SEARCH_PAGES)
     all_products: List[Dict] = []
@@ -1251,7 +1388,7 @@ def scrape_search_results(
     ua                        = random.choice(USER_AGENTS)
 
     print(f"\n[search_scraper] Starting: {search_url[:100]}")
-    print(f"[search_scraper] Target: {max_pages} pages | Products cap: {max_products or 'unlimited'}")
+    print(f"[search_scraper] Target: {max_pages} pages | cap: {max_products or 'unlimited'}")
 
     try:
         with Camoufox(headless=True, os='windows') as browser:
@@ -1265,7 +1402,6 @@ def scrape_search_results(
 
             for page_num in range(1, max_pages + 1):
                 print(f"\n[search_scraper] ══ Page {page_num}/{max_pages} ══")
-
                 nav_url = _build_page_url(search_url, page_num)
                 print(f"[search_scraper] URL: {nav_url[:110]}")
 
@@ -1274,16 +1410,13 @@ def scrape_search_results(
                     _wait_for_page_load(page)
                 except Exception as e:
                     print(f"[search_scraper] Navigation error page {page_num}: {e}")
-                    # Don't break — try next page
                     pages_scraped = page_num
                     continue
 
-                # Dismiss banners on page 1
                 if page_num == 1:
                     _dismiss_banners(page)
                     page.wait_for_timeout(800)
 
-                # Extract products BEFORE any scrolling
                 page_products = _extract_products_from_page(page)
 
                 new_count = 0
@@ -1296,28 +1429,23 @@ def scrape_search_results(
                         'product_id':  prod['product_id'],
                         'product_url': prod['product_url'],
                         'title':       prod.get('title', ''),
-                        'rating':      prod.get('rating'),
-                        'sold_count':  prod.get('sold_count'),
+                        'rating':      prod.get('rating', ''),
+                        'sold_count':  prod.get('sold_count', ''),
                     })
                     new_count += 1
 
                 pages_scraped = page_num
-                print(f"[search_scraper] Page {page_num}: +{new_count} new products | "
-                      f"running total = {len(all_products)}")
+                print(f"[search_scraper] Page {page_num}: +{new_count} new | "
+                      f"total = {len(all_products)}")
 
-                # Only stop early if the page genuinely had zero new products
-                # AND it's not the first page (first page can be slow)
                 if new_count == 0 and page_num > 1:
-                    print(f"[search_scraper] Page {page_num} returned 0 new products — "
-                          f"site may have run out of results. Stopping.")
+                    print(f"[search_scraper] 0 new products — site exhausted. Stopping.")
                     break
 
-                # Hard product cap (if requested)
                 if max_products > 0 and len(all_products) >= max_products:
-                    print(f"[search_scraper] Product cap ({max_products}) reached")
+                    print(f"[search_scraper] Cap ({max_products}) reached")
                     break
 
-                # Polite delay between pages (skip after last page)
                 if page_num < max_pages:
                     sleep_time = random.uniform(delay, delay * 1.5)
                     print(f"[search_scraper] Waiting {sleep_time:.1f}s...")
@@ -1334,7 +1462,8 @@ def scrape_search_results(
     if max_products > 0:
         all_products = all_products[:max_products]
 
-    print(f"\n[search_scraper] ✓ Complete: {len(all_products)} products from {pages_scraped} pages")
+    print(f"\n[search_scraper] ✓ Complete: {len(all_products)} products "
+          f"from {pages_scraped} pages")
 
     return {
         "products":       all_products,
@@ -1356,7 +1485,8 @@ if __name__ == '__main__':
         result = scrape_search_results(args[0], max_pages=int(args[1]) if len(args) > 1 else 5)
         print(f"\nTotal: {result['total_products']} products from {result['pages_scraped']} pages")
         for p in result['products'][:20]:
-            print(f"  [{p['product_id']}] {p['title'][:70]}")
+            print(f"  [{p['product_id']}] R:{p.get('rating','?')} "
+                  f"S:{p.get('sold_count','?')} {p['title'][:60]}")
     else:
         test_url = args[0] if args else "https://www.aliexpress.com/item/1005010089125608.html"
         result = get_product_info(test_url, extract_compliance=True)
