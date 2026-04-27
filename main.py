@@ -819,26 +819,35 @@ def get_product_info_by_id(product_id: str, extract_compliance: bool = False):
 
 
 # =============================================================================
+# =============================================================================
 # MERCHANT BULK PROCESSING ENDPOINTS
 # =============================================================================
+
+class MerchantIDsRequest(BaseModel):
+    """JSON-body alternative to CSV upload — send IDs directly."""
+    merchant_ids: List[str]
+
+    class Config:
+        json_schema_extra = {
+            "example": {"merchant_ids": ["1103833861", "912519001", "567839201"]}
+        }
+
 
 @app.post("/upload-csv", tags=["Merchant Bulk"])
 async def upload_merchant_csv(file: UploadFile = File(...)):
     """
-    Upload a CSV file containing MerchantID column.
+    Upload a CSV file containing a MerchantID column.
 
-    Expected CSV format:
+    REQUIRES:  pip install python-multipart
+
+    CSV format:
       MerchantID
       1103833861
       912519001
 
-    Steps performed:
-      1. Parse CSV → extract MerchantID list
-      2. Launch background bulk job (concurrent, with retries)
-      3. Return job_id for status polling
-
-    Poll status at:  GET /merchant-job-status/{job_id}
-    Download result: GET /merchant-download/{job_id}
+    Returns job_id immediately — processing runs in background.
+    Poll:     GET /merchant-job-status/{job_id}
+    Download: GET /merchant-download/{job_id}
     """
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv files are accepted")
@@ -856,17 +865,53 @@ async def upload_merchant_csv(file: UploadFile = File(...)):
 
     job_id = str(uuid.uuid4())
     start_bulk_job(job_id, merchant_ids)
-
-    logger.info(f"[merchant] Job {job_id} queued — {len(merchant_ids)} merchants")
+    logger.info(f"[merchant] Job {job_id} queued via CSV — {len(merchant_ids)} merchants")
 
     return {
-        "job_id":       job_id,
-        "merchant_count": len(merchant_ids),
-        "status":       "queued",
-        "poll_url":     f"/merchant-job-status/{job_id}",
-        "download_url": f"/merchant-download/{job_id}",
-        "message":      (
+        "job_id":           job_id,
+        "merchant_count":   len(merchant_ids),
+        "status":           "queued",
+        "poll_url":         f"/merchant-job-status/{job_id}",
+        "download_url":     f"/merchant-download/{job_id}",
+        "message": (
             f"Processing {len(merchant_ids)} merchants in background. "
+            f"Poll /merchant-job-status/{job_id} to track progress."
+        ),
+    }
+
+
+@app.post("/submit-merchant-ids", tags=["Merchant Bulk"])
+def submit_merchant_ids(req: MerchantIDsRequest):
+    """
+    JSON alternative to /upload-csv — no file upload needed.
+    No extra packages required.
+
+    Body:
+      { "merchant_ids": ["1103833861", "912519001"] }
+
+    Returns job_id immediately — processing runs in background.
+    Poll:     GET /merchant-job-status/{job_id}
+    Download: GET /merchant-download/{job_id}
+    """
+    import re as _re
+    clean_ids = [mid.strip() for mid in req.merchant_ids
+                 if mid and _re.match(r"^\d+$", mid.strip())]
+
+    if not clean_ids:
+        raise HTTPException(status_code=422, detail="No valid numeric merchant IDs provided")
+
+    job_id = str(uuid.uuid4())
+    start_bulk_job(job_id, clean_ids)
+    logger.info(f"[merchant] Job {job_id} queued via JSON — {len(clean_ids)} merchants")
+
+    return {
+        "job_id":           job_id,
+        "merchant_count":   len(clean_ids),
+        "status":           "queued",
+        "poll_url":         f"/merchant-job-status/{job_id}",
+        "download_url":     f"/merchant-download/{job_id}",
+        "message": (
+            f"Processing {len(clean_ids)} merchants in background. "
             f"Poll /merchant-job-status/{job_id} to track progress."
         ),
     }
@@ -875,14 +920,9 @@ async def upload_merchant_csv(file: UploadFile = File(...)):
 @app.get("/merchant-job-status/{job_id}", tags=["Merchant Bulk"])
 def merchant_job_status(job_id: str):
     """
-    Poll the status of a merchant bulk job.
+    Poll the progress of a merchant bulk job.
 
-    Returns:
-      status:    "queued" | "running" | "done"
-      total:     total merchants to process
-      done:      merchants processed so far
-      progress:  percentage complete
-      results:   list of completed rows (grows as processing proceeds)
+    status: "queued" | "running" | "done"
     """
     job = get_job_status(job_id)
     if job is None:
@@ -891,38 +931,33 @@ def merchant_job_status(job_id: str):
     total    = job.get("total", 0)
     done     = job.get("done", 0)
     progress = round(done / total * 100, 1) if total else 0.0
-
-    # Build a lightweight summary (don't return full results list unless done)
-    status = job.get("status", "unknown")
-    results = job.get("results", [])
+    status   = job.get("status", "unknown")
+    results  = job.get("results", [])
 
     success_count = sum(1 for r in results if r.get("total_items") is not None)
-    error_count   = sum(1 for r in results if r.get("error") and r["error"] != "")
+    error_count   = sum(1 for r in results if r.get("error"))
 
     return {
-        "job_id":        job_id,
-        "status":        status,
-        "total":         total,
-        "done":          done,
-        "progress_pct":  progress,
-        "success_count": success_count,
-        "error_count":   error_count,
-        "results":       results if status == "done" else results[-20:],  # last 20 while running
+        "job_id":         job_id,
+        "status":         status,
+        "total":          total,
+        "done":           done,
+        "progress_pct":   progress,
+        "success_count":  success_count,
+        "error_count":    error_count,
+        "results":        results if status == "done" else results[-20:],
         "download_ready": status == "done",
-        "download_url":  f"/merchant-download/{job_id}" if status == "done" else None,
+        "download_url":   f"/merchant-download/{job_id}" if status == "done" else None,
     }
 
 
 @app.get("/merchant-download/{job_id}", tags=["Merchant Bulk"])
 def merchant_download(job_id: str):
     """
-    Download the processed CSV once the job is complete.
+    Download the processed result as a CSV file.
+    Only available once job status = "done".
 
-    Returns a CSV file with columns: MerchantID, TotalItems, Error
-
-    Example row:
-      912519001,32,
-      567839201,,Blocked
+    CSV columns: MerchantID, TotalItems, Error
     """
     job = get_job_status(job_id)
     if job is None:
@@ -931,8 +966,11 @@ def merchant_download(job_id: str):
     if job.get("status") != "done":
         raise HTTPException(
             status_code=202,
-            detail=f"Job not complete yet. Status: {job['status']} "
-                   f"({job.get('done', 0)}/{job.get('total', 0)} done)"
+            detail=(
+                f"Job not complete yet — status: {job['status']} "
+                f"({job.get('done', 0)}/{job.get('total', 0)} done). "
+                f"Retry when status = 'done'."
+            ),
         )
 
     csv_bytes = build_output_csv(job.get("results", []))
@@ -947,10 +985,7 @@ def merchant_download(job_id: str):
 
 @app.get("/merchant-jobs", tags=["Merchant Bulk"])
 def list_merchant_jobs():
-    """
-    List all merchant bulk jobs and their current status.
-    Useful for monitoring active/completed jobs.
-    """
+    """List all merchant bulk jobs and their current status."""
     from merchant_scraper import _jobs, _jobs_lock
     with _jobs_lock:
         summary = []
@@ -968,7 +1003,6 @@ def list_merchant_jobs():
     return {"jobs": summary, "count": len(summary)}
 
 
-# =============================================================================
 # RELOAD FILTERS
 # =============================================================================
 
