@@ -68,21 +68,30 @@ def parse_merchant_csv(file_bytes: bytes) -> List[str]:
     Accepts column names: MerchantID, merchantid, merchant_id, ID, id (case-insensitive).
     Skips blank rows and non-numeric IDs.
     """
-    text    = file_bytes.decode("utf-8", errors="replace")
+    # utf-8-sig automatically strips the Excel BOM (\ufeff) if present
+    text    = file_bytes.decode("utf-8-sig", errors="replace")
     reader  = csv.DictReader(io.StringIO(text))
-    headers = [h.strip().lower() for h in (reader.fieldnames or [])]
+    # Normalise headers: strip whitespace + BOM just in case
+    raw_headers = reader.fieldnames or []
+    headers = [h.strip().lstrip("\ufeff").lower() for h in raw_headers]
+
+    # Map normalised header → original header for DictReader lookup
+    header_map = {h.strip().lstrip("\ufeff").lower(): h for h in raw_headers}
 
     # Find which column holds merchant IDs
-    id_col = None
+    id_col_norm = None
     for candidate in ["merchantid", "merchant_id", "merchant id", "id", "store_id", "storeid"]:
         if candidate in headers:
-            id_col = candidate
+            id_col_norm = candidate
             break
 
-    if id_col is None:
+    if id_col_norm is None:
         raise ValueError(
-            f"CSV must have a 'MerchantID' column. Found: {reader.fieldnames}"
+            f"CSV must have a 'MerchantID' column. Found: {raw_headers}"
         )
+
+    # Get the original column name for DictReader
+    id_col = header_map[id_col_norm]
 
     ids = []
     for row in reader:
@@ -352,4 +361,4 @@ def build_output_csv(results: List[Dict]) -> bytes:
             row.get("total_items", "") if row.get("total_items") is not None else "",
             row.get("error", ""),
         ])
-    return buf.getvalue().encode("utf-8")  
+    return buf.getvalue().encode("utf-8")
