@@ -40,6 +40,17 @@ from product_filter import (
     reload_filter_data,
 )
 
+# ── Merchant bulk processing ──────────────────────────────────────────────────
+import uuid
+from fastapi import UploadFile, File, BackgroundTasks
+from fastapi.responses import Response as FastAPIResponse
+from merchant_scraper import (
+    parse_merchant_csv,
+    start_bulk_job,
+    get_job_status,
+    build_output_csv,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -805,6 +816,156 @@ def get_product_info_by_id(product_id: str, extract_compliance: bool = False):
         "template":         result.get("template", {}),
         "timestamp":        result.get("timestamp"),
     }
+
+
+# =============================================================================
+# MERCHANT BULK PROCESSING ENDPOINTS
+# =============================================================================
+
+@app.post("/upload-csv", tags=["Merchant Bulk"])
+async def upload_merchant_csv(file: UploadFile = File(...)):
+    """
+    Upload a CSV file containing MerchantID column.
+
+    Expected CSV format:
+      MerchantID
+      1103833861
+      912519001
+
+    Steps performed:
+      1. Parse CSV → extract MerchantID list
+      2. Launch background bulk job (concurrent, with retries)
+      3. Return job_id for status polling
+
+    Poll status at:  GET /merchant-job-status/{job_id}
+    Download result: GET /merchant-download/{job_id}
+    """
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only .csv files are accepted")
+
+    try:
+        content      = await file.read()
+        merchant_ids = parse_merchant_csv(content)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"CSV parse error: {e}")
+
+    if not merchant_ids:
+        raise HTTPException(status_code=422, detail="No valid MerchantID rows found in CSV")
+
+    job_id = str(uuid.uuid4())
+    start_bulk_job(job_id, merchant_ids)
+
+    logger.info(f"[merchant] Job {job_id} queued — {len(merchant_ids)} merchants")
+
+    return {
+        "job_id":       job_id,
+        "merchant_count": len(merchant_ids),
+        "status":       "queued",
+        "poll_url":     f"/merchant-job-status/{job_id}",
+        "download_url": f"/merchant-download/{job_id}",
+        "message":      (
+            f"Processing {len(merchant_ids)} merchants in background. "
+            f"Poll /merchant-job-status/{job_id} to track progress."
+        ),
+    }
+
+
+@app.get("/merchant-job-status/{job_id}", tags=["Merchant Bulk"])
+def merchant_job_status(job_id: str):
+    """
+    Poll the status of a merchant bulk job.
+
+    Returns:
+      status:    "queued" | "running" | "done"
+      total:     total merchants to process
+      done:      merchants processed so far
+      progress:  percentage complete
+      results:   list of completed rows (grows as processing proceeds)
+    """
+    job = get_job_status(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    total    = job.get("total", 0)
+    done     = job.get("done", 0)
+    progress = round(done / total * 100, 1) if total else 0.0
+
+    # Build a lightweight summary (don't return full results list unless done)
+    status = job.get("status", "unknown")
+    results = job.get("results", [])
+
+    success_count = sum(1 for r in results if r.get("total_items") is not None)
+    error_count   = sum(1 for r in results if r.get("error") and r["error"] != "")
+
+    return {
+        "job_id":        job_id,
+        "status":        status,
+        "total":         total,
+        "done":          done,
+        "progress_pct":  progress,
+        "success_count": success_count,
+        "error_count":   error_count,
+        "results":       results if status == "done" else results[-20:],  # last 20 while running
+        "download_ready": status == "done",
+        "download_url":  f"/merchant-download/{job_id}" if status == "done" else None,
+    }
+
+
+@app.get("/merchant-download/{job_id}", tags=["Merchant Bulk"])
+def merchant_download(job_id: str):
+    """
+    Download the processed CSV once the job is complete.
+
+    Returns a CSV file with columns: MerchantID, TotalItems, Error
+
+    Example row:
+      912519001,32,
+      567839201,,Blocked
+    """
+    job = get_job_status(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    if job.get("status") != "done":
+        raise HTTPException(
+            status_code=202,
+            detail=f"Job not complete yet. Status: {job['status']} "
+                   f"({job.get('done', 0)}/{job.get('total', 0)} done)"
+        )
+
+    csv_bytes = build_output_csv(job.get("results", []))
+    filename  = f"merchants_{job_id[:8]}.csv"
+
+    return FastAPIResponse(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/merchant-jobs", tags=["Merchant Bulk"])
+def list_merchant_jobs():
+    """
+    List all merchant bulk jobs and their current status.
+    Useful for monitoring active/completed jobs.
+    """
+    from merchant_scraper import _jobs, _jobs_lock
+    with _jobs_lock:
+        summary = []
+        for jid, job in _jobs.items():
+            total = job.get("total", 0)
+            done  = job.get("done", 0)
+            summary.append({
+                "job_id":       jid,
+                "status":       job.get("status"),
+                "total":        total,
+                "done":         done,
+                "progress_pct": round(done / total * 100, 1) if total else 0.0,
+                "download_url": f"/merchant-download/{jid}" if job.get("status") == "done" else None,
+            })
+    return {"jobs": summary, "count": len(summary)}
 
 
 # =============================================================================
