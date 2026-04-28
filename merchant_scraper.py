@@ -381,21 +381,31 @@ def get_job_status(job_id: str) -> Optional[Dict]:
         return None
 
     if disk:
-        total     = disk.get("batches_total", 0)
-        processed = disk.get("batches_done", 0) + disk.get("batches_failed", 0)
+        total             = disk.get("batches_total", 0)
+        processed         = disk.get("batches_done", 0) + disk.get("batches_failed", 0)
+        total_merchants   = disk.get("total", 0)
+
+        # Count merchants done from per-batch sizes
+        merchants_done = 0
+        for b in disk.get("batches", []):
+            if b.get("status") in ("done", "failed"):
+                merchants_done += b.get("size", BATCH_SIZE)
+        merchants_done = min(merchants_done, total_merchants)
+
         return {
-            "status":          disk.get("status", mem.get("status", "unknown")),
-            "total":           disk.get("total", 0),
-            "batches_total":   disk.get("batches_total", 0),
-            "batches_done":    disk.get("batches_done", 0),
-            "batches_failed":  disk.get("batches_failed", 0),
-            "progress_pct":    round(processed / total * 100, 1) if total else 0.0,
-            "merchants_done":  min(processed * BATCH_SIZE, disk.get("total", 0)),
-            "started_at":      disk.get("started_at"),
-            "finished_at":     disk.get("finished_at"),
-            "batches":         disk.get("batches", []),
-            "download_ready":  disk.get("status") == "done",
-            "download_url":    f"/merchant-download/{job_id}" if disk.get("status") == "done" else None,
+            "status":              disk.get("status", mem.get("status", "unknown")),
+            "total_merchants":     total_merchants,
+            "merchants_done":      merchants_done,
+            "merchants_remaining": max(0, total_merchants - merchants_done),
+            "batches_total":       disk.get("batches_total", 0),
+            "batches_done":        disk.get("batches_done", 0),
+            "batches_failed":      disk.get("batches_failed", 0),
+            "progress_pct":        round(merchants_done / total_merchants * 100, 1) if total_merchants else 0.0,
+            "started_at":          disk.get("started_at"),
+            "finished_at":         disk.get("finished_at"),
+            "batches":             disk.get("batches", []),
+            "download_ready":      disk.get("status") == "done",
+            "download_url":        f"/merchant-download/{job_id}" if disk.get("status") == "done" else None,
         }
 
     return mem
@@ -422,18 +432,32 @@ def list_all_jobs() -> List[Dict]:
         meta = _load_metadata(job_dir.name)
         if not meta:
             continue
-        total     = meta.get("batches_total", 0)
-        processed = meta.get("batches_done", 0) + meta.get("batches_failed", 0)
+        batches_total   = meta.get("batches_total", 0)
+        batches_done    = meta.get("batches_done", 0)
+        batches_failed  = meta.get("batches_failed", 0)
+        batches_processed = batches_done + batches_failed
+        total           = meta.get("total", 0)
+
+        # Count merchants processed by reading per-batch sizes from metadata
+        merchants_done = 0
+        for b in meta.get("batches", []):
+            if b.get("status") in ("done", "failed"):
+                merchants_done += b.get("size", BATCH_SIZE)
+        # Cap at total in case of rounding
+        merchants_done = min(merchants_done, total)
+
         result.append({
-            "job_id":         job_dir.name,
-            "status":         meta.get("status"),
-            "total":          meta.get("total", 0),
-            "batches_total":  total,
-            "batches_done":   meta.get("batches_done", 0),
-            "batches_failed": meta.get("batches_failed", 0),
-            "progress_pct":   round(processed / total * 100, 1) if total else 0.0,
-            "started_at":     meta.get("started_at"),
-            "finished_at":    meta.get("finished_at"),
-            "download_url":   f"/merchant-download/{job_dir.name}" if meta.get("status") == "done" else None,
+            "job_id":             job_dir.name,
+            "status":             meta.get("status"),
+            "total_merchants":    total,
+            "merchants_done":     merchants_done,
+            "merchants_remaining": max(0, total - merchants_done),
+            "batches_total":      batches_total,
+            "batches_done":       batches_done,
+            "batches_failed":     batches_failed,
+            "progress_pct":       round(merchants_done / total * 100, 1) if total else 0.0,
+            "started_at":         meta.get("started_at"),
+            "finished_at":        meta.get("finished_at"),
+            "download_url":       f"/merchant-download/{job_dir.name}" if meta.get("status") == "done" else None,
         })
     return result
