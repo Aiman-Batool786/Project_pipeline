@@ -48,7 +48,8 @@ from merchant_scraper import (
     parse_merchant_csv,
     start_bulk_job,
     get_job_status,
-    build_output_csv,
+    get_output_path,
+    list_all_jobs,
 )
 
 logging.basicConfig(
@@ -968,12 +969,17 @@ def merchant_download(job_id: str):
             status_code=202,
             detail=(
                 f"Job not complete yet — status: {job['status']} "
-                f"({job.get('done', 0)}/{job.get('total', 0)} done). "
+                f"({job.get('batches_done', 0)}/{job.get('batches_total', 0)} batches done). "
                 f"Retry when status = 'done'."
             ),
         )
 
-    csv_bytes = build_output_csv(job.get("results", []))
+    # Read from disk — never held in memory
+    out_path = get_output_path(job_id)
+    if not out_path:
+        raise HTTPException(status_code=404, detail="Output file not found on disk")
+
+    csv_bytes = out_path.read_bytes()
     filename  = f"merchants_{job_id[:8]}.csv"
 
     return FastAPIResponse(
@@ -985,22 +991,11 @@ def merchant_download(job_id: str):
 
 @app.get("/merchant-jobs", tags=["Merchant Bulk"])
 def list_merchant_jobs():
-    """List all merchant bulk jobs and their current status."""
-    from merchant_scraper import _jobs, _jobs_lock
-    with _jobs_lock:
-        summary = []
-        for jid, job in _jobs.items():
-            total = job.get("total", 0)
-            done  = job.get("done", 0)
-            summary.append({
-                "job_id":       jid,
-                "status":       job.get("status"),
-                "total":        total,
-                "done":         done,
-                "progress_pct": round(done / total * 100, 1) if total else 0.0,
-                "download_url": f"/merchant-download/{jid}" if job.get("status") == "done" else None,
-            })
-    return {"jobs": summary, "count": len(summary)}
+    """
+    List all merchant bulk jobs — reads from disk, survives server restart.
+    Shows progress per job including batch-level breakdown.
+    """
+    return {"jobs": list_all_jobs(), "count": len(list_all_jobs())}
 
 
 # RELOAD FILTERS
