@@ -976,6 +976,100 @@ def list_merchant_jobs():
     """
     jobs = list_all_jobs()
     return {"jobs": jobs, "count": len(jobs)}
+# =============================================================================
+# merchant single id
+# =============================================================================
+
+@app.post("/merchant-debug", tags=["Merchant Debug"])
+def merchant_debug(req: dict):
+    """
+    DEBUG ENDPOINT (single merchant test)
+
+    Input:
+    {
+      "merchant_id": "1104990029"
+    }
+
+    Purpose:
+    - Test ONE merchant scraping
+    - Returns raw total_items + full debug info
+    - Does NOT run batch system
+    """
+
+    merchant_id = req.get("merchant_id")
+
+    if not merchant_id or not str(merchant_id).isdigit():
+        raise HTTPException(status_code=400, detail="merchant_id must be numeric")
+
+    try:
+        from camoufox.sync_api import Camoufox
+        from merchant_scraper import (
+            STORE_URL_TEMPLATE,
+            _extract_item_count_from_html
+        )
+        import random
+        import time
+
+        url = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
+        ua = random.choice([
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+        ])
+
+        with Camoufox(headless=True, os="windows") as browser:
+            ctx = browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                locale="en-US",
+                user_agent=ua,
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+
+            page = ctx.new_page()
+
+            start = time.time()
+
+            page.goto(url, timeout=45000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+
+            html = page.content()
+            lower = html.lower()
+
+            # Detect blocking
+            blocked = any(k in lower for k in [
+                "captcha", "robot", "verify you are human",
+                "access denied", "blocked"
+            ])
+
+            count = _extract_item_count_from_html(html)
+
+            end = time.time()
+
+            return {
+                "success": True,
+                "merchant_id": merchant_id,
+                "url": url,
+                "total_items": count,
+                "status": "BLOCKED" if blocked else "OK",
+                "debug": {
+                    "page_loaded": True,
+                    "html_size": len(html),
+                    "blocked_detected": blocked,
+                    "selector_used": "auto-extract",
+                    "load_time_sec": round(end - start, 2),
+                    "final_url": page.url
+                }
+            }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "merchant_id": merchant_id,
+            "error": str(e),
+            "status": "FAILED",
+            "debug": {
+                "page_loaded": False
+            }
+        }
+
 
 
 # =============================================================================
