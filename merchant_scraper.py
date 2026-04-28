@@ -1,24 +1,22 @@
 """
-merchant_scraper.py
-────────────────────
-Bulk Merchant ID processor for AliExpress store pages.
+merchant_scraper.py — Batch-Safe Bulk Processor
+─────────────────────────────────────────────────
+Design:
+  Splits merchants into batches of 100 → processes each batch with 5 threads
+  → writes batch CSV to disk immediately → never loses data on crash.
 
-Workflow:
-  1. Read MerchantID column from uploaded CSV
-  2. Build store URL for each ID
-  3. Visit each store page with Camoufox and extract total item count
-  4. Write results to output CSV (MerchantID, TotalItems, Error)
-  5. Support batch concurrency (5–10 at once), 3 retries, random delays
-
-Store URL template:
-  https://www.aliexpress.com/store/{merchantId}/pages/all-items.html?shop_sortType=bestmatch_sort
-
-Item count selector:
-  <span data-spm-anchor-id="a2g0o.store_pc_allItems_or_groupList...">32 items</span>
+File layout:
+  ./merchant_jobs/{job_id}/
+      metadata.json       ← job config + per-batch statuses
+      batch_0000.csv      ← results saved after batch 0 done
+      batch_0001.csv      ← results saved after batch 1 done
+      ...
+      output.csv          ← merged final CSV (written when all batches done)
 """
 
 import re
 import csv
+import json
 import time
 import random
 import logging
@@ -27,6 +25,7 @@ import io
 from pathlib import Path
 from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 from camoufox.sync_api import Camoufox
 
@@ -41,11 +40,13 @@ STORE_URL_TEMPLATE = (
     "?shop_sortType=bestmatch_sort"
 )
 
-MAX_RETRIES       = 3
-CONCURRENCY       = 5          # parallel browser threads
-PAGE_TIMEOUT      = 45_000     # ms
-DELAY_MIN         = 1.5        # seconds between batches
-DELAY_MAX         = 3.5
+BATCH_SIZE   = 100
+CONCURRENCY  = 5
+MAX_RETRIES  = 3
+PAGE_TIMEOUT = 45_000
+DELAY_MIN    = 1.5
+DELAY_MAX    = 3.5
+JOBS_DIR     = Path("./merchant_jobs")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -54,31 +55,55 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 ]
+
+# Lightweight in-memory registry — only status counts, NOT results
+_jobs: Dict[str, Dict] = {}
+_jobs_lock = threading.Lock()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DISK HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _job_dir(job_id: str) -> Path:
+    d = JOBS_DIR / job_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _metadata_path(job_id: str) -> Path:
+    return _job_dir(job_id) / "metadata.json"
+
+def _batch_path(job_id: str, batch_idx: int) -> Path:
+    return _job_dir(job_id) / f"batch_{batch_idx:04d}.csv"
+
+def _output_path(job_id: str) -> Path:
+    return _job_dir(job_id) / "output.csv"
+
+def _save_metadata(job_id: str, meta: dict) -> None:
+    with open(_metadata_path(job_id), "w") as f:
+        json.dump(meta, f, indent=2)
+
+def _load_metadata(job_id: str) -> Optional[dict]:
+    path = _metadata_path(job_id)
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CSV PARSING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_merchant_csv(file_bytes: bytes) -> List[str]:
-    """
-    Read CSV bytes and return list of MerchantID strings.
-    Accepts column names: MerchantID, merchantid, merchant_id, ID, id (case-insensitive).
-    Skips blank rows and non-numeric IDs.
-    """
-    # utf-8-sig automatically strips the Excel BOM (\ufeff) if present
-    text    = file_bytes.decode("utf-8-sig", errors="replace")
-    reader  = csv.DictReader(io.StringIO(text))
-    # Normalise headers: strip whitespace + BOM just in case
+    """Read CSV bytes, strip Excel BOM, return list of merchant IDs."""
+    text        = file_bytes.decode("utf-8-sig", errors="replace")
+    reader      = csv.DictReader(io.StringIO(text))
     raw_headers = reader.fieldnames or []
-    headers = [h.strip().lstrip("\ufeff").lower() for h in raw_headers]
+    headers     = [h.strip().lstrip("\ufeff").lower() for h in raw_headers]
+    header_map  = {h.strip().lstrip("\ufeff").lower(): h for h in raw_headers}
 
-    # Map normalised header → original header for DictReader lookup
-    header_map = {h.strip().lstrip("\ufeff").lower(): h for h in raw_headers}
-
-    # Find which column holds merchant IDs
     id_col_norm = None
     for candidate in ["merchantid", "merchant_id", "merchant id", "id", "store_id", "storeid"]:
         if candidate in headers:
@@ -86,20 +111,16 @@ def parse_merchant_csv(file_bytes: bytes) -> List[str]:
             break
 
     if id_col_norm is None:
-        raise ValueError(
-            f"CSV must have a 'MerchantID' column. Found: {raw_headers}"
-        )
+        raise ValueError(f"CSV must have a 'MerchantID' column. Found: {raw_headers}")
 
-    # Get the original column name for DictReader
     id_col = header_map[id_col_norm]
-
     ids = []
     for row in reader:
         raw = str(row.get(id_col, "") or "").strip()
         if raw and re.match(r"^\d+$", raw):
             ids.append(raw)
 
-    logger.info(f"[merchant_scraper] Parsed {len(ids)} valid merchant IDs from CSV")
+    logger.info(f"[merchant_scraper] Parsed {len(ids)} merchant IDs")
     return ids
 
 
@@ -108,17 +129,7 @@ def parse_merchant_csv(file_bytes: bytes) -> List[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_item_count_from_html(html: str) -> Optional[int]:
-    """
-    Extract item count from saved HTML using regex.
-
-    Targets:
-      <span data-spm-anchor-id="a2g0o.store_pc_allItems_or_groupList...">32 items</span>
-
-    Fallbacks:
-      - Any "N items" pattern near store context
-      - "totalProducts" or "itemCount" in inline JSON
-    """
-    # Primary: spm anchor ID for store all-items count
+    # Primary: confirmed spm anchor selector
     m = re.search(
         r'data-spm-anchor-id="[^"]*store_pc_allItems[^"]*"[^>]*>\s*(\d[\d,]*)\s*items?',
         html, re.IGNORECASE
@@ -126,8 +137,7 @@ def _extract_item_count_from_html(html: str) -> Optional[int]:
     if m:
         return int(m.group(1).replace(",", ""))
 
-    # Secondary: any span/div containing "N items" near store page context
-    # Only match if it's near a store-related class
+    # Secondary: store context
     m2 = re.search(
         r'(?:store|allItems|groupList)[^>]*>[^<]*?(\d[\d,]+)\s*items?',
         html, re.IGNORECASE
@@ -135,16 +145,15 @@ def _extract_item_count_from_html(html: str) -> Optional[int]:
     if m2:
         return int(m2.group(1).replace(",", ""))
 
-    # Broader: any "N items" text (use only if no other match)
+    # Broad: largest "N items" in page
     all_matches = re.findall(r'\b(\d[\d,]*)\s+items?\b', html, re.IGNORECASE)
     if all_matches:
-        # Return the largest sensible value (avoid "1 items" noise)
         nums = [int(x.replace(",", "")) for x in all_matches]
-        candidate = max(nums)
-        if candidate > 0:
-            return candidate
+        c = max(nums)
+        if c > 0:
+            return c
 
-    # JSON fallback: "totalProducts" or "itemCount"
+    # JSON fallback
     m3 = re.search(r'"(?:totalProducts|itemCount|totalItems)"\s*:\s*(\d+)', html)
     if m3:
         return int(m3.group(1))
@@ -157,208 +166,274 @@ def _extract_item_count_from_html(html: str) -> Optional[int]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_merchant(merchant_id: str) -> Dict:
-    """
-    Visit the store page for one merchant ID and return:
-      { merchant_id, total_items, error }
-
-    Retries up to MAX_RETRIES times with exponential back-off.
-    """
     url = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            logger.info(f"[merchant] {merchant_id} — attempt {attempt}/{MAX_RETRIES} → {url}")
-
             ua = random.choice(USER_AGENTS)
-
             with Camoufox(headless=True, os="windows") as browser:
-                context = browser.new_context(
+                ctx  = browser.new_context(
                     viewport={"width": 1440, "height": 900},
                     locale="en-US",
                     user_agent=ua,
                     extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
                 )
-                page = context.new_page()
-
+                page = ctx.new_page()
                 try:
                     page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
                 except Exception as nav_err:
-                    err_str = str(nav_err)
-                    if "ERR_NAME_NOT_RESOLVED" in err_str or "NS_ERROR" in err_str:
-                        return {
-                            "merchant_id":  merchant_id,
-                            "total_items":  None,
-                            "error":        "Page Not Found",
-                        }
+                    if any(x in str(nav_err) for x in ["ERR_NAME_NOT_RESOLVED", "NS_ERROR"]):
+                        return {"merchant_id": merchant_id, "total_items": None, "error": "Page Not Found"}
                     raise
 
-                # Short wait for JS to render item count
-                page.wait_for_timeout(random.randint(3000, 5000))
-
-                # Scroll to trigger lazy loading of the item count span
+                page.wait_for_timeout(random.randint(2500, 4500))
                 for _ in range(2):
                     page.mouse.wheel(0, 600)
-                    page.wait_for_timeout(500)
+                    page.wait_for_timeout(400)
 
                 html = page.content()
                 page.close()
-                context.close()
+                ctx.close()
 
-            # Detect blocked / CAPTCHA pages
-            lower_html = html.lower()
-            if any(k in lower_html for k in ["captcha", "robot", "verify you are human",
-                                               "access denied", "blocked"]):
-                logger.warning(f"[merchant] {merchant_id} — blocked/CAPTCHA on attempt {attempt}")
+            lower = html.lower()
+            if any(k in lower for k in ["captcha", "robot", "verify you are human", "access denied", "blocked"]):
                 if attempt < MAX_RETRIES:
                     time.sleep(random.uniform(5, 12))
                     continue
                 return {"merchant_id": merchant_id, "total_items": None, "error": "Blocked"}
 
-            # Detect 404 / invalid store
-            if any(k in lower_html for k in ["page not found", "store not found",
-                                              "404", "doesn't exist"]):
-                return {
-                    "merchant_id":  merchant_id,
-                    "total_items":  None,
-                    "error":        "Invalid Merchant",
-                }
+            if any(k in lower for k in ["page not found", "store not found", "doesn't exist"]):
+                return {"merchant_id": merchant_id, "total_items": None, "error": "Invalid Merchant"}
 
             count = _extract_item_count_from_html(html)
-
             if count is None:
-                logger.warning(f"[merchant] {merchant_id} — selector missing (attempt {attempt})")
                 if attempt < MAX_RETRIES:
                     time.sleep(random.uniform(3, 7))
                     continue
-                return {
-                    "merchant_id":  merchant_id,
-                    "total_items":  None,
-                    "error":        "Selector Missing",
-                }
+                return {"merchant_id": merchant_id, "total_items": None, "error": "Selector Missing"}
 
-            logger.info(f"[merchant] {merchant_id} — ✓ {count} items")
+            logger.info(f"[merchant] {merchant_id} ✓ {count} items")
             return {"merchant_id": merchant_id, "total_items": count, "error": ""}
 
         except Exception as exc:
-            err_msg = str(exc)
-            logger.error(f"[merchant] {merchant_id} attempt {attempt} error: {err_msg}")
-
-            # Classify common errors
-            if "timeout" in err_msg.lower():
-                error_label = "Timeout"
-            elif "empty" in err_msg.lower():
-                error_label = "Empty Response"
-            else:
-                error_label = f"Error: {err_msg[:80]}"
-
+            err_str = str(exc)
+            label = "Timeout" if "timeout" in err_str.lower() else f"Error: {err_str[:80]}"
+            logger.error(f"[merchant] {merchant_id} attempt {attempt} — {label}")
             if attempt < MAX_RETRIES:
                 time.sleep(random.uniform(4, 10))
                 continue
-
-            return {"merchant_id": merchant_id, "total_items": None, "error": error_label}
+            return {"merchant_id": merchant_id, "total_items": None, "error": label}
 
     return {"merchant_id": merchant_id, "total_items": None, "error": "Max retries exceeded"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BULK PROCESSOR
+# BATCH WRITER
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Global job registry  {job_id: {"status", "total", "done", "results", "error"}}
-_jobs: Dict[str, Dict] = {}
-_jobs_lock = threading.Lock()
+def _write_batch_csv(job_id: str, batch_idx: int, rows: List[Dict]) -> None:
+    """Write one batch result to its own CSV file. Safe on crash — already on disk."""
+    path = _batch_path(job_id, batch_idx)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["MerchantID", "TotalItems", "Error"])
+        for row in rows:
+            w.writerow([
+                row.get("merchant_id", ""),
+                "" if row.get("total_items") is None else row["total_items"],
+                row.get("error", ""),
+            ])
+    logger.info(f"[job:{job_id}] Batch {batch_idx:04d} → {path.name} ({len(rows)} rows)")
 
 
-def get_job_status(job_id: str) -> Optional[Dict]:
-    with _jobs_lock:
-        return _jobs.get(job_id)
+def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
+    """Merge all batch CSVs → single output.csv."""
+    out_path = _output_path(job_id)
+    with open(out_path, "w", newline="", encoding="utf-8") as out_f:
+        writer = csv.writer(out_f)
+        writer.writerow(["MerchantID", "TotalItems", "Error"])
+        for idx in range(batches_total):
+            bf = _batch_path(job_id, idx)
+            if not bf.exists():
+                continue
+            with open(bf, newline="", encoding="utf-8") as in_f:
+                reader = csv.reader(in_f)
+                next(reader, None)  # skip header
+                for row in reader:
+                    writer.writerow(row)
+    logger.info(f"[job:{job_id}] Merged {batches_total} batches → output.csv")
+    return out_path
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BATCH RUNNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
+    """Process one batch concurrently, write results to disk immediately."""
+    logger.info(f"[job:{job_id}] Batch {batch_idx:04d} start — {len(merchant_ids)} merchants")
+    rows = []
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = {pool.submit(_scrape_merchant, mid): mid for mid in merchant_ids}
+        for future in as_completed(futures):
+            try:
+                row = future.result(timeout=240)
+            except Exception as e:
+                mid = futures[future]
+                row = {"merchant_id": mid, "total_items": None, "error": str(e)[:120]}
+            rows.append(row)
+    _write_batch_csv(job_id, batch_idx, rows)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN JOB RUNNER
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
-    """
-    Background thread: processes all merchant IDs in batches with concurrency.
-    Updates _jobs[job_id] in-place for progress polling.
-    """
-    results: List[Dict] = []
-    total   = len(merchant_ids)
+    batches       = [merchant_ids[i:i + BATCH_SIZE] for i in range(0, len(merchant_ids), BATCH_SIZE)]
+    batches_total = len(batches)
+    total         = len(merchant_ids)
+
+    meta = {
+        "job_id": job_id, "status": "running", "total": total,
+        "batches_total": batches_total, "batches_done": 0, "batches_failed": 0,
+        "started_at": datetime.utcnow().isoformat(), "finished_at": None,
+        "batches": [{"idx": i, "size": len(b), "status": "queued"} for i, b in enumerate(batches)],
+    }
+    _save_metadata(job_id, meta)
 
     with _jobs_lock:
-        _jobs[job_id].update({"status": "running", "total": total, "done": 0, "results": []})
+        _jobs[job_id].update({"status": "running", "total": total,
+                               "batches_total": batches_total, "batches_done": 0, "batches_failed": 0})
 
-    logger.info(f"[job:{job_id}] Starting — {total} merchants | concurrency={CONCURRENCY}")
+    logger.info(f"[job:{job_id}] Start — {total} merchants | {batches_total} batches of {BATCH_SIZE}")
 
-    # Process in batches to keep memory stable
-    batch_size = CONCURRENCY
-    for batch_start in range(0, total, batch_size):
-        batch = merchant_ids[batch_start:batch_start + batch_size]
+    for idx, batch in enumerate(batches):
+        meta["batches"][idx]["status"] = "running"
+        _save_metadata(job_id, meta)
 
-        with ThreadPoolExecutor(max_workers=batch_size) as pool:
-            futures = {pool.submit(_scrape_merchant, mid): mid for mid in batch}
-            for future in as_completed(futures):
-                try:
-                    row = future.result(timeout=240)
-                except Exception as e:
-                    mid = futures[future]
-                    row = {"merchant_id": mid, "total_items": None, "error": str(e)[:120]}
+        try:
+            _run_batch(job_id, idx, batch)
+            meta["batches"][idx]["status"] = "done"
+            meta["batches_done"] += 1
+        except Exception as exc:
+            logger.error(f"[job:{job_id}] Batch {idx:04d} FAILED: {exc}")
+            meta["batches"][idx]["status"] = "failed"
+            meta["batches"][idx]["error"]  = str(exc)[:200]
+            meta["batches_failed"] += 1
 
-                results.append(row)
-                with _jobs_lock:
-                    _jobs[job_id]["done"]    = len(results)
-                    _jobs[job_id]["results"] = results
+        _save_metadata(job_id, meta)
 
-                logger.info(
-                    f"[job:{job_id}] {len(results)}/{total} — "
-                    f"{row['merchant_id']}: {row['total_items']} items | {row['error']}"
-                )
+        with _jobs_lock:
+            if job_id in _jobs:
+                _jobs[job_id]["batches_done"]    = meta["batches_done"]
+                _jobs[job_id]["batches_failed"]  = meta["batches_failed"]
 
-        # Polite delay between batches (not after the last one)
-        if batch_start + batch_size < total:
-            delay = random.uniform(DELAY_MIN, DELAY_MAX)
-            logger.info(f"[job:{job_id}] Batch done. Sleeping {delay:.1f}s…")
-            time.sleep(delay)
+        processed = meta["batches_done"] + meta["batches_failed"]
+        pct       = round(processed / batches_total * 100, 1)
+        merchants_done = min(processed * BATCH_SIZE, total)
+        logger.info(f"[job:{job_id}] {processed}/{batches_total} batches done "
+                    f"({merchants_done}/{total} merchants, {pct}%)")
+
+        if idx < batches_total - 1:
+            time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+
+    # Merge all batch CSVs into one final file
+    try:
+        _merge_batch_csvs(job_id, batches_total)
+    except Exception as e:
+        logger.error(f"[job:{job_id}] Merge failed: {e}")
+
+    meta["status"]      = "done"
+    meta["finished_at"] = datetime.utcnow().isoformat()
+    _save_metadata(job_id, meta)
 
     with _jobs_lock:
-        _jobs[job_id]["status"]  = "done"
-        _jobs[job_id]["results"] = results
+        if job_id in _jobs:
+            _jobs[job_id]["status"] = "done"
 
-    logger.info(f"[job:{job_id}] ✓ Complete — {len(results)} merchants processed")
+    logger.info(f"[job:{job_id}] ✓ Complete — "
+                f"{meta['batches_done']} ok | {meta['batches_failed']} failed")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC API
+# ─────────────────────────────────────────────────────────────────────────────
 
 def start_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
     """Launch bulk processing in a background daemon thread."""
     with _jobs_lock:
-        _jobs[job_id] = {
-            "status":  "queued",
-            "total":   len(merchant_ids),
-            "done":    0,
-            "results": [],
-        }
-    t = threading.Thread(
-        target=_run_bulk_job,
-        args=(job_id, merchant_ids),
-        daemon=True,
-        name=f"merchant-job-{job_id}",
-    )
+        _jobs[job_id] = {"status": "queued", "total": len(merchant_ids),
+                         "batches_total": 0, "batches_done": 0, "batches_failed": 0}
+    t = threading.Thread(target=_run_bulk_job, args=(job_id, merchant_ids),
+                         daemon=True, name=f"merchant-{job_id[:8]}")
     t.start()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CSV OUTPUT BUILDER
-# ─────────────────────────────────────────────────────────────────────────────
+def get_job_status(job_id: str) -> Optional[Dict]:
+    """Return status from memory (fast) with batch detail from disk."""
+    with _jobs_lock:
+        mem = dict(_jobs.get(job_id, {}))
 
-def build_output_csv(results: List[Dict]) -> bytes:
-    """
-    Build the output CSV bytes from job results.
+    disk = _load_metadata(job_id)
 
-    Columns: MerchantID, TotalItems, Error
-    """
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["MerchantID", "TotalItems", "Error"])
-    for row in results:
-        writer.writerow([
-            row.get("merchant_id", ""),
-            row.get("total_items", "") if row.get("total_items") is not None else "",
-            row.get("error", ""),
-        ])
-    return buf.getvalue().encode("utf-8")
+    if not mem and not disk:
+        return None
+
+    if disk:
+        total     = disk.get("batches_total", 0)
+        processed = disk.get("batches_done", 0) + disk.get("batches_failed", 0)
+        return {
+            "status":          disk.get("status", mem.get("status", "unknown")),
+            "total":           disk.get("total", 0),
+            "batches_total":   disk.get("batches_total", 0),
+            "batches_done":    disk.get("batches_done", 0),
+            "batches_failed":  disk.get("batches_failed", 0),
+            "progress_pct":    round(processed / total * 100, 1) if total else 0.0,
+            "merchants_done":  min(processed * BATCH_SIZE, disk.get("total", 0)),
+            "started_at":      disk.get("started_at"),
+            "finished_at":     disk.get("finished_at"),
+            "batches":         disk.get("batches", []),
+            "download_ready":  disk.get("status") == "done",
+            "download_url":    f"/merchant-download/{job_id}" if disk.get("status") == "done" else None,
+        }
+
+    return mem
+
+
+def is_job_done(job_id: str) -> bool:
+    meta = _load_metadata(job_id)
+    return meta is not None and meta.get("status") == "done"
+
+
+def get_output_path(job_id: str) -> Optional[Path]:
+    path = _output_path(job_id)
+    return path if path.exists() else None
+
+
+def list_all_jobs() -> List[Dict]:
+    """List all jobs from disk — survives server restart."""
+    result = []
+    if not JOBS_DIR.exists():
+        return result
+    for job_dir in sorted(JOBS_DIR.iterdir(), reverse=True):
+        if not job_dir.is_dir():
+            continue
+        meta = _load_metadata(job_dir.name)
+        if not meta:
+            continue
+        total     = meta.get("batches_total", 0)
+        processed = meta.get("batches_done", 0) + meta.get("batches_failed", 0)
+        result.append({
+            "job_id":         job_dir.name,
+            "status":         meta.get("status"),
+            "total":          meta.get("total", 0),
+            "batches_total":  total,
+            "batches_done":   meta.get("batches_done", 0),
+            "batches_failed": meta.get("batches_failed", 0),
+            "progress_pct":   round(processed / total * 100, 1) if total else 0.0,
+            "started_at":     meta.get("started_at"),
+            "finished_at":    meta.get("finished_at"),
+            "download_url":   f"/merchant-download/{job_dir.name}" if meta.get("status") == "done" else None,
+        })
+    return result
