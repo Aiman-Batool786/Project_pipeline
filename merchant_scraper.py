@@ -235,13 +235,43 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     page.wait_for_timeout(400)
 
                 html = page.content()
+
+                # Detect redirect (AliExpress migrates old store IDs to new ones — normal)
+                redirected_to = None
+                import re as _re2
+                m_redir = _re2.search(r'/store/(\d+)/', page.url)
+                if m_redir and m_redir.group(1) != merchant_id:
+                    redirected_to = m_redir.group(1)
+                    logger.info(
+                        f"[merchant] {merchant_id} redirected to store "
+                        f"{redirected_to} (normal ID migration)"
+                    )
+
                 page.close()
                 ctx.close()
 
             lower = html.lower()
-            if any(k in lower for k in ["captcha", "robot", "verify you are human", "access denied", "blocked"]):
+
+            # ── Precise block detection ───────────────────────────────────────
+            # AliExpress pages ALWAYS contain "robot"/"captcha" in analytics
+            # scripts — those are FALSE POSITIVES on valid pages.
+            # Only flag blocked when a real challenge element is present.
+            real_block_signals = [
+                'id="baxia-punish"',           # AliExpress block page div
+                'class="baxia-dialog"',         # block dialog
+                'nc_iconfont btn_slide',         # slider CAPTCHA widget
+                'grecaptcha',                    # Google reCAPTCHA embed
+                'data-sitekey',                  # reCAPTCHA site key attr
+                'verify you are human',          # explicit user-facing challenge
+                '<title>access denied</title>',  # hard block page title
+                'cf-challenge-running',          # Cloudflare challenge
+            ]
+            is_blocked = any(sig in lower for sig in real_block_signals)
+
+            if is_blocked:
+                logger.warning(f"[merchant] {merchant_id} — real block/CAPTCHA")
                 if attempt < MAX_RETRIES:
-                    time.sleep(random.uniform(5, 12))
+                    time.sleep(random.uniform(8, 15))
                     continue
                 return {"merchant_id": merchant_id, "total_items": None, "error": "Blocked"}
 
@@ -255,8 +285,14 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     continue
                 return {"merchant_id": merchant_id, "total_items": None, "error": "Selector Missing"}
 
-            logger.info(f"[merchant] {merchant_id} ✓ {count} items")
-            return {"merchant_id": merchant_id, "total_items": count, "error": ""}
+            logger.info(f"[merchant] {merchant_id} ✓ {count} items"
+                        + (f" (redirected→{redirected_to})" if redirected_to else ""))
+            return {
+                "merchant_id":   merchant_id,
+                "total_items":   count,
+                "error":         "",
+                "redirected_to": redirected_to,
+            }
 
         except Exception as exc:
             err_str = str(exc)
@@ -279,11 +315,12 @@ def _write_batch_csv(job_id: str, batch_idx: int, rows: List[Dict]) -> None:
     path = _batch_path(job_id, batch_idx)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["MerchantID", "TotalItems", "Error"])
+        w.writerow(["MerchantID", "TotalItems", "RedirectedTo", "Error"])
         for row in rows:
             w.writerow([
                 row.get("merchant_id", ""),
                 "" if row.get("total_items") is None else row["total_items"],
+                row.get("redirected_to") or "",
                 row.get("error", ""),
             ])
     logger.info(f"[job:{job_id}] Batch {batch_idx:04d} → {path.name} ({len(rows)} rows)")
@@ -294,7 +331,7 @@ def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
     out_path = _output_path(job_id)
     with open(out_path, "w", newline="", encoding="utf-8") as out_f:
         writer = csv.writer(out_f)
-        writer.writerow(["MerchantID", "TotalItems", "Error"])
+        writer.writerow(["MerchantID", "TotalItems", "RedirectedTo", "Error"])
         for idx in range(batches_total):
             bf = _batch_path(job_id, idx)
             if not bf.exists():
@@ -303,6 +340,9 @@ def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
                 reader = csv.reader(in_f)
                 next(reader, None)  # skip header
                 for row in reader:
+                    # Pad to 4 columns if old batch has only 3
+                    while len(row) < 4:
+                        row.append("")
                     writer.writerow(row)
     logger.info(f"[job:{job_id}] Merged {batches_total} batches → output.csv")
     return out_path
