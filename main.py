@@ -1003,11 +1003,49 @@ import random as random  # ensure random available in endpoint scope
 # MERCHANT DEBUG ENDPOINT (single ID test — does NOT use batch system)
 # =============================================================================
 
-class MerchantDebugRequest(BaseModel):
-    merchant_id: str
+# =============================================================================
+# MERCHANT DEBUG ENDPOINT  v3.1
+# FIXED: uses page.evaluate() on live DOM — NOT regex on page.content().
+# page.content() returns the JS skeleton only; "items" will never appear in it.
+# =============================================================================
 
-    class Config:
-        json_schema_extra = {"example": {"merchant_id": "1104990029"}}
+# ── JS extractor (same string used by _scrape_merchant in merchant_scraper.py)
+_DEBUG_JS_EXTRACT = """() => {
+    // Collect ALL matching elements and their text for diagnosis
+    const results = [];
+
+    // Method 1 — exact spm anchor substring match (most reliable)
+    document.querySelectorAll('span[data-spm-anchor-id*="store_pc_allItems_or_groupList"]')
+        .forEach(el => results.push({method:'anchor_exact', text: el.textContent.trim(),
+                                      anchor: el.getAttribute('data-spm-anchor-id')}));
+
+    // Method 2 — broader store_pc_allItems
+    document.querySelectorAll('span[data-spm-anchor-id*="store_pc_allItems"]')
+        .forEach(el => results.push({method:'anchor_broad', text: el.textContent.trim(),
+                                      anchor: el.getAttribute('data-spm-anchor-id')}));
+
+    // Method 3 — any span whose full text is "N items"
+    document.querySelectorAll('span').forEach(el => {
+        const t = el.textContent.trim();
+        if (/^\\d[\\d,]*\\s+items?$/i.test(t))
+            results.push({method:'span_full_text', text: t, anchor: el.getAttribute('data-spm-anchor-id') || ''});
+    });
+
+    // Method 4 — SSR JSON blobs in script tags
+    document.querySelectorAll('script').forEach(s => {
+        const m = (s.textContent||'').match(/"(?:totalProducts|itemCount|totalItems|storeItemCount)"\\s*:\\s*(\\d+)/);
+        if (m) results.push({method:'script_json', text: m[1]+' items', anchor:''});
+    });
+
+    // Deduplicate and pick first numeric match
+    let count = null;
+    for (const r of results) {
+        const m = r.text.match(/(\\d[\\d,]*)\\s+items?/i);
+        if (m && count === null) count = parseInt(m[1].replace(/,/g,''), 10);
+    }
+
+    return {count, candidates: results.slice(0, 10)};
+}"""
 
 
 @app.post("/merchant-debug", tags=["Merchant Bulk"])
@@ -1015,42 +1053,47 @@ def merchant_debug(req: MerchantDebugRequest):
     """
     DEBUG — scrape ONE merchant and return full diagnostic info.
 
-    Use this to verify the selector and detect Blocked/Selector Missing issues.
-    Does NOT use the batch system. Runs synchronously and returns immediately.
+    v3.1 FIX: extracts item count via page.evaluate() against the live
+    rendered DOM, NOT via regex on page.content() (which only contains the
+    JS skeleton — the word 'items' will never appear in it).
 
     Input:  { "merchant_id": "1104990029" }
     """
-    from merchant_scraper import (
-        STORE_URL_TEMPLATE,
-        _extract_item_count_from_html,
-        USER_AGENTS,
-        PAGE_TIMEOUT,
-    )
-    from camoufox.sync_api import Camoufox
     import time as _time
-    import re as _re
+    from camoufox.sync_api import Camoufox
+    from merchant_scraper import STORE_URL_TEMPLATE, USER_AGENTS, PAGE_TIMEOUT
 
     merchant_id = str(req.merchant_id).strip()
     if not merchant_id.isdigit():
         raise HTTPException(status_code=400, detail="merchant_id must be numeric")
 
-    url   = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
-    ua    = random.choice(USER_AGENTS)
-    t0    = _time.time()
+    url = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
+    ua  = random.choice(USER_AGENTS)
+    t0  = _time.time()
+
     debug = {
-        "url": url, "page_loaded": False, "final_url": None,
-        "html_size_bytes": 0, "blocked": False,
-        "selector_hit": None, "load_time_sec": None, "nav_error": None,
+        "url": url,
+        "page_loaded": False,
+        "final_url": None,
+        "html_size_bytes": 0,
+        "blocked": False,
+        "js_candidates": [],      # what the live DOM found
+        "selector_hit": None,
+        "load_time_sec": None,
+        "nav_error": None,
     }
 
     try:
         with Camoufox(headless=True, os="windows") as browser:
-            ctx  = browser.new_context(
-                viewport={"width": 1440, "height": 900}, locale="en-US",
-                user_agent=ua, extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            ctx = browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                locale="en-US",
+                user_agent=ua,
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             )
             page = ctx.new_page()
 
+            # ── Navigate ────────────────────────────────────────────────────
             try:
                 page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
                 debug["page_loaded"] = True
@@ -1059,113 +1102,102 @@ def merchant_debug(req: MerchantDebugRequest):
                 debug["nav_error"] = es[:200]
                 if "NS_BINDING_ABORTED" in es or "ERR_ABORTED" in es:
                     debug["page_loaded"] = True
-                    debug["nav_error"]   = "Redirect — attempting extraction anyway"
+                    debug["nav_error"]   = "Redirect mid-load — continuing"
                 elif any(x in es for x in ["ERR_NAME_NOT_RESOLVED", "NS_ERROR"]):
+                    page.close(); ctx.close()
                     return {"success": False, "merchant_id": merchant_id,
                             "total_items": None, "error": "Page Not Found", "debug": debug}
                 else:
+                    page.close(); ctx.close()
                     return {"success": False, "merchant_id": merchant_id,
                             "total_items": None, "error": f"Nav error: {es[:150]}", "debug": debug}
 
-            # Wait for item span explicitly
+            # ── Wait for JS-rendered item count span ─────────────────────────
             try:
                 page.wait_for_selector(
-                    'span[data-spm-anchor-id*="store_pc_allItems"]', timeout=8000
+                    'span[data-spm-anchor-id*="store_pc_allItems"]',
+                    timeout=10_000,
                 )
-                debug["selector_hit"] = "playwright_selector_found"
+                debug["selector_hit"] = "wait_for_selector_succeeded"
             except Exception:
-                page.wait_for_timeout(4000)
+                # Selector not visible within 10 s — give JS more time
+                page.wait_for_timeout(5_000)
+                debug["selector_hit"] = "wait_for_selector_timed_out_used_fallback_wait"
 
-            page.wait_for_timeout(2000)
-            for _ in range(2):
+            # Extra buffer + scroll to trigger any lazy-loaded sections
+            page.wait_for_timeout(2_000)
+            for _ in range(3):
                 page.mouse.wheel(0, 600)
                 page.wait_for_timeout(400)
+            page.wait_for_timeout(1_000)
 
-            html = page.content()
+            # ── PRIMARY EXTRACTION: live DOM via JS ──────────────────────────
+            # MUST run before page.close().
+            # page.content() returns only the skeleton HTML — JS-rendered
+            # elements like the item count span are NOT in it.
+            js_result = page.evaluate(_DEBUG_JS_EXTRACT)
+            js_count      = js_result.get("count")
+            js_candidates = js_result.get("candidates", [])
+
+            debug["js_candidates"]   = js_candidates
             debug["final_url"]       = page.url
-            debug["html_size_bytes"] = len(html)
             debug["load_time_sec"]   = round(_time.time() - t0, 2)
+
+            # ── Grab raw HTML only for block detection ───────────────────────
+            html  = page.content()
+            debug["html_size_bytes"] = len(html)
+            lower = html.lower()
+
             page.close()
             ctx.close()
 
-        lower = html.lower()
-
-        # Precise block detection — NOT keyword scan (false positives on every valid page)
-        real_block_signals = [
-            'id="baxia-punish"', 'class="baxia-dialog"', 'nc_iconfont btn_slide',
-            'grecaptcha', 'data-sitekey', 'verify you are human',
-            '<title>access denied</title>', 'cf-challenge-running',
-        ]
-        debug["blocked"] = any(sig in lower for sig in real_block_signals)
-
-        # Detect redirect (AliExpress migrates old store IDs — not a block)
-        import re as _re2
-        m_redir = _re2.search(r'/store/(\d+)/', debug.get("final_url", ""))
+        # ── Redirect detection ───────────────────────────────────────────────
+        import re as _re
+        m_redir = _re.search(r'/store/(\d+)/', debug["final_url"] or "")
         if m_redir and m_redir.group(1) != merchant_id:
             debug["redirected_to"] = m_redir.group(1)
-            debug["note"] = f"Store {merchant_id} migrated to {m_redir.group(1)} — extracting from redirected page"
+            debug["note"] = (
+                f"Store {merchant_id} migrated → {m_redir.group(1)} "
+                f"(normal AliExpress ID migration)"
+            )
+
+        # ── Precise block detection ──────────────────────────────────────────
+        real_block_signals = [
+            'id="baxia-punish"', 'class="baxia-dialog"',
+            'nc_iconfont btn_slide', 'grecaptcha', 'data-sitekey',
+            'verify you are human', '<title>access denied</title>',
+            'cf-challenge-running',
+        ]
+        debug["blocked"] = any(sig in lower for sig in real_block_signals)
 
         if debug["blocked"]:
             return {"success": False, "merchant_id": merchant_id,
                     "total_items": None, "error": "Blocked/CAPTCHA", "debug": debug}
 
-        # Try selectors one by one for diagnosis
-        count = None
+        if js_count is not None:
+            return {
+                "success":     True,
+                "merchant_id": merchant_id,
+                "total_items": js_count,
+                "error":       None,
+                "debug":       debug,
+            }
 
-        m = _re.search(
-            r'data-spm-anchor-id="[^"]*store_pc_allItems_or_groupList[^"]*"[^>]*>\s*(\d[\d,]*)\s*items?',
-            html, _re.IGNORECASE
-        )
-        if m:
-            count = int(m.group(1).replace(",", ""))
-            debug["selector_hit"] = "store_pc_allItems_or_groupList"
-        
-        if count is None:
-            m = _re.search(
-                r'data-spm-anchor-id="[^"]*store_pc_allItems[^"]*"[^>]*>\s*(\d[\d,]*)\s*items?',
-                html, _re.IGNORECASE
-            )
-            if m:
-                count = int(m.group(1).replace(",", ""))
-                debug["selector_hit"] = "store_pc_allItems"
-
-        if count is None:
-            m = _re.search(
-                r'<span[^>]+font-size:\s*1[0-9]px[^>]*>\s*(\d[\d,]+)\s*items?\s*</span>',
-                html, _re.IGNORECASE
-            )
-            if m:
-                count = int(m.group(1).replace(",", ""))
-                debug["selector_hit"] = "span_font_size_style"
-
-        if count is None:
-            all_m = _re.findall(r'\b(\d[\d,]+)\s+items?\b', html, _re.IGNORECASE)
-            if all_m:
-                nums  = [int(x.replace(",", "")) for x in all_m if int(x.replace(",", "")) > 0]
-                if nums:
-                    count = max(nums)
-                    debug["selector_hit"] = f"broad_scan:{all_m[:5]}"
-
-        # HTML snippet near "items" for manual inspection
-        idx = lower.find("items")
-        debug["html_snippet"] = (
-            html[max(0, idx - 150): idx + 60].replace("\n", " ").strip()
-            if idx != -1 else "NOT FOUND"
-        )
-
-        if count is None:
-            return {"success": False, "merchant_id": merchant_id,
-                    "total_items": None, "error": "Selector Missing",
-                    "debug": debug}
-
-        return {"success": True, "merchant_id": merchant_id,
-                "total_items": count, "error": None, "debug": debug}
+        # ── No count found anywhere ──────────────────────────────────────────
+        # Add a raw HTML excerpt for further diagnosis
+        debug["html_head_500"] = html[:500].replace("\n", " ")
+        return {
+            "success":     False,
+            "merchant_id": merchant_id,
+            "total_items": None,
+            "error":       "Selector Missing — see debug.js_candidates for live DOM state",
+            "debug":       debug,
+        }
 
     except Exception as exc:
         debug["load_time_sec"] = round(_time.time() - t0, 2)
         return {"success": False, "merchant_id": merchant_id,
                 "total_items": None, "error": str(exc)[:300], "debug": debug}
-
 
 
 # RELOAD FILTERS
