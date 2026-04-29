@@ -19,14 +19,6 @@ Key changes vs v2.8:
     • Accepted response includes both original_title and enhanced_title
     • Rejected response: { status:"rejected",
                            reason:"Title has restricted keyword" }
-
-  Merchant Bulk (v2):
-    • Batch-safe: results written to disk per batch — no data loss on crash
-    • Browser reuse: one browser per worker chunk (20 merchants per session)
-    • BATCH_SIZE=50, CONCURRENCY=8 for faster 2000+ merchant processing
-    • /merchant-job-status: reads from disk, survives server restart
-    • /merchant-download: streams from disk file, never held in memory
-    • /merchant-jobs: lists all jobs from disk
   ─────────────────────────────────────────────────────────────────────────
 """
 
@@ -50,7 +42,7 @@ from product_filter import (
 
 # ── Merchant bulk processing ──────────────────────────────────────────────────
 import uuid
-from fastapi import UploadFile, File
+from fastapi import UploadFile, File, BackgroundTasks
 from fastapi.responses import Response as FastAPIResponse
 from merchant_scraper import (
     parse_merchant_csv,
@@ -117,6 +109,7 @@ class BulkProductRequest(BaseModel):
 class SearchScrapeRequest(BaseModel):
     """
     Request body for POST /scrape-products.
+
     Scrapes up to max_pages (default 5) of AliExpress search results.
     ALL products are returned — both accepted and keyword-restricted ones.
     """
@@ -134,16 +127,6 @@ class SearchScrapeRequest(BaseModel):
                 "max_pages": 5,
                 "delay_between_requests": 1.0
             }
-        }
-
-
-class MerchantIDsRequest(BaseModel):
-    """JSON-body alternative to CSV upload — send IDs directly."""
-    merchant_ids: List[str]
-
-    class Config:
-        json_schema_extra = {
-            "example": {"merchant_ids": ["1103833861", "912519001", "567839201"]}
         }
 
 
@@ -182,41 +165,29 @@ def root():
         "service": "Octopia Template Pipeline",
         "version": "2.9.0",
         "endpoints": {
-            "POST /scrape-products":      "Search scraping — 5 pages, ALL products",
-            "POST /generate-product":     "Single product full pipeline + filtering",
-            "POST /generate-products":    "Bulk product pipeline + filtering (max 20)",
-            "GET  /product-info/{id}":    "Product by AliExpress ID (EUR currency)",
-            "POST /upload-csv":           "Upload MerchantID CSV → start bulk job",
-            "POST /submit-merchant-ids":  "Submit merchant IDs as JSON → start bulk job",
-            "GET  /merchant-job-status/{job_id}": "Poll job progress",
-            "GET  /merchant-download/{job_id}":   "Download result CSV",
-            "GET  /merchant-jobs":        "List all merchant jobs",
-            "POST /reload-filters":       "Hot-reload filter data from DB",
-        },
-        "merchant_bulk": {
-            "batch_size":           50,
-            "concurrency":          8,
-            "merchants_per_browser": 20,
-            "storage":              "disk (./merchant_jobs/) — crash-safe",
+            "POST /scrape-products":   "Search scraping — 5 pages, ALL products (accepted + restricted)",
+            "POST /generate-product":  "Single product full pipeline + filtering",
+            "POST /generate-products": "Bulk product pipeline + filtering (max 20)",
+            "POST /reload-filters":    "Hot-reload filter data from DB",
         },
         "scraping_rules": {
-            "max_pages":     5,
-            "pagination":    "Direct URL navigation — never stops early",
-            "deduplication": True,
+            "max_pages":      5,
+            "pagination":     "Direct URL navigation — never stops early",
+            "deduplication":  True,
         },
         "filter_rules": {
             "keyword_filter": {
-                "field":  "ORIGINAL title only",
-                "method": "partial case-insensitive match",
+                "field":   "ORIGINAL title only",
+                "method":  "partial case-insensitive match",
             },
             "category_confidence": {
                 "accept_threshold": "≥ 0.75",
                 "reject_below":     "< 0.75 → set Uncategorized",
             },
             "category_embedding": {
-                "block":  "> 0.85",
-                "review": "0.60–0.85",
-                "allow":  "< 0.60",
+                "block":   "> 0.85",
+                "review":  "0.60–0.85",
+                "allow":   "< 0.60",
             },
         },
     }
@@ -337,10 +308,10 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
         specs_enhanced = enhanced.get("specifications_enhanced", {})
         insert_enhanced_specifications(product_id, specs_enhanced)
 
-        enriched_data                     = scraped_data.copy()
-        enriched_data['title']            = enhanced_title
-        enriched_data['description']      = enhanced.get('description', description)
-        enriched_data['bullet_points']    = enhanced.get('bullet_points', [])
+        enriched_data                   = scraped_data.copy()
+        enriched_data['title']          = enhanced_title
+        enriched_data['description']    = enhanced.get('description', description)
+        enriched_data['bullet_points']  = enhanced.get('bullet_points', [])
         enriched_data['html_description'] = enhanced.get('html_description', '')
 
         for field in SPEC_FIELDS:
@@ -366,14 +337,11 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
                 "category_leaf": "Unknown", "confidence": 0.0
             }
 
-        # Apply confidence threshold: < 0.75 → Uncategorized
+        # ── Apply confidence threshold: < 0.75 → Uncategorized ──────────
         confidence = float(category.get("confidence", 0.0))
         conf_accepted, conf_reason = validate_category_confidence(confidence)
         if not conf_accepted:
-            logger.info(
-                f"[categorize] Confidence {confidence:.2f} < 0.75 → "
-                f"Uncategorized. {conf_reason}"
-            )
+            logger.info(f"[categorize] Confidence {confidence:.2f} < 0.75 → Uncategorized. {conf_reason}")
             category = {
                 "category_id":   "0",
                 "category_name": "Uncategorized",
@@ -426,14 +394,14 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
             "success":        True,
             "product_id":     product_id,
             "url":            url,
+            # Carry both titles for downstream use
             "original_title": original_title,
             "enhanced_title": enhanced_title,
             "original": {
                 "title":       original_title,
-                "description": (description[:200] + "..." if len(description) > 200
-                                else description),
+                "description": (description[:200] + "..." if len(description) > 200 else description),
                 **{f: scraped_data.get(f, "") for f in SPEC_FIELDS},
-                "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}"))
+                "images":      sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}"))
             },
             "seller":     {f: scraped_data.get(f, "") for f in SELLER_FIELDS},
             "compliance": compliance_data,
@@ -482,14 +450,31 @@ def scrape_search_products(request: SearchScrapeRequest):
     """
     Scrape product IDs, URLs, and ORIGINAL titles from AliExpress search results.
 
-    Output shape (ALL products — accepted and rejected):
-      Restricted: { product_id, product_url, title, rating, sold_count,
-                    status:"rejected", message:"..." }
-      Accepted:   { product_id, product_url, title, rating, sold_count,
-                    status:"accepted" }
+    Scraping rules:
+      • Always scrapes ALL max_pages (default 5) via direct URL navigation
+      • Never stops early — visits every page even without pagination DOM
+      • Deduplication by product_id
 
-    title is ALWAYS the original raw scraped title — never LLM-enhanced.
-    rating < 4.0 → rejected with reason in message field.
+    Output: ALL products with status field:
+
+    RESTRICTED (keyword found in original title):
+      {
+        "product_id":  "...",
+        "product_url": "...",
+        "title":       "<ORIGINAL scraped title>",
+        "status":      "rejected",
+        "message":     "Title not fetched due to restricted keyword"
+      }
+
+    ACCEPTED:
+      {
+        "product_id":  "...",
+        "product_url": "...",
+        "title":       "<ORIGINAL scraped title>",
+        "status":      "accepted"
+      }
+
+    ⚠️  title is ALWAYS the original raw scraped title — never LLM-enhanced.
     """
     if not request.search_url:
         raise HTTPException(status_code=400, detail="search_url is required")
@@ -516,9 +501,10 @@ def scrape_search_products(request: SearchScrapeRequest):
             f"{raw.get('pages_scraped', '?') if isinstance(raw, dict) else '?'} pages"
         )
 
-        result         = []
-        accepted_count = 0
-        rejected_count = 0
+        # Apply keyword filter on original title — return ALL products with status
+        result = []
+        accepted_count  = 0
+        rejected_count  = 0
 
         for p in products:
             if not p.get("product_id"):
@@ -527,6 +513,8 @@ def scrape_search_products(request: SearchScrapeRequest):
             original_title = p.get("title", "")
             is_restricted  = filter_restricted_keywords(original_title)
 
+            # Task 5: Rating filter — reject products with rating < 4.0
+            # (products with no rating from search page are kept and evaluated later)
             product_rating     = p.get("rating", "")
             rating_float       = 0.0
             rating_filter_fail = False
@@ -571,9 +559,7 @@ def scrape_search_products(request: SearchScrapeRequest):
                 })
                 accepted_count += 1
 
-        logger.info(
-            f"   accepted={accepted_count} | rejected={rejected_count} | total={len(result)}"
-        )
+        logger.info(f"   accepted={accepted_count} | rejected={rejected_count} | total={len(result)}")
         return result
 
     except Exception as e:
@@ -590,13 +576,15 @@ def generate_product(req: ProductURLRequest):
     """
     Full pipeline for a single product URL.
 
-    Filter order (on ORIGINAL title):
-      1. Keyword filter (partial match)
+    Filter logic (on ORIGINAL title):
+      1. Keyword filter (partial match on original title)
       2. Category confidence < 0.75 → Uncategorized
       3. Category embedding check on leaf
 
-    Accepted response includes both original_title and enhanced_title
-    plus all 4 detail fields (rating, shipment_country, delivery, remaining_stock).
+    REJECTED response:
+      { "status": "rejected", "reason": "Title has restricted keyword" }
+
+    ACCEPTED response includes both original_title and enhanced_title.
     """
     if not req.url:
         raise HTTPException(status_code=400, detail="URL cannot be empty")
@@ -606,9 +594,11 @@ def generate_product(req: ProductURLRequest):
     if not result.get("success"):
         return result
 
+    # Use the ORIGINAL title for keyword filter (not enhanced)
     original_title = result.get("original_title", "")
     raw_category   = result.get("category")
 
+    # ── Keyword filter on original title ────────────────────────────────
     if filter_restricted_keywords(original_title):
         return {
             "status":         "rejected",
@@ -619,6 +609,7 @@ def generate_product(req: ProductURLRequest):
             "timestamp":      datetime.now().isoformat(),
         }
 
+    # ── Category embedding filter ─────────────────────────────────────
     from product_filter import is_category_restricted
     cat_blocked, cat_reason = is_category_restricted(raw_category)
     if cat_blocked:
@@ -631,25 +622,26 @@ def generate_product(req: ProductURLRequest):
             "timestamp":      datetime.now().isoformat(),
         }
 
+    # ── Accepted ──────────────────────────────────────────────────────
     return {
-        "status":           "accepted",
-        "product_id":       result.get("product_id"),
-        "url":              req.url,
-        "original_title":   original_title,
-        "enhanced_title":   result.get("enhanced_title", ""),
-        "category":         result.get("category", {}).get("name", ""),
-        "confidence":       result.get("category", {}).get("confidence", 0.0),
-        "rating":           result.get("rating", ""),
+        "status":         "accepted",
+        "product_id":     result.get("product_id"),
+        "url":            req.url,
+        "original_title": original_title,
+        "enhanced_title": result.get("enhanced_title", ""),
+        "category":       result.get("category", {}).get("name", ""),
+        "confidence":     result.get("category", {}).get("confidence", 0.0),
+        "rating":         result.get("rating", ""),
         "shipment_country": result.get("shipment_country"),
         "delivery_start":   result.get("delivery_start"),
         "delivery_end":     result.get("delivery_end"),
         "delivery_days":    result.get("delivery_days"),
         "remaining_stock":  result.get("remaining_stock"),
-        "enhanced":         result.get("enhanced", {}),
-        "seller":           result.get("seller", {}),
-        "compliance":       result.get("compliance", {}),
-        "template":         result.get("template", {}),
-        "timestamp":        result.get("timestamp"),
+        "enhanced":       result.get("enhanced", {}),
+        "seller":         result.get("seller", {}),
+        "compliance":     result.get("compliance", {}),
+        "template":       result.get("template", {}),
+        "timestamp":      result.get("timestamp"),
     }
 
 
@@ -659,7 +651,18 @@ def generate_product(req: ProductURLRequest):
 
 @app.post("/generate-products", tags=["Product Processing"])
 def generate_products(req: BulkProductRequest):
-    """Full pipeline for multiple product URLs (max 20)."""
+    """
+    Full pipeline for multiple product URLs (max 20).
+
+    Returns all products with their status and both titles.
+
+    REJECTED:
+      { "status": "rejected", "reason": "...", "original_title": "...", "url": "..." }
+
+    ACCEPTED:
+      { "status": "accepted", "original_title": "...", "enhanced_title": "...",
+        "category": "...", "confidence": ..., ... }
+    """
     if not req.urls:
         raise HTTPException(status_code=400, detail="URLs list cannot be empty")
     if len(req.urls) > 20:
@@ -678,9 +681,9 @@ def generate_products(req: BulkProductRequest):
         if not result.get("success"):
             failed += 1
             results.append({
-                "status":    "error",
-                "url":       url,
-                "reason":    result.get("error", "Unknown error"),
+                "status":  "error",
+                "url":     url,
+                "reason":  result.get("error", "Unknown error"),
                 "timestamp": datetime.now().isoformat(),
             })
             continue
@@ -688,6 +691,7 @@ def generate_products(req: BulkProductRequest):
         original_title = result.get("original_title", "")
         raw_category   = result.get("category")
 
+        # Keyword filter on ORIGINAL title
         if filter_restricted_keywords(original_title):
             rejected += 1
             results.append({
@@ -699,6 +703,7 @@ def generate_products(req: BulkProductRequest):
             })
             continue
 
+        # Category embedding filter
         cat_blocked, cat_reason = is_category_restricted(raw_category)
         if cat_blocked:
             rejected += 1
@@ -711,6 +716,7 @@ def generate_products(req: BulkProductRequest):
             })
             continue
 
+        # Accepted
         successful += 1
         results.append({
             "status":         "accepted",
@@ -745,7 +751,11 @@ def generate_products(req: BulkProductRequest):
 def get_product_info_by_id(product_id: str, extract_compliance: bool = False):
     """
     Full pipeline for a single product by AliExpress product ID.
-    Uses EUR currency URL automatically.
+
+    Always uses EUR currency URL:
+      https://www.aliexpress.com/item/{id}.html?language=en&currency=EUR&gatewayAdapt=pol2glo
+
+    Returns same shape as POST /generate-product (accepted response).
     """
     if not product_id or not product_id.isdigit():
         raise HTTPException(status_code=400, detail="product_id must be numeric")
@@ -762,6 +772,7 @@ def get_product_info_by_id(product_id: str, extract_compliance: bool = False):
 
     original_title = result.get("original_title", "")
 
+    # Keyword filter
     if filter_restricted_keywords(original_title):
         return {
             "status":         "rejected",
@@ -772,6 +783,7 @@ def get_product_info_by_id(product_id: str, extract_compliance: bool = False):
             "timestamp":      datetime.now().isoformat(),
         }
 
+    # Category embedding filter
     from product_filter import is_category_restricted
     cat_blocked, cat_reason = is_category_restricted(result.get("category"))
     if cat_blocked:
@@ -808,8 +820,19 @@ def get_product_info_by_id(product_id: str, extract_compliance: bool = False):
 
 
 # =============================================================================
+# =============================================================================
 # MERCHANT BULK PROCESSING ENDPOINTS
 # =============================================================================
+
+class MerchantIDsRequest(BaseModel):
+    """JSON-body alternative to CSV upload — send IDs directly."""
+    merchant_ids: List[str]
+
+    class Config:
+        json_schema_extra = {
+            "example": {"merchant_ids": ["1103833861", "912519001", "567839201"]}
+        }
+
 
 @app.post("/upload-csv", tags=["Merchant Bulk"])
 async def upload_merchant_csv(file: UploadFile = File(...)):
@@ -823,11 +846,9 @@ async def upload_merchant_csv(file: UploadFile = File(...)):
       1103833861
       912519001
 
-    Processing:
-      • Splits into batches of 50
-      • 8 concurrent workers, each processing 20 merchants per browser session
-      • Results written to disk after each batch — no data loss on crash
-      • Returns job_id immediately — poll /merchant-job-status/{job_id}
+    Returns job_id immediately — processing runs in background.
+    Poll:     GET /merchant-job-status/{job_id}
+    Download: GET /merchant-download/{job_id}
     """
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv files are accepted")
@@ -848,14 +869,13 @@ async def upload_merchant_csv(file: UploadFile = File(...)):
     logger.info(f"[merchant] Job {job_id} queued via CSV — {len(merchant_ids)} merchants")
 
     return {
-        "job_id":         job_id,
-        "merchant_count": len(merchant_ids),
-        "status":         "queued",
-        "poll_url":       f"/merchant-job-status/{job_id}",
-        "download_url":   f"/merchant-download/{job_id}",
+        "job_id":           job_id,
+        "merchant_count":   len(merchant_ids),
+        "status":           "queued",
+        "poll_url":         f"/merchant-job-status/{job_id}",
+        "download_url":     f"/merchant-download/{job_id}",
         "message": (
-            f"Processing {len(merchant_ids)} merchants in background "
-            f"(batches of 50, 8 workers, 20 merchants/browser). "
+            f"Processing {len(merchant_ids)} merchants in background. "
             f"Poll /merchant-job-status/{job_id} to track progress."
         ),
     }
@@ -865,11 +885,14 @@ async def upload_merchant_csv(file: UploadFile = File(...)):
 def submit_merchant_ids(req: MerchantIDsRequest):
     """
     JSON alternative to /upload-csv — no file upload needed.
+    No extra packages required.
 
     Body:
       { "merchant_ids": ["1103833861", "912519001"] }
 
-    Same processing as /upload-csv (batches of 50, 8 workers).
+    Returns job_id immediately — processing runs in background.
+    Poll:     GET /merchant-job-status/{job_id}
+    Download: GET /merchant-download/{job_id}
     """
     import re as _re
     clean_ids = [mid.strip() for mid in req.merchant_ids
@@ -883,11 +906,11 @@ def submit_merchant_ids(req: MerchantIDsRequest):
     logger.info(f"[merchant] Job {job_id} queued via JSON — {len(clean_ids)} merchants")
 
     return {
-        "job_id":         job_id,
-        "merchant_count": len(clean_ids),
-        "status":         "queued",
-        "poll_url":       f"/merchant-job-status/{job_id}",
-        "download_url":   f"/merchant-download/{job_id}",
+        "job_id":           job_id,
+        "merchant_count":   len(clean_ids),
+        "status":           "queued",
+        "poll_url":         f"/merchant-job-status/{job_id}",
+        "download_url":     f"/merchant-download/{job_id}",
         "message": (
             f"Processing {len(clean_ids)} merchants in background. "
             f"Poll /merchant-job-status/{job_id} to track progress."
@@ -900,31 +923,32 @@ def merchant_job_status(job_id: str):
     """
     Poll the progress of a merchant bulk job.
 
-    Reads from disk — always accurate, survives server restart.
-
     status: "queued" | "running" | "done"
     """
     job = get_job_status(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
+    total    = job.get("total", 0)
+    done     = job.get("done", 0)
+    progress = round(done / total * 100, 1) if total else 0.0
+    status   = job.get("status", "unknown")
+    results  = job.get("results", [])
+
+    success_count = sum(1 for r in results if r.get("total_items") is not None)
+    error_count   = sum(1 for r in results if r.get("error"))
+
     return {
-        "job_id":              job_id,
-        "status":              job.get("status"),
-        "total_merchants":     job.get("total_merchants", 0),
-        "merchants_done":      job.get("merchants_done", 0),
-        "merchants_remaining": job.get("merchants_remaining", 0),
-        "batches_total":       job.get("batches_total", 0),
-        "batches_done":        job.get("batches_done", 0),
-        "batches_failed":      job.get("batches_failed", 0),
-        "progress_pct":        job.get("progress_pct", 0.0),
-        "config":              job.get("config", {}),
-        "started_at":          job.get("started_at"),
-        "finished_at":         job.get("finished_at"),
-        # Show last 10 batch statuses (not full results — they're on disk)
-        "recent_batches":      (job.get("batches") or [])[-10:],
-        "download_ready":      job.get("download_ready", False),
-        "download_url":        job.get("download_url"),
+        "job_id":         job_id,
+        "status":         status,
+        "total":          total,
+        "done":           done,
+        "progress_pct":   progress,
+        "success_count":  success_count,
+        "error_count":    error_count,
+        "results":        results if status == "done" else results[-20:],
+        "download_ready": status == "done",
+        "download_url":   f"/merchant-download/{job_id}" if status == "done" else None,
     }
 
 
@@ -933,7 +957,6 @@ def merchant_download(job_id: str):
     """
     Download the processed result as a CSV file.
     Only available once job status = "done".
-    Streams from disk — never held in memory.
 
     CSV columns: MerchantID, TotalItems, Error
     """
@@ -942,17 +965,16 @@ def merchant_download(job_id: str):
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
     if job.get("status") != "done":
-        batches_done  = job.get("batches_done", 0)
-        batches_total = job.get("batches_total", 0)
         raise HTTPException(
             status_code=202,
             detail=(
                 f"Job not complete yet — status: {job['status']} "
-                f"({batches_done}/{batches_total} batches done). "
+                f"({job.get('batches_done', 0)}/{job.get('batches_total', 0)} batches done). "
                 f"Retry when status = 'done'."
             ),
         )
 
+    # Read from disk — never held in memory
     out_path = get_output_path(job_id)
     if not out_path:
         raise HTTPException(status_code=404, detail="Output file not found on disk")
@@ -970,109 +992,170 @@ def merchant_download(job_id: str):
 @app.get("/merchant-jobs", tags=["Merchant Bulk"])
 def list_merchant_jobs():
     """
-    List all merchant bulk jobs.
-    Reads from disk — survives server restart.
-    Shows per-job progress, batch breakdown, and download link when done.
+    List all merchant bulk jobs — reads from disk, survives server restart.
+    Shows progress per job including batch-level breakdown.
     """
-    jobs = list_all_jobs()
-    return {"jobs": jobs, "count": len(jobs)}
+    return {"jobs": list_all_jobs(), "count": len(list_all_jobs())}
+
+import random as random  # ensure random available in endpoint scope
+
 # =============================================================================
-# merchant single id
+# MERCHANT DEBUG ENDPOINT (single ID test — does NOT use batch system)
 # =============================================================================
 
-@app.post("/merchant-debug", tags=["Merchant Debug"])
-def merchant_debug(req: dict):
+class MerchantDebugRequest(BaseModel):
+    merchant_id: str
+
+    class Config:
+        json_schema_extra = {"example": {"merchant_id": "1104990029"}}
+
+
+@app.post("/merchant-debug", tags=["Merchant Bulk"])
+def merchant_debug(req: MerchantDebugRequest):
     """
-    DEBUG ENDPOINT (single merchant test)
+    DEBUG — scrape ONE merchant and return full diagnostic info.
 
-    Input:
-    {
-      "merchant_id": "1104990029"
-    }
+    Use this to verify the selector and detect Blocked/Selector Missing issues.
+    Does NOT use the batch system. Runs synchronously and returns immediately.
 
-    Purpose:
-    - Test ONE merchant scraping
-    - Returns raw total_items + full debug info
-    - Does NOT run batch system
+    Input:  { "merchant_id": "1104990029" }
     """
+    from merchant_scraper import (
+        STORE_URL_TEMPLATE,
+        _extract_item_count_from_html,
+        USER_AGENTS,
+        PAGE_TIMEOUT,
+    )
+    from camoufox.sync_api import Camoufox
+    import time as _time
+    import re as _re
 
-    merchant_id = req.get("merchant_id")
-
-    if not merchant_id or not str(merchant_id).isdigit():
+    merchant_id = str(req.merchant_id).strip()
+    if not merchant_id.isdigit():
         raise HTTPException(status_code=400, detail="merchant_id must be numeric")
 
+    url   = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
+    ua    = random.choice(USER_AGENTS)
+    t0    = _time.time()
+    debug = {
+        "url": url, "page_loaded": False, "final_url": None,
+        "html_size_bytes": 0, "blocked": False,
+        "selector_hit": None, "load_time_sec": None, "nav_error": None,
+    }
+
     try:
-        from camoufox.sync_api import Camoufox
-        from merchant_scraper import (
-            STORE_URL_TEMPLATE,
-            _extract_item_count_from_html
-        )
-        import random
-        import time
-
-        url = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
-        ua = random.choice([
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"
-        ])
-
         with Camoufox(headless=True, os="windows") as browser:
-            ctx = browser.new_context(
-                viewport={"width": 1440, "height": 900},
-                locale="en-US",
-                user_agent=ua,
-                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            ctx  = browser.new_context(
+                viewport={"width": 1440, "height": 900}, locale="en-US",
+                user_agent=ua, extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             )
-
             page = ctx.new_page()
 
-            start = time.time()
+            try:
+                page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
+                debug["page_loaded"] = True
+            except Exception as nav_err:
+                es = str(nav_err)
+                debug["nav_error"] = es[:200]
+                if "NS_BINDING_ABORTED" in es or "ERR_ABORTED" in es:
+                    debug["page_loaded"] = True
+                    debug["nav_error"]   = "Redirect — attempting extraction anyway"
+                elif any(x in es for x in ["ERR_NAME_NOT_RESOLVED", "NS_ERROR"]):
+                    return {"success": False, "merchant_id": merchant_id,
+                            "total_items": None, "error": "Page Not Found", "debug": debug}
+                else:
+                    return {"success": False, "merchant_id": merchant_id,
+                            "total_items": None, "error": f"Nav error: {es[:150]}", "debug": debug}
 
-            page.goto(url, timeout=45000, wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
+            # Wait for item span explicitly
+            try:
+                page.wait_for_selector(
+                    'span[data-spm-anchor-id*="store_pc_allItems"]', timeout=8000
+                )
+                debug["selector_hit"] = "playwright_selector_found"
+            except Exception:
+                page.wait_for_timeout(4000)
+
+            page.wait_for_timeout(2000)
+            for _ in range(2):
+                page.mouse.wheel(0, 600)
+                page.wait_for_timeout(400)
 
             html = page.content()
-            lower = html.lower()
+            debug["final_url"]       = page.url
+            debug["html_size_bytes"] = len(html)
+            debug["load_time_sec"]   = round(_time.time() - t0, 2)
+            page.close()
+            ctx.close()
 
-            # Detect blocking
-            blocked = any(k in lower for k in [
-                "captcha", "robot", "verify you are human",
-                "access denied", "blocked"
-            ])
+        lower = html.lower()
+        debug["blocked"] = any(k in lower for k in [
+            "captcha", "robot", "verify you are human", "access denied", "blocked"
+        ])
 
-            count = _extract_item_count_from_html(html)
+        if debug["blocked"]:
+            return {"success": False, "merchant_id": merchant_id,
+                    "total_items": None, "error": "Blocked/CAPTCHA", "debug": debug}
 
-            end = time.time()
+        # Try selectors one by one for diagnosis
+        count = None
 
-            return {
-                "success": True,
-                "merchant_id": merchant_id,
-                "url": url,
-                "total_items": count,
-                "status": "BLOCKED" if blocked else "OK",
-                "debug": {
-                    "page_loaded": True,
-                    "html_size": len(html),
-                    "blocked_detected": blocked,
-                    "selector_used": "auto-extract",
-                    "load_time_sec": round(end - start, 2),
-                    "final_url": page.url
-                }
-            }
+        m = _re.search(
+            r'data-spm-anchor-id="[^"]*store_pc_allItems_or_groupList[^"]*"[^>]*>\s*(\d[\d,]*)\s*items?',
+            html, _re.IGNORECASE
+        )
+        if m:
+            count = int(m.group(1).replace(",", ""))
+            debug["selector_hit"] = "store_pc_allItems_or_groupList"
+        
+        if count is None:
+            m = _re.search(
+                r'data-spm-anchor-id="[^"]*store_pc_allItems[^"]*"[^>]*>\s*(\d[\d,]*)\s*items?',
+                html, _re.IGNORECASE
+            )
+            if m:
+                count = int(m.group(1).replace(",", ""))
+                debug["selector_hit"] = "store_pc_allItems"
 
-    except Exception as e:
-        return {
-            "success": False,
-            "merchant_id": merchant_id,
-            "error": str(e),
-            "status": "FAILED",
-            "debug": {
-                "page_loaded": False
-            }
-        }
+        if count is None:
+            m = _re.search(
+                r'<span[^>]+font-size:\s*1[0-9]px[^>]*>\s*(\d[\d,]+)\s*items?\s*</span>',
+                html, _re.IGNORECASE
+            )
+            if m:
+                count = int(m.group(1).replace(",", ""))
+                debug["selector_hit"] = "span_font_size_style"
+
+        if count is None:
+            all_m = _re.findall(r'\b(\d[\d,]+)\s+items?\b', html, _re.IGNORECASE)
+            if all_m:
+                nums  = [int(x.replace(",", "")) for x in all_m if int(x.replace(",", "")) > 0]
+                if nums:
+                    count = max(nums)
+                    debug["selector_hit"] = f"broad_scan:{all_m[:5]}"
+
+        # HTML snippet near "items" for manual inspection
+        idx = lower.find("items")
+        debug["html_snippet"] = (
+            html[max(0, idx - 150): idx + 60].replace("\n", " ").strip()
+            if idx != -1 else "NOT FOUND"
+        )
+
+        if count is None:
+            return {"success": False, "merchant_id": merchant_id,
+                    "total_items": None, "error": "Selector Missing",
+                    "debug": debug}
+
+        return {"success": True, "merchant_id": merchant_id,
+                "total_items": count, "error": None, "debug": debug}
+
+    except Exception as exc:
+        debug["load_time_sec"] = round(_time.time() - t0, 2)
+        return {"success": False, "merchant_id": merchant_id,
+                "total_items": None, "error": str(exc)[:300], "debug": debug}
 
 
 
-# =============================================================================
 # RELOAD FILTERS
 # =============================================================================
 
@@ -1147,8 +1230,7 @@ def get_compliance_by_product(product_id: int):
             "SELECT * FROM compliance_info WHERE product_id = ?", (product_id,)
         ).fetchall()
         conn.close()
-        return ([dict(r) for r in rows] if rows
-                else {"message": f"No compliance for product {product_id}"})
+        return [dict(r) for r in rows] if rows else {"message": f"No compliance for product {product_id}"}
     except Exception as e:
         return {"error": str(e)}
 
