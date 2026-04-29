@@ -1089,9 +1089,21 @@ def merchant_debug(req: MerchantDebugRequest):
             ctx.close()
 
         lower = html.lower()
-        debug["blocked"] = any(k in lower for k in [
-            "captcha", "robot", "verify you are human", "access denied", "blocked"
-        ])
+
+        # Precise block detection — NOT keyword scan (false positives on every valid page)
+        real_block_signals = [
+            'id="baxia-punish"', 'class="baxia-dialog"', 'nc_iconfont btn_slide',
+            'grecaptcha', 'data-sitekey', 'verify you are human',
+            '<title>access denied</title>', 'cf-challenge-running',
+        ]
+        debug["blocked"] = any(sig in lower for sig in real_block_signals)
+
+        # Detect redirect (AliExpress migrates old store IDs — not a block)
+        import re as _re2
+        m_redir = _re2.search(r'/store/(\d+)/', debug.get("final_url", ""))
+        if m_redir and m_redir.group(1) != merchant_id:
+            debug["redirected_to"] = m_redir.group(1)
+            debug["note"] = f"Store {merchant_id} migrated to {m_redir.group(1)} — extracting from redirected page"
 
         if debug["blocked"]:
             return {"success": False, "merchant_id": merchant_id,
