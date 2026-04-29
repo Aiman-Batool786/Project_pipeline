@@ -219,24 +219,70 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     else:
                         raise
 
-                # Wait for JS to render item count span — try explicit selector first
+                # Wait for JS-rendered item count span
+                # Try explicit selector wait first — faster when it appears early
                 try:
                     page.wait_for_selector(
                         'span[data-spm-anchor-id*="store_pc_allItems"]',
-                        timeout=8000
+                        timeout=10000
                     )
                 except Exception:
-                    # Selector didn't appear — extra JS render time
-                    page.wait_for_timeout(random.randint(3000, 5000))
+                    # Not found yet — wait longer for JS render
+                    page.wait_for_timeout(random.randint(4000, 6000))
 
-                page.wait_for_timeout(random.randint(1500, 2500))
+                page.wait_for_timeout(random.randint(1000, 2000))
                 for _ in range(2):
                     page.mouse.wheel(0, 600)
                     page.wait_for_timeout(400)
 
-                html = page.content()
+                # ── PRIMARY: extract from LIVE DOM via JavaScript ──────────────
+                # page.content() only returns the raw HTML skeleton — JS-rendered
+                # elements like the item count span are NOT in it.
+                # page.evaluate() runs in the browser context AFTER JS renders.
+                js_count = page.evaluate("""() => {
+                    // Method 1: exact spm anchor selector from confirmed HTML
+                    const byAnchor = document.querySelectorAll(
+                        'span[data-spm-anchor-id*="store_pc_allItems_or_groupList"]'
+                    );
+                    for (const el of byAnchor) {
+                        const t = el.textContent.trim();
+                        const m = t.match(/(\\d[\\d,]*)\\s+items?/i);
+                        if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+                    }
 
-                # Detect redirect (AliExpress migrates old store IDs to new ones — normal)
+                    // Method 2: broader store_pc_allItems anchor
+                    const byAnchorBroad = document.querySelectorAll(
+                        'span[data-spm-anchor-id*="store_pc_allItems"]'
+                    );
+                    for (const el of byAnchorBroad) {
+                        const t = el.textContent.trim();
+                        const m = t.match(/(\\d[\\d,]*)\\s+items?/i);
+                        if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+                    }
+
+                    // Method 3: any span whose FULL text is "N items"
+                    const allSpans = document.querySelectorAll('span');
+                    for (const el of allSpans) {
+                        const t = el.textContent.trim();
+                        const m = t.match(/^(\\d[\\d,]*)\\s+items?$/i);
+                        if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+                    }
+
+                    // Method 4: div containing "N items" text at top level
+                    const allDivs = document.querySelectorAll('div');
+                    for (const el of allDivs) {
+                        const direct = Array.from(el.childNodes)
+                            .filter(n => n.nodeType === 3)
+                            .map(n => n.textContent.trim())
+                            .join('');
+                        const m = direct.match(/^(\\d[\\d,]*)\\s+items?$/i);
+                        if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+                    }
+
+                    return null;
+                }""")
+
+                # Detect redirect
                 redirected_to = None
                 import re as _re2
                 m_redir = _re2.search(r'/store/(\d+)/', page.url)
@@ -247,28 +293,61 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                         f"{redirected_to} (normal ID migration)"
                     )
 
+                # Grab HTML for block detection only (not for item count)
+                html = page.content()
                 page.close()
                 ctx.close()
 
-            lower = html.lower()
+                # ── Block detection (precise — not keyword scan) ───────────────
+                lower = html.lower()
+                real_block_signals = [
+                    'id="baxia-punish"', 'class="baxia-dialog"',
+                    'nc_iconfont btn_slide', 'grecaptcha', 'data-sitekey',
+                    'verify you are human', '<title>access denied</title>',
+                    'cf-challenge-running',
+                ]
+                is_blocked = any(sig in lower for sig in real_block_signals)
 
-            # ── Precise block detection ───────────────────────────────────────
-            # AliExpress pages ALWAYS contain "robot"/"captcha" in analytics
-            # scripts — those are FALSE POSITIVES on valid pages.
-            # Only flag blocked when a real challenge element is present.
-            real_block_signals = [
-                'id="baxia-punish"',           # AliExpress block page div
-                'class="baxia-dialog"',         # block dialog
-                'nc_iconfont btn_slide',         # slider CAPTCHA widget
-                'grecaptcha',                    # Google reCAPTCHA embed
-                'data-sitekey',                  # reCAPTCHA site key attr
-                'verify you are human',          # explicit user-facing challenge
-                '<title>access denied</title>',  # hard block page title
-                'cf-challenge-running',          # Cloudflare challenge
-            ]
-            is_blocked = any(sig in lower for sig in real_block_signals)
+                if is_blocked:
+                    logger.warning(f"[merchant] {merchant_id} — real block/CAPTCHA")
+                    if attempt < MAX_RETRIES:
+                        time.sleep(random.uniform(8, 15))
+                        continue
+                    return {"merchant_id": merchant_id, "total_items": None, "error": "Blocked"}
 
-            if is_blocked:
+                # ── Use JS result if available, else fallback to HTML regex ──────
+                if js_count is not None:
+                    logger.info(
+                        f"[merchant] {merchant_id} ✓ {js_count} items (DOM)"
+                        + (f" → redir {redirected_to}" if redirected_to else "")
+                    )
+                    return {
+                        "merchant_id":   merchant_id,
+                        "total_items":   js_count,
+                        "error":         "",
+                        "redirected_to": redirected_to,
+                    }
+
+                # Fallback: regex on saved HTML
+                count = _extract_item_count_from_html(html)
+                if count is None:
+                    if attempt < MAX_RETRIES:
+                        logger.warning(f"[merchant] {merchant_id} — item count not found, retrying")
+                        time.sleep(random.uniform(3, 7))
+                        continue
+                    return {"merchant_id": merchant_id, "total_items": None,
+                            "error": "Selector Missing", "redirected_to": redirected_to}
+
+                logger.info(
+                    f"[merchant] {merchant_id} ✓ {count} items (HTML fallback)"
+                    + (f" → redir {redirected_to}" if redirected_to else "")
+                )
+                return {
+                    "merchant_id":   merchant_id,
+                    "total_items":   count,
+                    "error":         "",
+                    "redirected_to": redirected_to,
+                }            if is_blocked:
                 logger.warning(f"[merchant] {merchant_id} — real block/CAPTCHA")
                 if attempt < MAX_RETRIES:
                     time.sleep(random.uniform(8, 15))
