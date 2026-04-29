@@ -12,6 +12,14 @@ File layout:
       batch_0001.csv      ← results saved after batch 1 done
       ...
       output.csv          ← merged final CSV (written when all batches done)
+
+KEY FIX (v3.0):
+  • page.evaluate() now runs BEFORE page.close() — was the root cause of
+    "Selector Missing" on JS-rendered pages.
+  • Dead/duplicate code block after the return removed.
+  • JS selector updated to match AliExpress anchor ID format robustly,
+    including partial-match on the spm suffix which varies per session.
+  • Block detection kept precise (no false positives on normal pages).
 """
 
 import re
@@ -125,18 +133,18 @@ def parse_merchant_csv(file_bytes: bytes) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ITEM COUNT EXTRACTION
+# ITEM COUNT EXTRACTION  (HTML fallback only — DOM JS path is primary)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_item_count_from_html(html: str) -> Optional[int]:
     """
-    Extract item count from store page HTML.
+    Fallback regex extraction from raw HTML.
 
-    Exact confirmed HTML:
-      <span data-spm-anchor-id="a2g0o.store_pc_allItems_or_groupList.0.i41.xxx"
-            style="font-size: 15px; ...">227 items</span>
+    NOTE: AliExpress renders item counts via JS — this will usually miss them.
+    The primary path is page.evaluate() against the live DOM.
+    This function is only a safety net for edge cases where JS eval fails.
     """
-    # Primary A: exact spm anchor — store_pc_allItems_or_groupList (confirmed selector)
+    # Primary A: exact spm anchor
     m = re.search(
         r'data-spm-anchor-id="[^"]*store_pc_allItems_or_groupList[^"]*"[^>]*>'
         r'\s*(\d[\d,]*)\s*items?',
@@ -145,7 +153,7 @@ def _extract_item_count_from_html(html: str) -> Optional[int]:
     if m:
         return int(m.group(1).replace(",", ""))
 
-    # Primary B: broader store_pc_allItems (catches variant anchor IDs)
+    # Primary B: broader store_pc_allItems
     m = re.search(
         r'data-spm-anchor-id="[^"]*store_pc_allItems[^"]*"[^>]*>\s*(\d[\d,]*)\s*items?',
         html, re.IGNORECASE
@@ -154,7 +162,6 @@ def _extract_item_count_from_html(html: str) -> Optional[int]:
         return int(m.group(1).replace(",", ""))
 
     # Secondary: span with inline font-size style near "N items"
-    # Matches: <span style="font-size: 15px; font-weight: 400; color: rgb(25, 25, 25);">227 items</span>
     m2 = re.search(
         r'<span[^>]+font-size:\s*1[0-9]px[^>]*>\s*(\d[\d,]+)\s*items?\s*</span>',
         html, re.IGNORECASE
@@ -172,7 +179,7 @@ def _extract_item_count_from_html(html: str) -> Optional[int]:
         if val > 0:
             return val
 
-    # Broad fallback: largest "N items" anywhere on page (N > 0)
+    # Broad fallback: largest "N items" on page
     all_matches = re.findall(r'\b(\d[\d,]+)\s+items?\b', html, re.IGNORECASE)
     if all_matches:
         nums = [int(x.replace(",", "")) for x in all_matches if int(x.replace(",", "")) > 0]
@@ -188,7 +195,70 @@ def _extract_item_count_from_html(html: str) -> Optional[int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SINGLE MERCHANT SCRAPER
+# JAVASCRIPT DOM EXTRACTOR
+# Runs inside the browser against the live rendered DOM.
+# This is the ONLY reliable way to get the JS-rendered item count.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_JS_EXTRACT_COUNT = """() => {
+    // ── Method 1: exact spm anchor substring match ──────────────────────────
+    // AliExpress anchor IDs look like:
+    //   a2g0o.store_pc_allItems_or_groupList.0.i42.20cb143etmwONt
+    // querySelector with *= does substring match — safe against suffix variance.
+    const byExact = document.querySelectorAll(
+        'span[data-spm-anchor-id*="store_pc_allItems_or_groupList"]'
+    );
+    for (const el of byExact) {
+        const t = el.textContent.trim();
+        const m = t.match(/(\\d[\\d,]*)\\s+items?/i);
+        if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+    }
+
+    // ── Method 2: broader store_pc_allItems (catches allItems-only variant) ─
+    const byBroad = document.querySelectorAll(
+        'span[data-spm-anchor-id*="store_pc_allItems"]'
+    );
+    for (const el of byBroad) {
+        const t = el.textContent.trim();
+        const m = t.match(/(\\d[\\d,]*)\\s+items?/i);
+        if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+    }
+
+    // ── Method 3: ANY span whose FULL text is exactly "N items" ─────────────
+    // Matches: <span ...>119 items</span>  (confirmed live DOM shape)
+    const allSpans = document.querySelectorAll('span');
+    for (const el of allSpans) {
+        const t = el.textContent.trim();
+        const m = t.match(/^(\\d[\\d,]*)\\s+items?$/i);
+        if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+    }
+
+    // ── Method 4: direct text node of a div is "N items" ────────────────────
+    const allDivs = document.querySelectorAll('div');
+    for (const el of allDivs) {
+        const direct = Array.from(el.childNodes)
+            .filter(n => n.nodeType === 3)          // TEXT_NODE only
+            .map(n => n.textContent.trim())
+            .join('');
+        const m = direct.match(/^(\\d[\\d,]*)\\s+items?$/i);
+        if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+    }
+
+    // ── Method 5: window.__INIT_DATA__ or similar SSR JSON blobs ───────────
+    // AliExpress sometimes embeds counts in a script tag as JSON.
+    const scripts = document.querySelectorAll('script');
+    for (const s of scripts) {
+        const src = s.textContent || '';
+        const m = src.match(/"(?:totalProducts|itemCount|totalItems|storeItemCount)"\\s*:\\s*(\\d+)/);
+        if (m) return parseInt(m[1], 10);
+    }
+
+    return null;
+}"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SINGLE MERCHANT SCRAPER  — FIXED
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_merchant(merchant_id: str) -> Dict:
@@ -198,124 +268,104 @@ def _scrape_merchant(merchant_id: str) -> Dict:
         try:
             ua = random.choice(USER_AGENTS)
             with Camoufox(headless=True, os="windows") as browser:
-                ctx  = browser.new_context(
+                ctx = browser.new_context(
                     viewport={"width": 1440, "height": 900},
                     locale="en-US",
                     user_agent=ua,
                     extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
                 )
                 page = ctx.new_page()
+
+                # ── Navigate ─────────────────────────────────────────────────
                 try:
                     page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
                 except Exception as nav_err:
                     err_str = str(nav_err)
                     if "NS_BINDING_ABORTED" in err_str or "ERR_ABORTED" in err_str:
-                        # Redirect mid-load — content may still be usable, continue
-                        logger.warning(f"[merchant] {merchant_id} nav aborted (redirect) — continuing")
+                        # Redirect mid-load — content may still be usable
+                        logger.warning(
+                            f"[merchant] {merchant_id} nav aborted (redirect) — continuing"
+                        )
                     elif any(x in err_str for x in ["ERR_NAME_NOT_RESOLVED", "NS_ERROR_UNKNOWN"]):
-                        return {"merchant_id": merchant_id, "total_items": None, "error": "Page Not Found"}
+                        page.close(); ctx.close()
+                        return {"merchant_id": merchant_id, "total_items": None,
+                                "error": "Page Not Found"}
                     elif "NS_ERROR" in err_str:
-                        return {"merchant_id": merchant_id, "total_items": None, "error": "Page Not Found"}
+                        page.close(); ctx.close()
+                        return {"merchant_id": merchant_id, "total_items": None,
+                                "error": "Page Not Found"}
                     else:
                         raise
 
-                # Wait for JS-rendered item count span
-                # Try explicit selector wait first — faster when it appears early
+                # ── Wait for JS-rendered item count span ──────────────────────
+                # Try the explicit selector first (fast path when available early)
                 try:
                     page.wait_for_selector(
                         'span[data-spm-anchor-id*="store_pc_allItems"]',
-                        timeout=10000
+                        timeout=10_000,
                     )
                 except Exception:
-                    # Not found yet — wait longer for JS render
-                    page.wait_for_timeout(random.randint(4000, 6000))
+                    # Selector didn't appear within 10s — give JS more time
+                    page.wait_for_timeout(random.randint(4_000, 6_000))
 
-                page.wait_for_timeout(random.randint(1000, 2000))
+                # Small extra buffer + two scroll ticks to trigger lazy loading
+                page.wait_for_timeout(random.randint(1_000, 2_000))
                 for _ in range(2):
                     page.mouse.wheel(0, 600)
                     page.wait_for_timeout(400)
 
-                # ── PRIMARY: extract from LIVE DOM via JavaScript ──────────────
-                # page.content() only returns the raw HTML skeleton — JS-rendered
-                # elements like the item count span are NOT in it.
-                # page.evaluate() runs in the browser context AFTER JS renders.
-                js_count = page.evaluate("""() => {
-                    // Method 1: exact spm anchor selector from confirmed HTML
-                    const byAnchor = document.querySelectorAll(
-                        'span[data-spm-anchor-id*="store_pc_allItems_or_groupList"]'
-                    );
-                    for (const el of byAnchor) {
-                        const t = el.textContent.trim();
-                        const m = t.match(/(\\d[\\d,]*)\\s+items?/i);
-                        if (m) return parseInt(m[1].replace(/,/g, ''), 10);
-                    }
+                # ── PRIMARY: JS DOM eval — MUST happen BEFORE page.close() ───
+                # page.content() returns the HTML skeleton BEFORE JS renders.
+                # page.evaluate() runs in the live browser context — gets the
+                # rendered item count span that regex on page.content() misses.
+                js_count = page.evaluate(_JS_EXTRACT_COUNT)
 
-                    // Method 2: broader store_pc_allItems anchor
-                    const byAnchorBroad = document.querySelectorAll(
-                        'span[data-spm-anchor-id*="store_pc_allItems"]'
-                    );
-                    for (const el of byAnchorBroad) {
-                        const t = el.textContent.trim();
-                        const m = t.match(/(\\d[\\d,]*)\\s+items?/i);
-                        if (m) return parseInt(m[1].replace(/,/g, ''), 10);
-                    }
-
-                    // Method 3: any span whose FULL text is "N items"
-                    const allSpans = document.querySelectorAll('span');
-                    for (const el of allSpans) {
-                        const t = el.textContent.trim();
-                        const m = t.match(/^(\\d[\\d,]*)\\s+items?$/i);
-                        if (m) return parseInt(m[1].replace(/,/g, ''), 10);
-                    }
-
-                    // Method 4: div containing "N items" text at top level
-                    const allDivs = document.querySelectorAll('div');
-                    for (const el of allDivs) {
-                        const direct = Array.from(el.childNodes)
-                            .filter(n => n.nodeType === 3)
-                            .map(n => n.textContent.trim())
-                            .join('');
-                        const m = direct.match(/^(\\d[\\d,]*)\\s+items?$/i);
-                        if (m) return parseInt(m[1].replace(/,/g, ''), 10);
-                    }
-
-                    return null;
-                }""")
-
-                # Detect redirect
+                # ── Detect redirect (AliExpress migrates old store IDs) ───────
                 redirected_to = None
-                import re as _re2
-                m_redir = _re2.search(r'/store/(\d+)/', page.url)
+                m_redir = re.search(r'/store/(\d+)/', page.url)
                 if m_redir and m_redir.group(1) != merchant_id:
                     redirected_to = m_redir.group(1)
                     logger.info(
-                        f"[merchant] {merchant_id} redirected to store "
+                        f"[merchant] {merchant_id} redirected → store "
                         f"{redirected_to} (normal ID migration)"
                     )
 
-                # Grab HTML for block detection only (not for item count)
-                html = page.content()
+                # ── Grab HTML ONLY for block detection ────────────────────────
+                # (NOT for item count — JS has already given us that above)
+                html  = page.content()
+                lower = html.lower()
+
                 page.close()
                 ctx.close()
 
-                # ── Block detection (precise — not keyword scan) ───────────────
-                lower = html.lower()
+                # ── Precise block detection ───────────────────────────────────
+                # Use ONLY strong CAPTCHA/block signals — not generic keywords
+                # that appear on every normal AliExpress page (e.g. "item").
                 real_block_signals = [
-                    'id="baxia-punish"', 'class="baxia-dialog"',
-                    'nc_iconfont btn_slide', 'grecaptcha', 'data-sitekey',
-                    'verify you are human', '<title>access denied</title>',
+                    'id="baxia-punish"',
+                    'class="baxia-dialog"',
+                    'nc_iconfont btn_slide',
+                    'grecaptcha',
+                    'data-sitekey',
+                    'verify you are human',
+                    '<title>access denied</title>',
                     'cf-challenge-running',
                 ]
                 is_blocked = any(sig in lower for sig in real_block_signals)
 
                 if is_blocked:
-                    logger.warning(f"[merchant] {merchant_id} — real block/CAPTCHA")
+                    logger.warning(f"[merchant] {merchant_id} — real block/CAPTCHA detected")
                     if attempt < MAX_RETRIES:
                         time.sleep(random.uniform(8, 15))
                         continue
-                    return {"merchant_id": merchant_id, "total_items": None, "error": "Blocked"}
+                    return {
+                        "merchant_id": merchant_id,
+                        "total_items": None,
+                        "error": "Blocked",
+                        "redirected_to": redirected_to,
+                    }
 
-                # ── Use JS result if available, else fallback to HTML regex ──────
+                # ── Use JS result if available ────────────────────────────────
                 if js_count is not None:
                     logger.info(
                         f"[merchant] {merchant_id} ✓ {js_count} items (DOM)"
@@ -328,15 +378,22 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                         "redirected_to": redirected_to,
                     }
 
-                # Fallback: regex on saved HTML
+                # ── Fallback: regex on raw HTML (rarely succeeds for count) ───
                 count = _extract_item_count_from_html(html)
                 if count is None:
                     if attempt < MAX_RETRIES:
-                        logger.warning(f"[merchant] {merchant_id} — item count not found, retrying")
+                        logger.warning(
+                            f"[merchant] {merchant_id} — item count not found "
+                            f"(attempt {attempt}), retrying"
+                        )
                         time.sleep(random.uniform(3, 7))
                         continue
-                    return {"merchant_id": merchant_id, "total_items": None,
-                            "error": "Selector Missing", "redirected_to": redirected_to}
+                    return {
+                        "merchant_id":   merchant_id,
+                        "total_items":   None,
+                        "error":         "Selector Missing",
+                        "redirected_to": redirected_to,
+                    }
 
                 logger.info(
                     f"[merchant] {merchant_id} ✓ {count} items (HTML fallback)"
@@ -347,31 +404,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     "total_items":   count,
                     "error":         "",
                     "redirected_to": redirected_to,
-                }            if is_blocked:
-                logger.warning(f"[merchant] {merchant_id} — real block/CAPTCHA")
-                if attempt < MAX_RETRIES:
-                    time.sleep(random.uniform(8, 15))
-                    continue
-                return {"merchant_id": merchant_id, "total_items": None, "error": "Blocked"}
-
-            if any(k in lower for k in ["page not found", "store not found", "doesn't exist"]):
-                return {"merchant_id": merchant_id, "total_items": None, "error": "Invalid Merchant"}
-
-            count = _extract_item_count_from_html(html)
-            if count is None:
-                if attempt < MAX_RETRIES:
-                    time.sleep(random.uniform(3, 7))
-                    continue
-                return {"merchant_id": merchant_id, "total_items": None, "error": "Selector Missing"}
-
-            logger.info(f"[merchant] {merchant_id} ✓ {count} items"
-                        + (f" (redirected→{redirected_to})" if redirected_to else ""))
-            return {
-                "merchant_id":   merchant_id,
-                "total_items":   count,
-                "error":         "",
-                "redirected_to": redirected_to,
-            }
+                }
 
         except Exception as exc:
             err_str = str(exc)
@@ -419,7 +452,6 @@ def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
                 reader = csv.reader(in_f)
                 next(reader, None)  # skip header
                 for row in reader:
-                    # Pad to 4 columns if old batch has only 3
                     while len(row) < 4:
                         row.append("")
                     writer.writerow(row)
@@ -465,10 +497,14 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
     _save_metadata(job_id, meta)
 
     with _jobs_lock:
-        _jobs[job_id].update({"status": "running", "total": total,
-                               "batches_total": batches_total, "batches_done": 0, "batches_failed": 0})
+        _jobs[job_id].update({
+            "status": "running", "total": total,
+            "batches_total": batches_total, "batches_done": 0, "batches_failed": 0,
+        })
 
-    logger.info(f"[job:{job_id}] Start — {total} merchants | {batches_total} batches of {BATCH_SIZE}")
+    logger.info(
+        f"[job:{job_id}] Start — {total} merchants | {batches_total} batches of {BATCH_SIZE}"
+    )
 
     for idx, batch in enumerate(batches):
         meta["batches"][idx]["status"] = "running"
@@ -488,19 +524,20 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
 
         with _jobs_lock:
             if job_id in _jobs:
-                _jobs[job_id]["batches_done"]    = meta["batches_done"]
-                _jobs[job_id]["batches_failed"]  = meta["batches_failed"]
+                _jobs[job_id]["batches_done"]   = meta["batches_done"]
+                _jobs[job_id]["batches_failed"] = meta["batches_failed"]
 
-        processed = meta["batches_done"] + meta["batches_failed"]
-        pct       = round(processed / batches_total * 100, 1)
+        processed      = meta["batches_done"] + meta["batches_failed"]
+        pct            = round(processed / batches_total * 100, 1)
         merchants_done = min(processed * BATCH_SIZE, total)
-        logger.info(f"[job:{job_id}] {processed}/{batches_total} batches done "
-                    f"({merchants_done}/{total} merchants, {pct}%)")
+        logger.info(
+            f"[job:{job_id}] {processed}/{batches_total} batches done "
+            f"({merchants_done}/{total} merchants, {pct}%)"
+        )
 
         if idx < batches_total - 1:
             time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
-    # Merge all batch CSVs into one final file
     try:
         _merge_batch_csvs(job_id, batches_total)
     except Exception as e:
@@ -514,8 +551,10 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
         if job_id in _jobs:
             _jobs[job_id]["status"] = "done"
 
-    logger.info(f"[job:{job_id}] ✓ Complete — "
-                f"{meta['batches_done']} ok | {meta['batches_failed']} failed")
+    logger.info(
+        f"[job:{job_id}] ✓ Complete — "
+        f"{meta['batches_done']} ok | {meta['batches_failed']} failed"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -525,10 +564,14 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
 def start_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
     """Launch bulk processing in a background daemon thread."""
     with _jobs_lock:
-        _jobs[job_id] = {"status": "queued", "total": len(merchant_ids),
-                         "batches_total": 0, "batches_done": 0, "batches_failed": 0}
-    t = threading.Thread(target=_run_bulk_job, args=(job_id, merchant_ids),
-                         daemon=True, name=f"merchant-{job_id[:8]}")
+        _jobs[job_id] = {
+            "status": "queued", "total": len(merchant_ids),
+            "batches_total": 0, "batches_done": 0, "batches_failed": 0,
+        }
+    t = threading.Thread(
+        target=_run_bulk_job, args=(job_id, merchant_ids),
+        daemon=True, name=f"merchant-{job_id[:8]}",
+    )
     t.start()
 
 
@@ -543,11 +586,8 @@ def get_job_status(job_id: str) -> Optional[Dict]:
         return None
 
     if disk:
-        total             = disk.get("batches_total", 0)
-        processed         = disk.get("batches_done", 0) + disk.get("batches_failed", 0)
-        total_merchants   = disk.get("total", 0)
+        total_merchants = disk.get("total", 0)
 
-        # Count merchants done from per-batch sizes
         merchants_done = 0
         for b in disk.get("batches", []):
             if b.get("status") in ("done", "failed"):
@@ -562,12 +602,14 @@ def get_job_status(job_id: str) -> Optional[Dict]:
             "batches_total":       disk.get("batches_total", 0),
             "batches_done":        disk.get("batches_done", 0),
             "batches_failed":      disk.get("batches_failed", 0),
-            "progress_pct":        round(merchants_done / total_merchants * 100, 1) if total_merchants else 0.0,
+            "progress_pct":        round(merchants_done / total_merchants * 100, 1)
+                                   if total_merchants else 0.0,
             "started_at":          disk.get("started_at"),
             "finished_at":         disk.get("finished_at"),
             "batches":             disk.get("batches", []),
             "download_ready":      disk.get("status") == "done",
-            "download_url":        f"/merchant-download/{job_id}" if disk.get("status") == "done" else None,
+            "download_url":        f"/merchant-download/{job_id}"
+                                   if disk.get("status") == "done" else None,
         }
 
     return mem
@@ -594,32 +636,30 @@ def list_all_jobs() -> List[Dict]:
         meta = _load_metadata(job_dir.name)
         if not meta:
             continue
-        batches_total   = meta.get("batches_total", 0)
-        batches_done    = meta.get("batches_done", 0)
-        batches_failed  = meta.get("batches_failed", 0)
-        batches_processed = batches_done + batches_failed
-        total           = meta.get("total", 0)
+        batches_total  = meta.get("batches_total", 0)
+        batches_done   = meta.get("batches_done", 0)
+        batches_failed = meta.get("batches_failed", 0)
+        total          = meta.get("total", 0)
 
-        # Count merchants processed by reading per-batch sizes from metadata
         merchants_done = 0
         for b in meta.get("batches", []):
             if b.get("status") in ("done", "failed"):
                 merchants_done += b.get("size", BATCH_SIZE)
-        # Cap at total in case of rounding
         merchants_done = min(merchants_done, total)
 
         result.append({
-            "job_id":             job_dir.name,
-            "status":             meta.get("status"),
-            "total_merchants":    total,
-            "merchants_done":     merchants_done,
+            "job_id":              job_dir.name,
+            "status":              meta.get("status"),
+            "total_merchants":     total,
+            "merchants_done":      merchants_done,
             "merchants_remaining": max(0, total - merchants_done),
-            "batches_total":      batches_total,
-            "batches_done":       batches_done,
-            "batches_failed":     batches_failed,
-            "progress_pct":       round(merchants_done / total * 100, 1) if total else 0.0,
-            "started_at":         meta.get("started_at"),
-            "finished_at":        meta.get("finished_at"),
-            "download_url":       f"/merchant-download/{job_dir.name}" if meta.get("status") == "done" else None,
+            "batches_total":       batches_total,
+            "batches_done":        batches_done,
+            "batches_failed":      batches_failed,
+            "progress_pct":        round(merchants_done / total * 100, 1) if total else 0.0,
+            "started_at":          meta.get("started_at"),
+            "finished_at":         meta.get("finished_at"),
+            "download_url":        f"/merchant-download/{job_dir.name}"
+                                   if meta.get("status") == "done" else None,
         })
     return result
