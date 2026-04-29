@@ -1003,13 +1003,6 @@ import random as random  # ensure random available in endpoint scope
 # MERCHANT DEBUG ENDPOINT (single ID test — does NOT use batch system)
 # =============================================================================
 
-# =============================================================================
-# MERCHANT DEBUG ENDPOINT  v3.1
-# FIXED: uses page.evaluate() on live DOM — NOT regex on page.content().
-# page.content() returns the JS skeleton only; "items" will never appear in it.
-# =============================================================================
-
-# ── JS extractor (same string used by _scrape_merchant in merchant_scraper.py)
 _DEBUG_JS_EXTRACT = """() => {
     // Collect ALL matching elements and their text for diagnosis
     const results = [];
