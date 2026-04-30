@@ -1,16 +1,26 @@
 """
-merchant_scraper.py — Batch-Safe Bulk Processor v3.3
+merchant_scraper.py — Batch-Safe Bulk Processor v3.4
 ─────────────────────────────────────────────────────
-KEY FIXES (v3.3):
-  • Forces Sweden locale + EUR currency via cookies/headers so AliExpress
-    serves the correct store without geo-redirecting to a different store ID.
-  • If a redirect still happens (legitimate store ID migration), extraction
-    runs on wherever the page lands — we never re-navigate away from the
-    settled page.
-  • ae:reload_path meta-redirect is followed before JS eval.
-  • networkidle wait added before page.evaluate() so React is fully mounted.
-  • MAX_RETRIES bumped to 3 with CAPTCHA back-off of 15–25 s.
-  • Per-attempt timeout budget: 300 s (up from 240 s).
+KEY FIX (v3.4 — "Selector Missing" even after networkidle):
+
+  ROOT CAUSE:
+    networkidle fires when no network requests for 500 ms — but React can
+    still be in a render cycle with zero network activity. Calling
+    page.evaluate() at that moment finds an empty DOM and returns null.
+
+  FIX:
+    Replace the single page.evaluate() call with page.wait_for_function()
+    which POLLS the live DOM every 100 ms for up to 20 s until the item
+    count span actually appears. This is guaranteed to catch the element
+    regardless of React render timing.
+
+  OTHER CHANGES vs v3.3:
+    • Locale cookies kept (Sweden/EUR prevents geo-redirect).
+    • ae:reload_path meta-redirect still followed.
+    • wait_for_load_state("networkidle") kept as a warm-up signal.
+    • Dedicated _wait_for_item_count() helper centralises the polling.
+    • Fallback: if polling times out, one final page.evaluate() is tried.
+    • Per-attempt timeout budget: 300 s.
 """
 
 import re
@@ -42,7 +52,7 @@ STORE_URL_TEMPLATE = (
 BATCH_SIZE   = 100
 CONCURRENCY  = 5
 MAX_RETRIES  = 3
-PAGE_TIMEOUT = 60_000    # 60 s — stores are slow after redirect settlement
+PAGE_TIMEOUT = 60_000
 DELAY_MIN    = 1.5
 DELAY_MAX    = 3.5
 JOBS_DIR     = Path("./merchant_jobs")
@@ -56,35 +66,27 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
-# ── Sweden / EUR locale cookies ───────────────────────────────────────────────
-# These mirror exactly what AliExpress sets after a user clicks
-# "Ship to → Sweden, EUR, English" and saves.
-# Setting them before the first navigation prevents the geo-redirect.
 ALIEXPRESS_LOCALE_COOKIES = [
-    # Ship-to country: SE (Sweden)
-    {"name": "aep_usuc_f",   "value": "site=glo&c_tp=SEK&x_alimid=-&b_locale=en_US&ae_u_p_s=2",
+    {"name": "aep_usuc_f",
+     "value": "site=glo&c_tp=SEK&x_alimid=-&b_locale=en_US&ae_u_p_s=2",
      "domain": ".aliexpress.com", "path": "/"},
-    # Currency: EUR
     {"name": "ali_apache_currency", "value": "EUR",
      "domain": ".aliexpress.com", "path": "/"},
-    # Language: English
     {"name": "ali_apache_lang",     "value": "en_US",
      "domain": ".aliexpress.com", "path": "/"},
-    # intl_locale
     {"name": "intl_locale",         "value": "en_US",
      "domain": ".aliexpress.com", "path": "/"},
-    # Ship-to country code
     {"name": "xman_us_f",           "value": "x_l=1&acs_rt=",
      "domain": ".aliexpress.com", "path": "/"},
-    # Country/region: SE
-    {"name": "aep_common_f",        "value": "x_user_id=-&x_login_name=-&x_mbtype=&x_isnewuser=n",
+    {"name": "aep_common_f",
+     "value": "x_user_id=-&x_login_name=-&x_mbtype=&x_isnewuser=n",
      "domain": ".aliexpress.com", "path": "/"},
 ]
 
 ALIEXPRESS_LOCALE_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xhtml+xml,"
-              "application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/avif,image/webp,*/*;q=0.8",
     "sec-ch-ua-platform": '"Windows"',
     "sec-fetch-dest": "document",
     "sec-fetch-mode": "navigate",
@@ -176,7 +178,6 @@ def parse_merchant_csv(file_bytes: bytes) -> List[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_item_count_from_html(html: str) -> Optional[int]:
-    """Regex fallback — rarely succeeds on JS-rendered pages but worth trying."""
     for pattern in [
         r'data-spm-anchor-id="[^"]*store_pc_allItems_or_groupList[^"]*"[^>]*>\s*(\d[\d,]*)\s*items?',
         r'data-spm-anchor-id="[^"]*store_pc_allItems[^"]*"[^>]*>\s*(\d[\d,]*)\s*items?',
@@ -196,49 +197,99 @@ def _extract_item_count_from_html(html: str) -> Optional[int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JAVASCRIPT DOM EXTRACTOR  v3.3
+# JAVASCRIPT EXTRACTOR  (single evaluate — used as fallback after polling)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _JS_EXTRACT_COUNT = """() => {
-    // ── Method 1: SPAN with exact spm anchor ────────────────────────────────
-    // a2g0o.store_pc_allItems_or_groupList.0.i3.xxx
+    // Method 1: SPAN with exact spm anchor
+    for (const el of document.querySelectorAll(
+            'span[data-spm-anchor-id*="store_pc_allItems_or_groupList"]')) {
+        const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
+        if (m) return parseInt(m[1].replace(/,/g,''), 10);
+    }
+    // Method 2: SPAN with broader anchor
+    for (const el of document.querySelectorAll(
+            'span[data-spm-anchor-id*="store_pc_allItems"]')) {
+        const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
+        if (m) return parseInt(m[1].replace(/,/g,''), 10);
+    }
+    // Method 3: parent DIV has anchor, child SPAN has text
+    for (const div of document.querySelectorAll(
+            'div[data-spm-anchor-id*="store_pc_allItems_or_groupList"],' +
+            'div[data-spm-anchor-id*="store_pc_allItems"]')) {
+        for (const span of div.querySelectorAll('span')) {
+            const m = span.textContent.trim().match(/^(\\d[\\d,]*)\\s+items?$/i);
+            if (m) return parseInt(m[1].replace(/,/g,''), 10);
+        }
+    }
+    // Method 4: ANY span whose full text is "N items"
+    for (const el of document.querySelectorAll('span')) {
+        const m = el.textContent.trim().match(/^(\\d[\\d,]*)\\s+items?$/i);
+        if (m) return parseInt(m[1].replace(/,/g,''), 10);
+    }
+    // Method 5: div direct text node
+    for (const el of document.querySelectorAll('div')) {
+        const direct = Array.from(el.childNodes)
+            .filter(n => n.nodeType === 3)
+            .map(n => n.textContent.trim()).join('');
+        const m = direct.match(/^(\\d[\\d,]*)\\s+items?$/i);
+        if (m) return parseInt(m[1].replace(/,/g,''), 10);
+    }
+    // Method 6: SSR JSON in script tags
+    for (const s of document.querySelectorAll('script')) {
+        const m = (s.textContent || '').match(
+            /"(?:totalProducts|itemCount|totalItems|storeItemCount)"\\s*:\\s*(\\d+)/
+        );
+        if (m) return parseInt(m[1], 10);
+    }
+    return null;
+}"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOM POLLING FUNCTION  ← THE CORE FIX
+# ─────────────────────────────────────────────────────────────────────────────
+
+# This JS runs inside wait_for_function() which polls every 100 ms.
+# It returns the count as soon as ANY of the selectors finds "N items".
+# This handles React render timing: networkidle can fire while React is
+# still mounting components — polling catches the element whenever it appears.
+_JS_POLL_FOR_COUNT = """() => {
+    // Try all known selector shapes. Return the count as soon as found,
+    // or false to tell wait_for_function to keep polling.
+
+    // Shape 1: <span data-spm-anchor-id="...store_pc_allItems_or_groupList...">N items</span>
     for (const el of document.querySelectorAll(
             'span[data-spm-anchor-id*="store_pc_allItems_or_groupList"]')) {
         const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
         if (m) return parseInt(m[1].replace(/,/g,''), 10);
     }
 
-    // ── Method 2: SPAN with broader store_pc_allItems ───────────────────────
+    // Shape 2: broader store_pc_allItems anchor on span
     for (const el of document.querySelectorAll(
             'span[data-spm-anchor-id*="store_pc_allItems"]')) {
         const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
         if (m) return parseInt(m[1].replace(/,/g,''), 10);
     }
 
-    // ── Method 3: PARENT DIV carries the anchor; child SPAN has the text ────
-    // Confirmed real DOM:
-    //   <div data-spm-anchor-id="...store_pc_allItems_or_groupList...">
-    //     ...
-    //     <span style="font-size:15px">1 items</span>   ← different anchor (i3)
-    //   </div>
+    // Shape 3: parent DIV has anchor, child SPAN has "N items" text
     for (const div of document.querySelectorAll(
             'div[data-spm-anchor-id*="store_pc_allItems_or_groupList"],' +
             'div[data-spm-anchor-id*="store_pc_allItems"]')) {
         for (const span of div.querySelectorAll('span')) {
-            const t = span.textContent.trim();
-            const m = t.match(/^(\\d[\\d,]*)\\s+items?$/i);
+            const m = span.textContent.trim().match(/^(\\d[\\d,]*)\\s+items?$/i);
             if (m) return parseInt(m[1].replace(/,/g,''), 10);
         }
     }
 
-    // ── Method 4: ANY span whose FULL trimmed text is "N items" ─────────────
+    // Shape 4: ANY span whose FULL trimmed text is exactly "N items"
+    // Confirmed real DOM: <span style="font-size:15px">6 items</span>
     for (const el of document.querySelectorAll('span')) {
-        const t = el.textContent.trim();
-        const m = t.match(/^(\\d[\\d,]*)\\s+items?$/i);
+        const m = el.textContent.trim().match(/^(\\d[\\d,]*)\\s+items?$/i);
         if (m) return parseInt(m[1].replace(/,/g,''), 10);
     }
 
-    // ── Method 5: div direct text node is "N items" ─────────────────────────
+    // Shape 5: div direct text node is "N items"
     for (const el of document.querySelectorAll('div')) {
         const direct = Array.from(el.childNodes)
             .filter(n => n.nodeType === 3)
@@ -247,7 +298,7 @@ _JS_EXTRACT_COUNT = """() => {
         if (m) return parseInt(m[1].replace(/,/g,''), 10);
     }
 
-    // ── Method 6: SSR JSON in script tags ───────────────────────────────────
+    // Shape 6: SSR JSON blob in <script>
     for (const s of document.querySelectorAll('script')) {
         const src = s.textContent || '';
         const m = src.match(
@@ -256,19 +307,42 @@ _JS_EXTRACT_COUNT = """() => {
         if (m) return parseInt(m[1], 10);
     }
 
-    return null;
+    return false;  // keep polling
 }"""
 
 
+def _wait_for_item_count(page, poll_timeout_ms: int = 20_000) -> Optional[int]:
+    """
+    Poll the live DOM every 100 ms until an item count appears or timeout.
+
+    This is the correct way to handle React-rendered content:
+      - networkidle fires when no network for 500ms, but React render
+        can still be in progress with zero network activity.
+      - wait_for_function polls continuously so it catches the element
+        the moment React mounts the component tree.
+
+    Returns the count as int, or None if not found within poll_timeout_ms.
+    """
+    try:
+        result = page.wait_for_function(
+            _JS_POLL_FOR_COUNT,
+            timeout=poll_timeout_ms,
+            polling=100,   # check every 100 ms
+        )
+        # wait_for_function returns a JSHandle — call .json_value() to get Python int
+        count = result.json_value()
+        if isinstance(count, (int, float)) and count > 0:
+            return int(count)
+    except Exception as poll_err:
+        logger.debug(f"[poll] wait_for_function timed out or failed: {poll_err}")
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# BROWSER CONTEXT FACTORY  — sets locale cookies before first navigation
+# BROWSER CONTEXT FACTORY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_context(browser, ua: str):
-    """
-    Create a Playwright-style browser context pre-loaded with
-    Sweden/EUR/English cookies so AliExpress never shows the geo-selector.
-    """
     ctx = browser.new_context(
         viewport={"width": 1440, "height": 900},
         locale="en-US",
@@ -276,13 +350,12 @@ def _make_context(browser, ua: str):
         user_agent=ua,
         extra_http_headers=ALIEXPRESS_LOCALE_HEADERS,
     )
-    # Inject locale cookies — must be done BEFORE any navigation
     ctx.add_cookies(ALIEXPRESS_LOCALE_COOKIES)
     return ctx
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SINGLE MERCHANT SCRAPER  v3.3
+# SINGLE MERCHANT SCRAPER  v3.4
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_merchant(merchant_id: str) -> Dict:
@@ -297,16 +370,14 @@ def _scrape_merchant(merchant_id: str) -> Dict:
 
                 # ── STEP 1: Navigate ─────────────────────────────────────────
                 try:
-                    page.goto(
-                        original_url,
-                        timeout=PAGE_TIMEOUT,
-                        wait_until="domcontentloaded",
-                    )
+                    page.goto(original_url, timeout=PAGE_TIMEOUT,
+                              wait_until="domcontentloaded")
                 except Exception as nav_err:
                     err_str = str(nav_err)
                     if "NS_BINDING_ABORTED" in err_str or "ERR_ABORTED" in err_str:
-                        # Redirect fired mid-load — page content is still usable
-                        logger.warning(f"[merchant] {merchant_id} nav aborted (redirect) — continuing")
+                        logger.warning(
+                            f"[merchant] {merchant_id} nav aborted (redirect) — continuing"
+                        )
                     elif any(x in err_str for x in ["ERR_NAME_NOT_RESOLVED", "NS_ERROR"]):
                         page.close(); ctx.close()
                         return {"merchant_id": merchant_id, "total_items": None,
@@ -314,107 +385,107 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     else:
                         raise
 
-                # ── STEP 2: Follow ae:reload_path meta-redirect if present ───
-                # AliExpress sets <meta property="ae:reload_path" content="NEW_URL">
-                # on old store pages. domcontentloaded fires on the shell page
-                # BEFORE JavaScript reads this meta and navigates. We do it
-                # ourselves to get to the final, fully-rendered store.
+                # ── STEP 2: Follow ae:reload_path meta-redirect ──────────────
                 try:
                     reload_url = page.evaluate("""() => {
                         const m = document.querySelector('meta[property="ae:reload_path"]');
                         return m ? m.getAttribute('content') : null;
                     }""")
                     if reload_url and reload_url.strip() != page.url.strip():
-                        logger.info(f"[merchant] {merchant_id} ae:reload_path → {reload_url}")
+                        logger.info(
+                            f"[merchant] {merchant_id} ae:reload_path → {reload_url}"
+                        )
                         try:
                             page.goto(reload_url, timeout=PAGE_TIMEOUT,
                                       wait_until="domcontentloaded")
                         except Exception as redir_err:
-                            redir_s = str(redir_err)
-                            if "NS_BINDING_ABORTED" not in redir_s and "ERR_ABORTED" not in redir_s:
-                                logger.warning(f"[merchant] {merchant_id} reload_path nav err: {redir_s[:100]}")
-                except Exception as meta_err:
-                    logger.debug(f"[merchant] {merchant_id} meta eval err: {meta_err}")
-
-                # ── STEP 3: Wait for networkidle — React must finish mounting ─
-                # This is the critical gate before page.evaluate().
-                # Without it, the component tree hasn't rendered the item count yet.
-                try:
-                    page.wait_for_load_state("networkidle", timeout=20_000)
+                            rs = str(redir_err)
+                            if "NS_BINDING_ABORTED" not in rs and "ERR_ABORTED" not in rs:
+                                logger.warning(
+                                    f"[merchant] {merchant_id} reload_path err: {rs[:80]}"
+                                )
                 except Exception:
-                    # networkidle may never fire on heavy pages — fall through
                     pass
 
-                # ── STEP 4: Explicit selector wait as secondary signal ────────
+                # ── STEP 3: networkidle warm-up ──────────────────────────────
+                # This is NOT the extraction signal — just a warm-up to let
+                # the network settle before we start polling the DOM.
                 try:
-                    page.wait_for_selector(
-                        'span[data-spm-anchor-id*="store_pc_allItems"]',
-                        timeout=15_000,
-                    )
+                    page.wait_for_load_state("networkidle", timeout=15_000)
                 except Exception:
-                    # Not visible yet — give JS more time
-                    page.wait_for_timeout(random.randint(5_000, 8_000))
+                    pass  # heavy pages may never reach networkidle — continue
 
-                # Small buffer + scroll to trigger lazy-loaded sections
-                page.wait_for_timeout(random.randint(1_000, 2_000))
+                # ── STEP 4: Scroll to trigger lazy-loaded sections ───────────
                 for _ in range(3):
                     page.mouse.wheel(0, 700)
                     page.wait_for_timeout(400)
                 page.wait_for_timeout(1_000)
 
-                # ── STEP 5: Extract via live DOM ─────────────────────────────
-                # MUST happen BEFORE page.close().
-                # page.content() only has the JS skeleton — never the item count.
-                js_count = page.evaluate(_JS_EXTRACT_COUNT)
+                # ── STEP 5: POLL DOM until item count appears ────────────────
+                # This is the KEY FIX. Instead of one evaluate() call that
+                # may fire before React mounts, we poll every 100 ms for up
+                # to 20 s. The moment React renders the span, we get the count.
+                js_count = _wait_for_item_count(page, poll_timeout_ms=20_000)
 
-                # Detect legitimate store ID migration (not geo-redirect)
+                # If polling timed out, try one final evaluate() as fallback
+                if js_count is None:
+                    logger.debug(
+                        f"[merchant] {merchant_id} polling timed out — "
+                        f"trying single evaluate fallback"
+                    )
+                    try:
+                        js_count = page.evaluate(_JS_EXTRACT_COUNT)
+                    except Exception:
+                        pass
+
+                # Detect legitimate store ID migration
                 redirected_to = None
                 m_redir = re.search(r'/store/(\d+)/', page.url)
                 if m_redir and m_redir.group(1) != merchant_id:
                     redirected_to = m_redir.group(1)
                     logger.info(
-                        f"[merchant] {merchant_id} → store {redirected_to} "
-                        f"(ID migration, not geo-redirect — locale cookies set)"
+                        f"[merchant] {merchant_id} → store {redirected_to} (ID migration)"
                     )
 
-                # Grab HTML ONLY for block detection
+                # Block check on HTML skeleton (block signals ARE in skeleton)
                 html  = page.content()
                 lower = html.lower()
                 page.close()
                 ctx.close()
 
-                # ── Block / CAPTCHA detection ─────────────────────────────────
                 is_blocked = any(sig in lower for sig in REAL_BLOCK_SIGNALS)
                 if is_blocked:
-                    logger.warning(f"[merchant] {merchant_id} — CAPTCHA/block detected (attempt {attempt})")
+                    logger.warning(
+                        f"[merchant] {merchant_id} — CAPTCHA/block (attempt {attempt})"
+                    )
                     if attempt < MAX_RETRIES:
-                        sleep_time = random.uniform(15, 25)  # longer back-off for CAPTCHA
-                        logger.info(f"[merchant] {merchant_id} sleeping {sleep_time:.0f} s before retry")
-                        time.sleep(sleep_time)
+                        time.sleep(random.uniform(15, 25))
                         continue
                     return {"merchant_id": merchant_id, "total_items": None,
-                            "error": "Blocked/CAPTCHA after retries", "redirected_to": redirected_to}
+                            "error": "Blocked/CAPTCHA after retries",
+                            "redirected_to": redirected_to}
 
-                # ── Return JS result ──────────────────────────────────────────
                 if js_count is not None:
                     logger.info(
-                        f"[merchant] {merchant_id} ✓ {js_count} items (DOM)"
+                        f"[merchant] {merchant_id} ✓ {js_count} items"
                         + (f" → redir {redirected_to}" if redirected_to else "")
                     )
                     return {"merchant_id": merchant_id, "total_items": js_count,
                             "error": "", "redirected_to": redirected_to}
 
-                # ── HTML regex fallback ───────────────────────────────────────
+                # HTML regex fallback (rarely succeeds but worth trying)
                 count = _extract_item_count_from_html(html)
                 if count is not None:
-                    logger.info(f"[merchant] {merchant_id} ✓ {count} items (HTML fallback)")
+                    logger.info(
+                        f"[merchant] {merchant_id} ✓ {count} items (HTML fallback)"
+                    )
                     return {"merchant_id": merchant_id, "total_items": count,
                             "error": "", "redirected_to": redirected_to}
 
                 if attempt < MAX_RETRIES:
                     logger.warning(
                         f"[merchant] {merchant_id} — count not found "
-                        f"(attempt {attempt}/{MAX_RETRIES}), retrying in 5–10 s"
+                        f"(attempt {attempt}/{MAX_RETRIES}), retrying"
                     )
                     time.sleep(random.uniform(5, 10))
                     continue
@@ -481,7 +552,9 @@ def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
-    logger.info(f"[job:{job_id}] Batch {batch_idx:04d} start — {len(merchant_ids)} merchants")
+    logger.info(
+        f"[job:{job_id}] Batch {batch_idx:04d} start — {len(merchant_ids)} merchants"
+    )
     rows = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         futures = {pool.submit(_scrape_merchant, mid): mid for mid in merchant_ids}
@@ -490,8 +563,8 @@ def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
                 row = future.result(timeout=300)
             except Exception as e:
                 mid = futures[future]
-                row = {"merchant_id": mid, "total_items": None, "error": str(e)[:120],
-                       "redirected_to": None}
+                row = {"merchant_id": mid, "total_items": None,
+                       "error": str(e)[:120], "redirected_to": None}
             rows.append(row)
     _write_batch_csv(job_id, batch_idx, rows)
 
@@ -501,7 +574,10 @@ def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
-    batches       = [merchant_ids[i:i + BATCH_SIZE] for i in range(0, len(merchant_ids), BATCH_SIZE)]
+    batches       = [
+        merchant_ids[i:i + BATCH_SIZE]
+        for i in range(0, len(merchant_ids), BATCH_SIZE)
+    ]
     batches_total = len(batches)
     total         = len(merchant_ids)
 
@@ -509,7 +585,10 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
         "job_id": job_id, "status": "running", "total": total,
         "batches_total": batches_total, "batches_done": 0, "batches_failed": 0,
         "started_at": datetime.utcnow().isoformat(), "finished_at": None,
-        "batches": [{"idx": i, "size": len(b), "status": "queued"} for i, b in enumerate(batches)],
+        "batches": [
+            {"idx": i, "size": len(b), "status": "queued"}
+            for i, b in enumerate(batches)
+        ],
     }
     _save_metadata(job_id, meta)
 
@@ -519,7 +598,10 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
             "batches_total": batches_total, "batches_done": 0, "batches_failed": 0,
         })
 
-    logger.info(f"[job:{job_id}] Start — {total} merchants | {batches_total} batches of {BATCH_SIZE}")
+    logger.info(
+        f"[job:{job_id}] Start — {total} merchants | "
+        f"{batches_total} batches of {BATCH_SIZE}"
+    )
 
     for idx, batch in enumerate(batches):
         meta["batches"][idx]["status"] = "running"
