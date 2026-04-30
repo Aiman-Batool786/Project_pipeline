@@ -22,6 +22,9 @@ from product_filter import (
 )
 
 import uuid
+import random
+import time
+import re as _re
 from fastapi import UploadFile, File, BackgroundTasks
 from fastapi.responses import Response as FastAPIResponse
 from merchant_scraper import (
@@ -32,6 +35,7 @@ from merchant_scraper import (
     list_all_jobs,
     _make_context,
     _JS_EXTRACT_COUNT,
+    _wait_for_item_count,
     STORE_URL_TEMPLATE,
     USER_AGENTS,
     PAGE_TIMEOUT,
@@ -650,9 +654,9 @@ async def upload_merchant_csv(file: UploadFile = File(...)):
 
 @app.post("/submit-merchant-ids", tags=["Merchant Bulk"])
 def submit_merchant_ids(req: MerchantIDsRequest):
-    import re as _re
+    import re as _re2
     clean_ids = [mid.strip() for mid in req.merchant_ids
-                 if mid and _re.match(r"^\d+$", mid.strip())]
+                 if mid and _re2.match(r"^\d+$", mid.strip())]
     if not clean_ids:
         raise HTTPException(status_code=422, detail="No valid numeric merchant IDs provided")
 
@@ -712,27 +716,26 @@ def list_merchant_jobs():
 
 
 # =============================================================================
-# MERCHANT DEBUG ENDPOINT  v3.3
+# MERCHANT DEBUG  v3.4
+# KEY FIX: uses _wait_for_item_count() which POLLS the DOM every 100 ms
+# instead of a single page.evaluate() that fires before React mounts.
 # =============================================================================
-
-import random as _random
-import time as _time
-import re as _re
 
 @app.post("/merchant-debug", tags=["Merchant Bulk"])
 def merchant_debug(req: MerchantDebugRequest):
     """
     DEBUG — scrape ONE merchant with full diagnostic info.
 
-    v3.3 FIX — Root cause: AliExpress geo-detects the server IP and
-    redirects to a country-specific store version with a DIFFERENT store ID.
-    The fix: inject Sweden + EUR + English cookies BEFORE the first navigation
-    so AliExpress serves the correct store without any geo-redirect.
+    v3.4 FIX — Root cause of "Selector Missing":
+      networkidle fires when no network requests for 500 ms, but React can
+      still be mid-render with zero network activity. A single page.evaluate()
+      at that moment returns null because the span isn't in the DOM yet.
 
-    Additionally follows ae:reload_path meta-redirect and waits for
-    networkidle before running page.evaluate() against the live DOM.
+    Fix: _wait_for_item_count() polls the DOM every 100 ms for up to 20 s
+    using wait_for_function(). The moment React mounts the item count span,
+    we capture it — regardless of how long rendering takes.
 
-    Input:  { "merchant_id": "1104653774" }
+    Input:  { "merchant_id": "246548581" }
     """
     from camoufox.sync_api import Camoufox
 
@@ -741,28 +744,28 @@ def merchant_debug(req: MerchantDebugRequest):
         raise HTTPException(status_code=400, detail="merchant_id must be numeric")
 
     url = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
-    ua  = _random.choice(USER_AGENTS)
-    t0  = _time.time()
+    ua  = random.choice(USER_AGENTS)
+    t0  = time.time()
 
     debug = {
-        "url": url,
-        "page_loaded": False,
-        "final_url": None,
-        "html_size_bytes": 0,
-        "blocked": False,
-        "reload_path_detected": None,
-        "networkidle": None,
-        "selector_hit": None,
-        "js_count": None,
-        "redirected_to": None,
-        "locale_cookies_injected": True,   # always True in v3.3
-        "load_time_sec": None,
-        "nav_error": None,
+        "url":                    url,
+        "page_loaded":            False,
+        "final_url":              None,
+        "html_size_bytes":        0,
+        "blocked":                False,
+        "reload_path_detected":   None,
+        "networkidle":            None,
+        "selector_hit":           None,
+        "poll_result":            None,   # what DOM polling found
+        "js_count":               None,   # fallback evaluate result
+        "redirected_to":          None,
+        "locale_cookies_injected": True,
+        "load_time_sec":          None,
+        "nav_error":              None,
     }
 
     try:
         with Camoufox(headless=True, os="windows") as browser:
-            # ── Locale-forced context ─────────────────────────────────────────
             ctx  = _make_context(browser, ua)
             page = ctx.new_page()
 
@@ -793,46 +796,46 @@ def merchant_debug(req: MerchantDebugRequest):
                 }""")
                 if reload_url and reload_url.strip() != page.url.strip():
                     debug["reload_path_detected"] = reload_url
-                    logger.info(f"[debug] {merchant_id} ae:reload_path → {reload_url}")
                     try:
                         page.goto(reload_url, timeout=PAGE_TIMEOUT,
                                   wait_until="domcontentloaded")
                     except Exception as redir_err:
                         rs = str(redir_err)
                         if "NS_BINDING_ABORTED" not in rs and "ERR_ABORTED" not in rs:
-                            debug["nav_error"] = f"reload_path nav: {rs[:100]}"
+                            debug["nav_error"] = f"reload_path: {rs[:100]}"
             except Exception as meta_err:
-                debug["nav_error"] = f"meta eval: {str(meta_err)[:100]}"
+                debug["nav_error"] = f"meta eval: {str(meta_err)[:80]}"
 
-            # ── STEP 3: networkidle — React must finish mounting ──────────────
+            # ── STEP 3: networkidle warm-up (not the extraction signal) ───────
             try:
-                page.wait_for_load_state("networkidle", timeout=20_000)
+                page.wait_for_load_state("networkidle", timeout=15_000)
                 debug["networkidle"] = "reached"
             except Exception:
                 debug["networkidle"] = "timeout — used fallback"
 
-            # ── STEP 4: explicit selector wait ───────────────────────────────
-            try:
-                page.wait_for_selector(
-                    'span[data-spm-anchor-id*="store_pc_allItems"]',
-                    timeout=15_000,
-                )
-                debug["selector_hit"] = "wait_for_selector_succeeded"
-            except Exception:
-                page.wait_for_timeout(5_000)
-                debug["selector_hit"] = "wait_for_selector_timed_out"
-
-            page.wait_for_timeout(2_000)
+            # ── STEP 4: Scroll to trigger lazy-loaded sections ────────────────
             for _ in range(3):
                 page.mouse.wheel(0, 700)
                 page.wait_for_timeout(400)
             page.wait_for_timeout(1_000)
 
-            # ── STEP 5: live DOM eval (MUST be before page.close()) ───────────
-            js_count = page.evaluate(_JS_EXTRACT_COUNT)
-            debug["js_count"]      = js_count
+            # ── STEP 5: POLL DOM until item count appears ─────────────────────
+            # This is the core fix. Polls every 100 ms for up to 20 s.
+            # Catches the element the moment React renders it.
+            polled_count = _wait_for_item_count(page, poll_timeout_ms=20_000)
+            debug["poll_result"] = polled_count
+
+            # Fallback: single evaluate if polling timed out
+            js_count = polled_count
+            if js_count is None:
+                try:
+                    js_count = page.evaluate(_JS_EXTRACT_COUNT)
+                    debug["js_count"] = js_count
+                except Exception:
+                    pass
+
             debug["final_url"]     = page.url
-            debug["load_time_sec"] = round(_time.time() - t0, 2)
+            debug["load_time_sec"] = round(time.time() - t0, 2)
 
             html = page.content()
             debug["html_size_bytes"] = len(html)
@@ -846,8 +849,7 @@ def merchant_debug(req: MerchantDebugRequest):
         if m_redir and m_redir.group(1) != merchant_id:
             debug["redirected_to"] = m_redir.group(1)
             debug["note"] = (
-                f"Store {merchant_id} → {debug['redirected_to']} "
-                f"(ID migration — locale cookies were set, this is legitimate)"
+                f"Store {merchant_id} → {debug['redirected_to']} (ID migration)"
             )
 
         # ── Block detection ───────────────────────────────────────────────────
@@ -860,14 +862,15 @@ def merchant_debug(req: MerchantDebugRequest):
             return {"success": True, "merchant_id": merchant_id,
                     "total_items": js_count, "error": None, "debug": debug}
 
-        # Diagnostic: show head of HTML if JS extraction also failed
         debug["html_head_500"] = html[:500].replace("\n", " ")
-        return {"success": False, "merchant_id": merchant_id, "total_items": None,
-                "error": "Selector Missing after locale fix — see debug.html_head_500",
-                "debug": debug}
+        return {
+            "success": False, "merchant_id": merchant_id, "total_items": None,
+            "error": "Selector Missing after polling — check debug.html_head_500",
+            "debug": debug,
+        }
 
     except Exception as exc:
-        debug["load_time_sec"] = round(_time.time() - t0, 2)
+        debug["load_time_sec"] = round(time.time() - t0, 2)
         return {"success": False, "merchant_id": merchant_id,
                 "total_items": None, "error": str(exc)[:300], "debug": debug}
 
