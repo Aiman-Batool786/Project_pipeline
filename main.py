@@ -1003,42 +1003,11 @@ import random as random  # ensure random available in endpoint scope
 # MERCHANT DEBUG ENDPOINT (single ID test — does NOT use batch system)
 # =============================================================================
 
-_DEBUG_JS_EXTRACT = """() => {
-    // Collect ALL matching elements and their text for diagnosis
-    const results = [];
+class MerchantDebugRequest(BaseModel):
+    merchant_id: str
 
-    // Method 1 — exact spm anchor substring match (most reliable)
-    document.querySelectorAll('span[data-spm-anchor-id*="store_pc_allItems_or_groupList"]')
-        .forEach(el => results.push({method:'anchor_exact', text: el.textContent.trim(),
-                                      anchor: el.getAttribute('data-spm-anchor-id')}));
-
-    // Method 2 — broader store_pc_allItems
-    document.querySelectorAll('span[data-spm-anchor-id*="store_pc_allItems"]')
-        .forEach(el => results.push({method:'anchor_broad', text: el.textContent.trim(),
-                                      anchor: el.getAttribute('data-spm-anchor-id')}));
-
-    // Method 3 — any span whose full text is "N items"
-    document.querySelectorAll('span').forEach(el => {
-        const t = el.textContent.trim();
-        if (/^\\d[\\d,]*\\s+items?$/i.test(t))
-            results.push({method:'span_full_text', text: t, anchor: el.getAttribute('data-spm-anchor-id') || ''});
-    });
-
-    // Method 4 — SSR JSON blobs in script tags
-    document.querySelectorAll('script').forEach(s => {
-        const m = (s.textContent||'').match(/"(?:totalProducts|itemCount|totalItems|storeItemCount)"\\s*:\\s*(\\d+)/);
-        if (m) results.push({method:'script_json', text: m[1]+' items', anchor:''});
-    });
-
-    // Deduplicate and pick first numeric match
-    let count = null;
-    for (const r of results) {
-        const m = r.text.match(/(\\d[\\d,]*)\\s+items?/i);
-        if (m && count === null) count = parseInt(m[1].replace(/,/g,''), 10);
-    }
-
-    return {count, candidates: results.slice(0, 10)};
-}"""
+    class Config:
+        json_schema_extra = {"example": {"merchant_id": "1104990029"}}
 
 
 @app.post("/merchant-debug", tags=["Merchant Bulk"])
@@ -1046,15 +1015,22 @@ def merchant_debug(req: MerchantDebugRequest):
     """
     DEBUG — scrape ONE merchant and return full diagnostic info.
 
-    v3.1 FIX: extracts item count via page.evaluate() against the live
-    rendered DOM, NOT via regex on page.content() (which only contains the
-    JS skeleton — the word 'items' will never appear in it).
+    ROOT CAUSE FIX: AliExpress uses <meta property="ae:reload_path"> to
+    redirect old store IDs to new ones via JavaScript. domcontentloaded fires
+    on the shell page BEFORE the JS redirect executes. We must:
+      1. Detect the ae:reload_path meta
+      2. Navigate explicitly to the new URL
+      3. Wait for networkidle so React finishes rendering
+      4. Extract item count via page.evaluate() against the live DOM
+         (page.content() only returns the skeleton — item count is never in it)
 
-    Input:  { "merchant_id": "1104990029" }
+    Input:  { "merchant_id": "911754561" }
     """
-    import time as _time
+    from merchant_scraper import (
+        STORE_URL_TEMPLATE, USER_AGENTS, PAGE_TIMEOUT, _JS_EXTRACT_COUNT
+    )
     from camoufox.sync_api import Camoufox
-    from merchant_scraper import STORE_URL_TEMPLATE, USER_AGENTS, PAGE_TIMEOUT
+    import time as _time, re as _re
 
     merchant_id = str(req.merchant_id).strip()
     if not merchant_id.isdigit():
@@ -1063,30 +1039,23 @@ def merchant_debug(req: MerchantDebugRequest):
     url = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
     ua  = random.choice(USER_AGENTS)
     t0  = _time.time()
-
     debug = {
-        "url": url,
-        "page_loaded": False,
-        "final_url": None,
-        "html_size_bytes": 0,
-        "blocked": False,
-        "js_candidates": [],      # what the live DOM found
-        "selector_hit": None,
-        "load_time_sec": None,
-        "nav_error": None,
+        "url": url, "page_loaded": False, "final_url": None,
+        "html_size_bytes": 0, "blocked": False, "reload_path_detected": None,
+        "js_count": None, "selector_hit": None,
+        "load_time_sec": None, "nav_error": None,
     }
 
     try:
         with Camoufox(headless=True, os="windows") as browser:
             ctx = browser.new_context(
-                viewport={"width": 1440, "height": 900},
-                locale="en-US",
+                viewport={"width": 1440, "height": 900}, locale="en-US",
                 user_agent=ua,
                 extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             )
             page = ctx.new_page()
 
-            # ── Navigate ────────────────────────────────────────────────────
+            # ── Step 1: navigate to store page ──────────────────────────────
             try:
                 page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
                 debug["page_loaded"] = True
@@ -1095,7 +1064,7 @@ def merchant_debug(req: MerchantDebugRequest):
                 debug["nav_error"] = es[:200]
                 if "NS_BINDING_ABORTED" in es or "ERR_ABORTED" in es:
                     debug["page_loaded"] = True
-                    debug["nav_error"]   = "Redirect mid-load — continuing"
+                    debug["nav_error"] = "Redirect mid-load — continuing"
                 elif any(x in es for x in ["ERR_NAME_NOT_RESOLVED", "NS_ERROR"]):
                     page.close(); ctx.close()
                     return {"success": False, "merchant_id": merchant_id,
@@ -1103,9 +1072,30 @@ def merchant_debug(req: MerchantDebugRequest):
                 else:
                     page.close(); ctx.close()
                     return {"success": False, "merchant_id": merchant_id,
-                            "total_items": None, "error": f"Nav error: {es[:150]}", "debug": debug}
+                            "total_items": None, "error": f"Nav: {es[:150]}", "debug": debug}
 
-            # ── Wait for JS-rendered item count span ─────────────────────────
+            # ── Step 2: detect and follow ae:reload_path JS meta-redirect ───
+            reload_url = page.evaluate("""() => {
+                const meta = document.querySelector('meta[property="ae:reload_path"]');
+                return meta ? meta.getAttribute('content') : null;
+            }""")
+            if reload_url and reload_url != page.url:
+                debug["reload_path_detected"] = reload_url
+                logger.info(f"[debug] {merchant_id} ae:reload_path → {reload_url}")
+                try:
+                    page.goto(reload_url, timeout=PAGE_TIMEOUT,
+                              wait_until="domcontentloaded")
+                except Exception:
+                    pass
+
+            # ── Step 3: wait for networkidle → React finishes rendering ─────
+            try:
+                page.wait_for_load_state("networkidle", timeout=15_000)
+                debug["selector_hit"] = "networkidle_reached"
+            except Exception:
+                debug["selector_hit"] = "networkidle_timeout_used_fallback"
+
+            # ── Step 4: explicit selector wait ──────────────────────────────
             try:
                 page.wait_for_selector(
                     'span[data-spm-anchor-id*="store_pc_allItems"]',
@@ -1113,46 +1103,29 @@ def merchant_debug(req: MerchantDebugRequest):
                 )
                 debug["selector_hit"] = "wait_for_selector_succeeded"
             except Exception:
-                # Selector not visible within 10 s — give JS more time
-                page.wait_for_timeout(5_000)
-                debug["selector_hit"] = "wait_for_selector_timed_out_used_fallback_wait"
+                page.wait_for_timeout(4_000)
 
-            # Extra buffer + scroll to trigger any lazy-loaded sections
             page.wait_for_timeout(2_000)
             for _ in range(3):
                 page.mouse.wheel(0, 600)
                 page.wait_for_timeout(400)
-            page.wait_for_timeout(1_000)
 
-            # ── PRIMARY EXTRACTION: live DOM via JS ──────────────────────────
-            # MUST run before page.close().
-            # page.content() returns only the skeleton HTML — JS-rendered
-            # elements like the item count span are NOT in it.
-            js_result = page.evaluate(_DEBUG_JS_EXTRACT)
-            js_count      = js_result.get("count")
-            js_candidates = js_result.get("candidates", [])
-
-            debug["js_candidates"]   = js_candidates
+            # ── Step 5: extract via live DOM (MUST be before page.close()) ──
+            js_count = page.evaluate(_JS_EXTRACT_COUNT)
+            debug["js_count"]        = js_count
             debug["final_url"]       = page.url
             debug["load_time_sec"]   = round(_time.time() - t0, 2)
 
-            # ── Grab raw HTML only for block detection ───────────────────────
-            html  = page.content()
+            html = page.content()
             debug["html_size_bytes"] = len(html)
-            lower = html.lower()
-
             page.close()
             ctx.close()
 
         # ── Redirect detection ───────────────────────────────────────────────
-        import re as _re
+        lower = html.lower()
         m_redir = _re.search(r'/store/(\d+)/', debug["final_url"] or "")
         if m_redir and m_redir.group(1) != merchant_id:
             debug["redirected_to"] = m_redir.group(1)
-            debug["note"] = (
-                f"Store {merchant_id} migrated → {m_redir.group(1)} "
-                f"(normal AliExpress ID migration)"
-            )
 
         # ── Precise block detection ──────────────────────────────────────────
         real_block_signals = [
@@ -1162,35 +1135,28 @@ def merchant_debug(req: MerchantDebugRequest):
             'cf-challenge-running',
         ]
         debug["blocked"] = any(sig in lower for sig in real_block_signals)
-
         if debug["blocked"]:
             return {"success": False, "merchant_id": merchant_id,
                     "total_items": None, "error": "Blocked/CAPTCHA", "debug": debug}
 
         if js_count is not None:
-            return {
-                "success":     True,
-                "merchant_id": merchant_id,
-                "total_items": js_count,
-                "error":       None,
-                "debug":       debug,
-            }
+            return {"success": True, "merchant_id": merchant_id,
+                    "total_items": js_count, "error": None, "debug": debug}
 
-        # ── No count found anywhere ──────────────────────────────────────────
-        # Add a raw HTML excerpt for further diagnosis
+        # Add HTML head for further diagnosis if JS also failed
         debug["html_head_500"] = html[:500].replace("\n", " ")
-        return {
-            "success":     False,
-            "merchant_id": merchant_id,
-            "total_items": None,
-            "error":       "Selector Missing — see debug.js_candidates for live DOM state",
-            "debug":       debug,
-        }
+        return {"success": False, "merchant_id": merchant_id,
+                "total_items": None,
+                "error": "Selector Missing after ae:reload_path fix — see debug",
+                "debug": debug}
 
     except Exception as exc:
         debug["load_time_sec"] = round(_time.time() - t0, 2)
         return {"success": False, "merchant_id": merchant_id,
                 "total_items": None, "error": str(exc)[:300], "debug": debug}
+
+
+
 
 
 # RELOAD FILTERS
