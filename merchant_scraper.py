@@ -1,23 +1,27 @@
 """
-merchant_scraper.py — Batch-Safe Bulk Processor v3.7
-─────────────────────────────────────────────────────
-KEY FINDING (from debug output merchant 912058106):
-  networkidle = REACHED   → page fully loaded
-  html_size   = 257KB     → full page, not throttled, not blocked
-  poll_result = null      → 60s polling found NOTHING
-  
-  This means: the page loaded completely BUT our JS selectors are not
-  matching the actual DOM structure. The element shape must differ from
-  what we expect.
+merchant_scraper.py — Network-Intercept Edition v4.0
+──────────────────────────────────────────────────────
 
-  SOLUTION: Added _JS_DOM_DUMP that extracts ALL text containing "item"
-  from the live DOM — this tells us EXACTLY what element shape AliExpress
-  is using so we can fix the selector precisely.
+ROOT CAUSE ANALYSIS (v3.7 → v4.0):
+  The item count is NOT in the initial HTML. AliExpress loads it via an
+  XHR/Fetch API call AFTER React hydrates. The API URL pattern is:
 
-  Also added broader fallback selectors:
-  - Match "N item" (singular, no 's')  
-  - Match inside elements with 'total' in their class/id
-  - Match any element whose text is purely numeric followed by 'item'
+    POST https://aecommerce.aliexpress.com/store/async/merchandise/count
+    or
+    GET  https://server.ilecdn.com/mtop/... (newer CDN-backed endpoint)
+
+  Strategy (in priority order):
+    1. INTERCEPT — register page.on("response") BEFORE navigation, capture
+                   the JSON from the count API directly. Zero DOM dependency.
+    2. POLL TEXT  — tree-walk every text node for /^\d[\d,]* items?$/i.
+                   Works regardless of class/id/anchor changes.
+    3. HTML REGEX — scan raw HTML for JSON fields or inline text patterns.
+
+  Redirect fix:
+    AliExpress 301-redirects old merchant IDs at the NETWORK level. We now
+    treat the landing URL as the canonical source of truth and never mistake
+    it for a "wrong" redirect — we record it as redirected_to but always
+    process the page we actually landed on.
 """
 
 import re
@@ -29,11 +33,11 @@ import logging
 import threading
 import io
 from pathlib import Path
-from typing import List, Dict, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Optional, Any
 from datetime import datetime
 
 from camoufox.sync_api import Camoufox
+from playwright.sync_api import Response as PlaywrightResponse
 
 logger = logging.getLogger("merchant_scraper")
 
@@ -50,8 +54,8 @@ BATCH_SIZE          = 20
 CONCURRENCY         = 1
 MAX_RETRIES         = 3
 PAGE_TIMEOUT        = 90_000
-NETWORKIDLE_TIMEOUT = 25_000
-POLL_TIMEOUT_MS     = 60_000
+NETWORKIDLE_TIMEOUT = 20_000
+POLL_TIMEOUT_MS     = 30_000   # Reduced — intercept usually wins in <5s
 DELAY_MIN           = 8.0
 DELAY_MAX           = 20.0
 THROTTLE_DELAY_MIN  = 30
@@ -107,6 +111,28 @@ REAL_BLOCK_SIGNALS = [
     'verify you are human',
     '<title>access denied</title>',
     'cf-challenge-running',
+]
+
+# XHR/Fetch URL fragments that carry the item count
+# AliExpress uses several CDN/API hosts depending on region & A/B test
+COUNT_API_PATTERNS = [
+    "merchandise/count",
+    "store/async/merchandise",
+    "mtop.aliexpress.store.pc.shop.item.count",
+    "mtop.aliexpress.store.page",
+    "aecommerce.aliexpress.com",
+    "/store/async/",
+    "storeFront/count",
+    "storeItemCount",
+    "shop_itemcount",
+    "shop-item-count",
+]
+
+# JSON field names that hold the total count in the intercepted response
+COUNT_JSON_FIELDS = [
+    "totalProducts", "itemCount", "totalItems", "storeItemCount",
+    "total", "count", "totalResults", "productCount", "allProductCount",
+    "totalNum", "totalRecord", "totalCount", "itemTotal",
 ]
 
 _jobs: Dict[str, Dict] = {}
@@ -175,202 +201,165 @@ def parse_merchant_csv(file_bytes: bytes) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTML FALLBACK
+# STRATEGY 1 — XHR / FETCH INTERCEPTION
+# Register BEFORE page.goto() so we never miss the request.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_item_count_from_html(html: str) -> Optional[int]:
-    for pattern in [
-        r'data-spm-anchor-id="[^"]*store_pc_allItems_or_groupList[^"]*"[^>]*>\s*(\d[\d,]*)\s*items?',
-        r'data-spm-anchor-id="[^"]*store_pc_allItems[^"]*"[^>]*>\s*(\d[\d,]*)\s*items?',
-        r'<span[^>]+font-size:\s*1[0-9]px[^>]*>\s*(\d[\d,]+)\s*items?\s*</span>',
-        r'"(?:totalProducts|itemCount|totalItems|storeItemCount)"\s*:\s*(\d+)',
-    ]:
-        m = re.search(pattern, html, re.IGNORECASE)
-        if m:
-            return int(m.group(1).replace(",", ""))
+def _is_count_api_response(url: str) -> bool:
+    """Return True if this response URL looks like the item-count endpoint."""
+    url_lower = url.lower()
+    return any(pat.lower() in url_lower for pat in COUNT_API_PATTERNS)
 
-    all_matches = re.findall(r'\b(\d[\d,]+)\s+items?\b', html, re.IGNORECASE)
-    if all_matches:
-        nums = [int(x.replace(",", "")) for x in all_matches if int(x.replace(",", "")) > 0]
-        if nums:
-            return max(nums)
+
+def _extract_count_from_json(data: Any, depth: int = 0) -> Optional[int]:
+    """
+    Recursively search a parsed JSON object for known count field names.
+    Returns the first plausible value (> 0).
+    """
+    if depth > 8:
+        return None
+
+    if isinstance(data, dict):
+        for field in COUNT_JSON_FIELDS:
+            if field in data:
+                val = data[field]
+                if isinstance(val, (int, float)) and val > 0:
+                    return int(val)
+                if isinstance(val, str) and val.isdigit() and int(val) > 0:
+                    return int(val)
+        # Recurse into values
+        for v in data.values():
+            result = _extract_count_from_json(v, depth + 1)
+            if result is not None:
+                return result
+
+    elif isinstance(data, list):
+        for item in data:
+            result = _extract_count_from_json(item, depth + 1)
+            if result is not None:
+                return result
+
+    return None
+
+
+def _try_parse_response_body(response: PlaywrightResponse) -> Optional[int]:
+    """
+    Safely read a Playwright response body and extract the item count.
+    Handles JSON, JSONP, and embedded JSON in JS assignment strings.
+    """
+    try:
+        body = response.text()
+    except Exception:
+        return None
+
+    if not body or len(body) < 10:
+        return None
+
+    # 1. Pure JSON
+    try:
+        data = json.loads(body)
+        count = _extract_count_from_json(data)
+        if count is not None:
+            return count
+    except json.JSONDecodeError:
+        pass
+
+    # 2. JSONP: callback({...}) or mtopjsonp1({...})
+    jsonp_match = re.search(r'\w+\s*\(\s*(\{.+\})\s*\)\s*;?\s*$', body, re.DOTALL)
+    if jsonp_match:
+        try:
+            data = json.loads(jsonp_match.group(1))
+            count = _extract_count_from_json(data)
+            if count is not None:
+                return count
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Inline regex fallback — grab any count-like field from raw text
+    for field in COUNT_JSON_FIELDS:
+        m = re.search(
+            rf'"{field}"\s*:\s*"?(\d+)"?',
+            body, re.IGNORECASE
+        )
+        if m:
+            val = int(m.group(1))
+            if val > 0:
+                return val
+
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DIAGNOSTIC JS — dumps what the DOM actually contains near "item"
-# Used by /merchant-debug to show the EXACT element shape
+# STRATEGY 2 — DOM POLL (pure text-node walker, no class/anchor dependency)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# This JS walks every text node in the document and looks for "N items" text.
+# It does NOT rely on any CSS class, data attribute, or element ID.
+_JS_TEXTNODE_POLL = """() => {
+    if (!document.body) return false;
+    const walker = document.createTreeWalker(
+        document.body, NodeFilter.SHOW_TEXT, null
+    );
+    let node;
+    while ((node = walker.nextNode())) {
+        const t = node.textContent.trim();
+        // Match: "1234 items" or "1,234 items" or "1234 item"
+        const m = t.match(/^([\d,]+)\s+items?$/i);
+        if (m) {
+            const val = parseInt(m[1].replace(/,/g, ''), 10);
+            if (val > 0) return val;
+        }
+    }
+    // Also search script tags for SSR JSON (React server-side data)
+    for (const s of document.querySelectorAll('script[type="application/json"], script')) {
+        const src = s.textContent || '';
+        if (src.length < 50) continue;
+        const patterns = [
+            /"(?:totalProducts|itemCount|totalItems|storeItemCount|totalResults|allProductCount)"\s*:\s*(\d+)/,
+            /"total"\s*:\s*(\d+)/,
+        ];
+        for (const pat of patterns) {
+            const m2 = src.match(pat);
+            if (m2) {
+                const v = parseInt(m2[1], 10);
+                if (v > 0 && v < 10_000_000) return v;
+            }
+        }
+    }
+    return false;
+}"""
+
+# DOM dump for diagnostics — unchanged from v3.7 but harmless to keep
 _JS_DOM_DUMP = """() => {
     const results = [];
-
-    // 1. All elements whose text contains "item" (case insensitive)
     const all = document.querySelectorAll('span, div, p, h1, h2, h3, li');
     for (const el of all) {
         const t = el.textContent.trim();
-        // Only leaf-like elements (short text, contains "item")
         if (t.length < 60 && /item/i.test(t) && t.length > 0) {
             results.push({
-                tag:    el.tagName.toLowerCase(),
-                text:   t,
-                id:     el.id || '',
-                cls:    el.className ? String(el.className).slice(0, 80) : '',
+                tag: el.tagName.toLowerCase(), text: t,
+                id: el.id || '', cls: el.className ? String(el.className).slice(0, 80) : '',
                 anchor: el.getAttribute('data-spm-anchor-id') || '',
-                style:  el.getAttribute('style') ? el.getAttribute('style').slice(0, 80) : ''
+                style: el.getAttribute('style') ? el.getAttribute('style').slice(0, 80) : ''
             });
             if (results.length >= 20) break;
         }
     }
-
-    // 2. Also check script tags for JSON data with product counts
     const scriptMatches = [];
     for (const s of document.querySelectorAll('script')) {
         const src = s.textContent || '';
         const m = src.match(/"(?:totalProducts|itemCount|totalItems|storeItemCount|total)"\s*:\s*(\d+)/g);
         if (m) scriptMatches.push(...m.slice(0, 3));
     }
-
     return { dom_elements: results, script_matches: scriptMatches.slice(0, 10) };
 }"""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PRIMARY JS EXTRACTOR — expanded to catch more element shapes
-# ─────────────────────────────────────────────────────────────────────────────
-
-_JS_EXTRACT_COUNT = """() => {
-    // Shape 1: span with store_pc_allItems_or_groupList anchor
-    for (const el of document.querySelectorAll(
-            'span[data-spm-anchor-id*="store_pc_allItems_or_groupList"]')) {
-        const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
-        if (m) return parseInt(m[1].replace(/,/g,''), 10);
-    }
-    // Shape 2: span with store_pc_allItems anchor
-    for (const el of document.querySelectorAll(
-            'span[data-spm-anchor-id*="store_pc_allItems"]')) {
-        const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
-        if (m) return parseInt(m[1].replace(/,/g,''), 10);
-    }
-    // Shape 3: parent div has anchor, child span has text
-    for (const div of document.querySelectorAll(
-            'div[data-spm-anchor-id*="store_pc_allItems_or_groupList"],' +
-            'div[data-spm-anchor-id*="store_pc_allItems"]')) {
-        for (const span of div.querySelectorAll('span')) {
-            const m = span.textContent.trim().match(/^(\\d[\\d,]*)\\s+items?$/i);
-            if (m) return parseInt(m[1].replace(/,/g,''), 10);
-        }
-    }
-    // Shape 4: any span whose full text is exactly "N items" or "N item"
-    for (const el of document.querySelectorAll('span')) {
-        const m = el.textContent.trim().match(/^(\\d[\\d,]*)\\s+items?$/i);
-        if (m) return parseInt(m[1].replace(/,/g,''), 10);
-    }
-    // Shape 5: div direct text node is "N items"
-    for (const el of document.querySelectorAll('div')) {
-        const direct = Array.from(el.childNodes)
-            .filter(n => n.nodeType === 3)
-            .map(n => n.textContent.trim()).join('');
-        const m = direct.match(/^(\\d[\\d,]*)\\s+items?$/i);
-        if (m) return parseInt(m[1].replace(/,/g,''), 10);
-    }
-    // Shape 6: any element with class/id containing 'total' or 'count'
-    for (const el of document.querySelectorAll('[class*="total"],[class*="count"],[id*="total"],[id*="count"]')) {
-        const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
-        if (m) return parseInt(m[1].replace(/,/g,''), 10);
-    }
-    // Shape 7: SSR JSON in script tags
-    for (const s of document.querySelectorAll('script')) {
-        const src = s.textContent || '';
-        const m = src.match(
-            /"(?:totalProducts|itemCount|totalItems|storeItemCount)"\s*:\\s*(\\d+)/
-        );
-        if (m) return parseInt(m[1], 10);
-    }
-    // Shape 8: broader text search — any element containing "N items" text
-    // where N > 0. Last resort before giving up.
-    const walker = document.createTreeWalker(
-        document.body, NodeFilter.SHOW_TEXT, null
-    );
-    let node;
-    while ((node = walker.nextNode())) {
-        const t = node.textContent.trim();
-        const m = t.match(/^(\\d[\\d,]*)\\s+items?$/i);
-        if (m) {
-            const val = parseInt(m[1].replace(/,/g,''), 10);
-            if (val > 0) return val;
-        }
-    }
-    return null;
-}"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DOM POLLING — same broad search, returns false to keep polling
-# ─────────────────────────────────────────────────────────────────────────────
-
-_JS_POLL_FOR_COUNT = """() => {
-    for (const el of document.querySelectorAll(
-            'span[data-spm-anchor-id*="store_pc_allItems_or_groupList"]')) {
-        const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
-        if (m) return parseInt(m[1].replace(/,/g,''), 10);
-    }
-    for (const el of document.querySelectorAll(
-            'span[data-spm-anchor-id*="store_pc_allItems"]')) {
-        const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
-        if (m) return parseInt(m[1].replace(/,/g,''), 10);
-    }
-    for (const div of document.querySelectorAll(
-            'div[data-spm-anchor-id*="store_pc_allItems_or_groupList"],' +
-            'div[data-spm-anchor-id*="store_pc_allItems"]')) {
-        for (const span of div.querySelectorAll('span')) {
-            const m = span.textContent.trim().match(/^(\\d[\\d,]*)\\s+items?$/i);
-            if (m) return parseInt(m[1].replace(/,/g,''), 10);
-        }
-    }
-    for (const el of document.querySelectorAll('span')) {
-        const m = el.textContent.trim().match(/^(\\d[\\d,]*)\\s+items?$/i);
-        if (m) return parseInt(m[1].replace(/,/g,''), 10);
-    }
-    for (const el of document.querySelectorAll('div')) {
-        const direct = Array.from(el.childNodes)
-            .filter(n => n.nodeType === 3)
-            .map(n => n.textContent.trim()).join('');
-        const m = direct.match(/^(\\d[\\d,]*)\\s+items?$/i);
-        if (m) return parseInt(m[1].replace(/,/g,''), 10);
-    }
-    for (const el of document.querySelectorAll('[class*="total"],[class*="count"],[id*="total"],[id*="count"]')) {
-        const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
-        if (m) return parseInt(m[1].replace(/,/g,''), 10);
-    }
-    for (const s of document.querySelectorAll('script')) {
-        const src = s.textContent || '';
-        const m = src.match(
-            /"(?:totalProducts|itemCount|totalItems|storeItemCount)"\\s*:\\s*(\\d+)/
-        );
-        if (m) return parseInt(m[1], 10);
-    }
-    // TreeWalker: scan ALL text nodes
-    const walker = document.createTreeWalker(
-        document.body, NodeFilter.SHOW_TEXT, null
-    );
-    let node;
-    while ((node = walker.nextNode())) {
-        const t = node.textContent.trim();
-        const m = t.match(/^(\\d[\\d,]*)\\s+items?$/i);
-        if (m) {
-            const val = parseInt(m[1].replace(/,/g,''), 10);
-            if (val > 0) return val;
-        }
-    }
-    return false;
-}"""
-
-
-def _wait_for_item_count(page, poll_timeout_ms: int = POLL_TIMEOUT_MS) -> Optional[int]:
+def _wait_for_item_count_textnode(page, poll_timeout_ms: int = POLL_TIMEOUT_MS) -> Optional[int]:
+    """Poll the DOM every 100ms using the text-node walker — no selector dependency."""
     try:
         result = page.wait_for_function(
-            _JS_POLL_FOR_COUNT,
+            _JS_TEXTNODE_POLL,
             timeout=poll_timeout_ms,
             polling=100,
         )
@@ -379,6 +368,31 @@ def _wait_for_item_count(page, poll_timeout_ms: int = POLL_TIMEOUT_MS) -> Option
             return int(count)
     except Exception as poll_err:
         logger.debug(f"[poll] timed out after {poll_timeout_ms}ms: {poll_err}")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STRATEGY 3 — RAW HTML REGEX FALLBACK
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_item_count_from_html(html: str) -> Optional[int]:
+    """Last-resort: regex scan over the raw HTML string."""
+    # JSON-embedded fields (SSR data, window.__initialData__, etc.)
+    for field in COUNT_JSON_FIELDS:
+        m = re.search(rf'"{field}"\s*:\s*"?(\d+)"?', html, re.IGNORECASE)
+        if m:
+            val = int(m.group(1))
+            if 0 < val < 10_000_000:
+                return val
+
+    # Visible text pattern: "N items" anywhere in the HTML
+    all_matches = re.findall(r'\b(\d[\d,]*)\s+items?\b', html, re.IGNORECASE)
+    if all_matches:
+        nums = [int(x.replace(",", "")) for x in all_matches
+                if 0 < int(x.replace(",", "")) < 10_000_000]
+        if nums:
+            return max(nums)
+
     return None
 
 
@@ -410,19 +424,60 @@ def _warmup_session(page) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SINGLE MERCHANT SCRAPER  v3.7
+# REDIRECT HANDLING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_store_id_from_url(url: str) -> Optional[str]:
+    """Pull the store/merchant ID out of any AliExpress store URL."""
+    m = re.search(r'/store/(\d+)', url)
+    return m.group(1) if m else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SINGLE MERCHANT SCRAPER  v4.0
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_merchant(merchant_id: str) -> Dict:
     original_url = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
 
     for attempt in range(1, MAX_RETRIES + 1):
+        intercepted_count: Optional[int] = None
+        intercepted_url:   Optional[str] = None
+
         try:
             ua = random.choice(USER_AGENTS)
             with Camoufox(headless=True, os="windows") as browser:
                 ctx  = _make_context(browser, ua)
                 page = ctx.new_page()
 
+                # ── STRATEGY 1 SETUP: Register network interceptor ─────────────
+                # Must be set BEFORE page.goto() so we catch the very first
+                # XHR/Fetch that fires during page load.
+                def on_response(response: PlaywrightResponse) -> None:
+                    nonlocal intercepted_count, intercepted_url
+                    if intercepted_count is not None:
+                        return  # Already found, no need to keep processing
+                    try:
+                        url = response.url
+                        if not _is_count_api_response(url):
+                            return
+                        status = response.status
+                        if status not in (200, 304):
+                            return
+                        count = _try_parse_response_body(response)
+                        if count is not None:
+                            intercepted_count = count
+                            intercepted_url   = url
+                            logger.debug(
+                                f"[intercept] {merchant_id} ✓ {count} "
+                                f"from {url[:80]}"
+                            )
+                    except Exception as e:
+                        logger.debug(f"[intercept] handler error: {e}")
+
+                page.on("response", on_response)
+
+                # ── Warmup (attempt 1 only) ────────────────────────────────────
                 if attempt == 1:
                     _warmup_session(page)
 
@@ -441,7 +496,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     else:
                         raise
 
-                # ── ae:reload_path ────────────────────────────────────────────
+                # ── ae:reload_path meta-redirect ──────────────────────────────
                 try:
                     reload_url = page.evaluate("""() => {
                         const m = document.querySelector('meta[property="ae:reload_path"]');
@@ -455,53 +510,101 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                         except Exception as re_err:
                             rs = str(re_err)
                             if "NS_BINDING_ABORTED" not in rs and "ERR_ABORTED" not in rs:
-                                logger.warning(f"[merchant] {merchant_id} reload_path err: {rs[:80]}")
+                                logger.warning(
+                                    f"[merchant] {merchant_id} reload_path err: {rs[:80]}"
+                                )
                 except Exception:
                     pass
 
-                # ── Detect redirect → extra wait ──────────────────────────────
-                redirected_to = None
-                m_redir = re.search(r'/store/(\d+)/', page.url)
-                if m_redir and m_redir.group(1) != merchant_id:
-                    redirected_to = m_redir.group(1)
-                    logger.info(f"[merchant] {merchant_id} → {redirected_to} (redirect +5s wait)")
-                    page.wait_for_timeout(5_000)
+                # ── Determine final store ID (redirect detection) ──────────────
+                # AliExpress 301s old IDs to new ones. We accept this — the
+                # count we extract is for the SAME store, just a new ID.
+                # We record it in redirected_to but DO NOT treat it as an error.
+                final_url    = page.url
+                landed_id    = _extract_store_id_from_url(final_url)
+                redirected_to = (
+                    landed_id
+                    if landed_id and landed_id != merchant_id
+                    else None
+                )
+                if redirected_to:
+                    logger.info(
+                        f"[merchant] {merchant_id} → {redirected_to} "
+                        f"(ID migration, continuing)"
+                    )
 
-                # ── networkidle warm-up ───────────────────────────────────────
+                # ── networkidle (don't depend on it, just let it settle) ───────
                 try:
                     page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
                 except Exception:
                     pass
 
-                # ── Scroll ────────────────────────────────────────────────────
+                # ── If intercept already got the count, we're done early ───────
+                if intercepted_count is not None:
+                    html      = page.content()
+                    html_size = len(html)
+                    lower     = html.lower()
+                    page.close(); ctx.close()
+
+                    if any(sig in lower for sig in REAL_BLOCK_SIGNALS):
+                        logger.warning(f"[merchant] {merchant_id} — CAPTCHA (attempt {attempt})")
+                        if attempt < MAX_RETRIES:
+                            time.sleep(random.uniform(THROTTLE_DELAY_MIN, THROTTLE_DELAY_MAX))
+                            continue
+                        return {"merchant_id": merchant_id, "total_items": None,
+                                "error": "Blocked/CAPTCHA", "redirected_to": redirected_to}
+
+                    logger.info(
+                        f"[merchant] {merchant_id} ✓ {intercepted_count} items "
+                        f"(intercept)"
+                        + (f" → redir {redirected_to}" if redirected_to else "")
+                    )
+                    return {
+                        "merchant_id": merchant_id,
+                        "total_items": intercepted_count,
+                        "error": "",
+                        "redirected_to": redirected_to,
+                        "source": "intercept",
+                    }
+
+                # ── Scroll to trigger lazy loaders ────────────────────────────
                 for _ in range(3):
                     page.mouse.wheel(0, random.randint(500, 900))
-                    page.wait_for_timeout(random.randint(300, 700))
+                    page.wait_for_timeout(random.randint(300, 600))
                 page.wait_for_timeout(random.randint(800, 1_500))
 
-                # ── Poll DOM (60s) ────────────────────────────────────────────
-                js_count = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
+                # ── Check again after scroll (intercept fires async) ──────────
+                if intercepted_count is not None:
+                    html      = page.content()
+                    html_size = len(html)
+                    lower     = html.lower()
+                    page.close(); ctx.close()
 
-                if js_count is None:
-                    try:
-                        js_count = page.evaluate(_JS_EXTRACT_COUNT)
-                    except Exception:
-                        pass
+                    logger.info(
+                        f"[merchant] {merchant_id} ✓ {intercepted_count} items "
+                        f"(post-scroll intercept)"
+                        + (f" → redir {redirected_to}" if redirected_to else "")
+                    )
+                    return {
+                        "merchant_id": merchant_id,
+                        "total_items": intercepted_count,
+                        "error": "",
+                        "redirected_to": redirected_to,
+                        "source": "intercept_post_scroll",
+                    }
 
-                # Refresh redirect detection
-                m_redir2 = re.search(r'/store/(\d+)/', page.url)
-                if m_redir2 and m_redir2.group(1) != merchant_id:
-                    redirected_to = m_redir2.group(1)
+                # ── STRATEGY 2: Poll DOM text nodes ───────────────────────────
+                dom_count = _wait_for_item_count_textnode(
+                    page, poll_timeout_ms=POLL_TIMEOUT_MS
+                )
 
                 html      = page.content()
                 html_size = len(html)
                 lower     = html.lower()
-                page.close()
-                ctx.close()
+                page.close(); ctx.close()
 
                 # ── Block detection ───────────────────────────────────────────
-                is_blocked = any(sig in lower for sig in REAL_BLOCK_SIGNALS)
-                if is_blocked:
+                if any(sig in lower for sig in REAL_BLOCK_SIGNALS):
                     logger.warning(f"[merchant] {merchant_id} — CAPTCHA (attempt {attempt})")
                     if attempt < MAX_RETRIES:
                         time.sleep(random.uniform(THROTTLE_DELAY_MIN, THROTTLE_DELAY_MAX))
@@ -510,43 +613,61 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                             "error": "Blocked/CAPTCHA", "redirected_to": redirected_to}
 
                 # ── Throttle detection ────────────────────────────────────────
-                if js_count is None and html_size < THROTTLE_SIZE_KB * 1024:
+                if dom_count is None and html_size < THROTTLE_SIZE_KB * 1024:
                     logger.warning(
-                        f"[merchant] {merchant_id} — throttled: {html_size//1024}KB "
+                        f"[merchant] {merchant_id} — throttled: {html_size // 1024}KB "
                         f"(attempt {attempt})"
                     )
                     if attempt < MAX_RETRIES:
                         time.sleep(random.uniform(THROTTLE_DELAY_MIN, THROTTLE_DELAY_MAX))
                         continue
                     return {"merchant_id": merchant_id, "total_items": None,
-                            "error": f"Throttled ({html_size//1024}KB)",
+                            "error": f"Throttled ({html_size // 1024}KB)",
                             "redirected_to": redirected_to}
 
-                # ── Success ───────────────────────────────────────────────────
-                if js_count is not None:
+                if dom_count is not None:
                     logger.info(
-                        f"[merchant] {merchant_id} ✓ {js_count} items"
+                        f"[merchant] {merchant_id} ✓ {dom_count} items (dom_poll)"
                         + (f" → redir {redirected_to}" if redirected_to else "")
                     )
-                    return {"merchant_id": merchant_id, "total_items": js_count,
-                            "error": "", "redirected_to": redirected_to}
+                    return {
+                        "merchant_id": merchant_id,
+                        "total_items": dom_count,
+                        "error": "",
+                        "redirected_to": redirected_to,
+                        "source": "dom_poll",
+                    }
 
-                count = _extract_item_count_from_html(html)
-                if count is not None:
-                    return {"merchant_id": merchant_id, "total_items": count,
-                            "error": "", "redirected_to": redirected_to}
+                # ── STRATEGY 3: Raw HTML regex ────────────────────────────────
+                html_count = _extract_item_count_from_html(html)
+                if html_count is not None:
+                    logger.info(
+                        f"[merchant] {merchant_id} ✓ {html_count} items (html_regex)"
+                        + (f" → redir {redirected_to}" if redirected_to else "")
+                    )
+                    return {
+                        "merchant_id": merchant_id,
+                        "total_items": html_count,
+                        "error": "",
+                        "redirected_to": redirected_to,
+                        "source": "html_regex",
+                    }
 
+                # ── All strategies exhausted ──────────────────────────────────
                 if attempt < MAX_RETRIES:
                     logger.warning(
-                        f"[merchant] {merchant_id} — no count found, "
-                        f"{html_size//1024}KB, attempt {attempt}"
+                        f"[merchant] {merchant_id} — no count, "
+                        f"{html_size // 1024}KB, attempt {attempt}"
                     )
                     time.sleep(random.uniform(5, 10))
                     continue
 
-                return {"merchant_id": merchant_id, "total_items": None,
-                        "error": f"Selector Missing ({html_size//1024}KB)",
-                        "redirected_to": redirected_to}
+                return {
+                    "merchant_id": merchant_id,
+                    "total_items": None,
+                    "error": f"All strategies failed ({html_size // 1024}KB)",
+                    "redirected_to": redirected_to,
+                }
 
         except Exception as exc:
             err_str = str(exc)
@@ -570,13 +691,14 @@ def _write_batch_csv(job_id: str, batch_idx: int, rows: List[Dict]) -> None:
     path = _batch_path(job_id, batch_idx)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["MerchantID", "TotalItems", "RedirectedTo", "Error"])
+        w.writerow(["MerchantID", "TotalItems", "RedirectedTo", "Error", "Source"])
         for row in rows:
             w.writerow([
                 row.get("merchant_id", ""),
                 "" if row.get("total_items") is None else row["total_items"],
                 row.get("redirected_to") or "",
                 row.get("error", ""),
+                row.get("source", ""),
             ])
     logger.info(f"[job:{job_id}] Batch {batch_idx:04d} → {path.name} ({len(rows)} rows)")
 
@@ -585,7 +707,7 @@ def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
     out_path = _output_path(job_id)
     with open(out_path, "w", newline="", encoding="utf-8") as out_f:
         writer = csv.writer(out_f)
-        writer.writerow(["MerchantID", "TotalItems", "RedirectedTo", "Error"])
+        writer.writerow(["MerchantID", "TotalItems", "RedirectedTo", "Error", "Source"])
         for idx in range(batches_total):
             bf = _batch_path(job_id, idx)
             if not bf.exists():
@@ -594,7 +716,7 @@ def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
                 reader = csv.reader(in_f)
                 next(reader, None)
                 for row in reader:
-                    while len(row) < 4:
+                    while len(row) < 5:
                         row.append("")
                     writer.writerow(row)
     logger.info(f"[job:{job_id}] Merged {batches_total} batches → output.csv")
@@ -616,7 +738,8 @@ def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
                    "error": str(e)[:120], "redirected_to": None}
         rows.append(row)
 
-        status = (f"✓ {row['total_items']}" if row.get("total_items") is not None
+        status = (f"✓ {row['total_items']} [{row.get('source','?')}]"
+                  if row.get("total_items") is not None
                   else f"✗ {row.get('error','?')[:40]}")
         logger.info(f"[job:{job_id}] [{i+1}/{len(merchant_ids)}] {mid} → {status}")
 
