@@ -1,26 +1,31 @@
 """
-merchant_scraper.py — Batch-Safe Bulk Processor v3.4
+merchant_scraper.py — Batch-Safe Bulk Processor v3.6
 ─────────────────────────────────────────────────────
-KEY FIX (v3.4 — "Selector Missing" even after networkidle):
+ROOT CAUSE OF "Selector Missing after polling" (confirmed from debug output):
 
-  ROOT CAUSE:
-    networkidle fires when no network requests for 500 ms — but React can
-    still be in a render cycle with zero network activity. Calling
-    page.evaluate() at that moment finds an empty DOM and returns null.
+  DEBUG EVIDENCE (merchant 1104552996):
+    html_size_bytes : 257KB  → full page, NOT throttled, NOT blocked
+    blocked         : false  → no CAPTCHA
+    networkidle     : TIMEOUT → page kept making network requests entire 15s window
+    poll_result     : null   → polling gave up after 20s
+    load_time_sec   : 85.25  → page took 85 SECONDS total to fully render
+    redirected_to   : 1104559925 → store ID migration adds extra load time
 
-  FIX:
-    Replace the single page.evaluate() call with page.wait_for_function()
-    which POLLS the live DOM every 100 ms for up to 20 s until the item
-    count span actually appears. This is guaranteed to catch the element
-    regardless of React render timing.
+  THE PROBLEM:
+    networkidle timeout (15s) fires → polling starts → polling times out (20s)
+    Total wait = 35s BUT React needed 85s to finish mounting.
+    Polling gave up while React was still mid-flight fetching product data.
 
-  OTHER CHANGES vs v3.3:
-    • Locale cookies kept (Sweden/EUR prevents geo-redirect).
-    • ae:reload_path meta-redirect still followed.
-    • wait_for_load_state("networkidle") kept as a warm-up signal.
-    • Dedicated _wait_for_item_count() helper centralises the polling.
-    • Fallback: if polling times out, one final page.evaluate() is tried.
-    • Per-attempt timeout budget: 300 s.
+  THE FIX (v3.6):
+    1. poll_timeout raised from 20s → 60s  (must cover full React mount time)
+    2. networkidle timeout raised from 15s → 25s (more time to settle)
+    3. After a store ID redirect is detected, add an extra 5s wait before
+       polling — redirected stores take longer to initialize React state.
+    4. PAGE_TIMEOUT raised from 60s → 90s to cover 85s+ load times.
+    5. CONCURRENCY = 1 (sequential) — prevents IP rate-limiting.
+    6. DELAY 8-20s between merchants — human-like pacing.
+    7. Throttle detection: page < 180KB + no count = throttled, wait 30-60s.
+    8. Session warmup: visit homepage first to establish natural session.
 """
 
 import re
@@ -49,13 +54,18 @@ STORE_URL_TEMPLATE = (
     "?shop_sortType=bestmatch_sort"
 )
 
-BATCH_SIZE   = 100
-CONCURRENCY  = 5
-MAX_RETRIES  = 3
-PAGE_TIMEOUT = 60_000
-DELAY_MIN    = 1.5
-DELAY_MAX    = 3.5
-JOBS_DIR     = Path("./merchant_jobs")
+BATCH_SIZE          = 20     # small batches = frequent saves to disk
+CONCURRENCY         = 1      # sequential — prevents concurrent-session detection
+MAX_RETRIES         = 3
+PAGE_TIMEOUT        = 90_000  # 90s — covers 85s+ load times seen in production
+NETWORKIDLE_TIMEOUT = 25_000  # 25s networkidle window
+POLL_TIMEOUT_MS     = 60_000  # 60s DOM polling — must cover full React mount time
+DELAY_MIN           = 8.0    # minimum seconds between merchants
+DELAY_MAX           = 20.0   # maximum seconds between merchants
+THROTTLE_DELAY_MIN  = 30     # seconds to wait when throttle detected
+THROTTLE_DELAY_MAX  = 60
+THROTTLE_SIZE_KB    = 180    # pages < 180KB after all waits = likely throttled
+JOBS_DIR            = Path("./merchant_jobs")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -64,6 +74,9 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
 ]
 
 ALIEXPRESS_LOCALE_COOKIES = [
@@ -197,23 +210,20 @@ def _extract_item_count_from_html(html: str) -> Optional[int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JAVASCRIPT EXTRACTOR  (single evaluate — used as fallback after polling)
+# JAVASCRIPT EXTRACTOR  (single evaluate — fallback after polling)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _JS_EXTRACT_COUNT = """() => {
-    // Method 1: SPAN with exact spm anchor
     for (const el of document.querySelectorAll(
             'span[data-spm-anchor-id*="store_pc_allItems_or_groupList"]')) {
         const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
         if (m) return parseInt(m[1].replace(/,/g,''), 10);
     }
-    // Method 2: SPAN with broader anchor
     for (const el of document.querySelectorAll(
             'span[data-spm-anchor-id*="store_pc_allItems"]')) {
         const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
         if (m) return parseInt(m[1].replace(/,/g,''), 10);
     }
-    // Method 3: parent DIV has anchor, child SPAN has text
     for (const div of document.querySelectorAll(
             'div[data-spm-anchor-id*="store_pc_allItems_or_groupList"],' +
             'div[data-spm-anchor-id*="store_pc_allItems"]')) {
@@ -222,12 +232,10 @@ _JS_EXTRACT_COUNT = """() => {
             if (m) return parseInt(m[1].replace(/,/g,''), 10);
         }
     }
-    // Method 4: ANY span whose full text is "N items"
     for (const el of document.querySelectorAll('span')) {
         const m = el.textContent.trim().match(/^(\\d[\\d,]*)\\s+items?$/i);
         if (m) return parseInt(m[1].replace(/,/g,''), 10);
     }
-    // Method 5: div direct text node
     for (const el of document.querySelectorAll('div')) {
         const direct = Array.from(el.childNodes)
             .filter(n => n.nodeType === 3)
@@ -235,7 +243,6 @@ _JS_EXTRACT_COUNT = """() => {
         const m = direct.match(/^(\\d[\\d,]*)\\s+items?$/i);
         if (m) return parseInt(m[1].replace(/,/g,''), 10);
     }
-    // Method 6: SSR JSON in script tags
     for (const s of document.querySelectorAll('script')) {
         const m = (s.textContent || '').match(
             /"(?:totalProducts|itemCount|totalItems|storeItemCount)"\\s*:\\s*(\\d+)/
@@ -247,32 +254,20 @@ _JS_EXTRACT_COUNT = """() => {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DOM POLLING FUNCTION  ← THE CORE FIX
+# DOM POLLING  — polls every 100ms until count found or timeout
 # ─────────────────────────────────────────────────────────────────────────────
 
-# This JS runs inside wait_for_function() which polls every 100 ms.
-# It returns the count as soon as ANY of the selectors finds "N items".
-# This handles React render timing: networkidle can fire while React is
-# still mounting components — polling catches the element whenever it appears.
 _JS_POLL_FOR_COUNT = """() => {
-    // Try all known selector shapes. Return the count as soon as found,
-    // or false to tell wait_for_function to keep polling.
-
-    // Shape 1: <span data-spm-anchor-id="...store_pc_allItems_or_groupList...">N items</span>
     for (const el of document.querySelectorAll(
             'span[data-spm-anchor-id*="store_pc_allItems_or_groupList"]')) {
         const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
         if (m) return parseInt(m[1].replace(/,/g,''), 10);
     }
-
-    // Shape 2: broader store_pc_allItems anchor on span
     for (const el of document.querySelectorAll(
             'span[data-spm-anchor-id*="store_pc_allItems"]')) {
         const m = el.textContent.trim().match(/(\\d[\\d,]*)\\s+items?/i);
         if (m) return parseInt(m[1].replace(/,/g,''), 10);
     }
-
-    // Shape 3: parent DIV has anchor, child SPAN has "N items" text
     for (const div of document.querySelectorAll(
             'div[data-spm-anchor-id*="store_pc_allItems_or_groupList"],' +
             'div[data-spm-anchor-id*="store_pc_allItems"]')) {
@@ -281,15 +276,10 @@ _JS_POLL_FOR_COUNT = """() => {
             if (m) return parseInt(m[1].replace(/,/g,''), 10);
         }
     }
-
-    // Shape 4: ANY span whose FULL trimmed text is exactly "N items"
-    // Confirmed real DOM: <span style="font-size:15px">6 items</span>
     for (const el of document.querySelectorAll('span')) {
         const m = el.textContent.trim().match(/^(\\d[\\d,]*)\\s+items?$/i);
         if (m) return parseInt(m[1].replace(/,/g,''), 10);
     }
-
-    // Shape 5: div direct text node is "N items"
     for (const el of document.querySelectorAll('div')) {
         const direct = Array.from(el.childNodes)
             .filter(n => n.nodeType === 3)
@@ -297,8 +287,6 @@ _JS_POLL_FOR_COUNT = """() => {
         const m = direct.match(/^(\\d[\\d,]*)\\s+items?$/i);
         if (m) return parseInt(m[1].replace(/,/g,''), 10);
     }
-
-    // Shape 6: SSR JSON blob in <script>
     for (const s of document.querySelectorAll('script')) {
         const src = s.textContent || '';
         const m = src.match(
@@ -306,35 +294,26 @@ _JS_POLL_FOR_COUNT = """() => {
         );
         if (m) return parseInt(m[1], 10);
     }
-
     return false;  // keep polling
 }"""
 
 
-def _wait_for_item_count(page, poll_timeout_ms: int = 20_000) -> Optional[int]:
+def _wait_for_item_count(page, poll_timeout_ms: int = POLL_TIMEOUT_MS) -> Optional[int]:
     """
-    Poll the live DOM every 100 ms until an item count appears or timeout.
-
-    This is the correct way to handle React-rendered content:
-      - networkidle fires when no network for 500ms, but React render
-        can still be in progress with zero network activity.
-      - wait_for_function polls continuously so it catches the element
-        the moment React mounts the component tree.
-
-    Returns the count as int, or None if not found within poll_timeout_ms.
+    Poll the live DOM every 100ms until item count appears or timeout.
+    POLL_TIMEOUT_MS=60000 (60s) to cover pages that take 80+ seconds to render.
     """
     try:
         result = page.wait_for_function(
             _JS_POLL_FOR_COUNT,
             timeout=poll_timeout_ms,
-            polling=100,   # check every 100 ms
+            polling=100,
         )
-        # wait_for_function returns a JSHandle — call .json_value() to get Python int
         count = result.json_value()
         if isinstance(count, (int, float)) and count > 0:
             return int(count)
     except Exception as poll_err:
-        logger.debug(f"[poll] wait_for_function timed out or failed: {poll_err}")
+        logger.debug(f"[poll] timed out after {poll_timeout_ms}ms: {poll_err}")
     return None
 
 
@@ -354,8 +333,20 @@ def _make_context(browser, ua: str):
     return ctx
 
 
+def _warmup_session(page) -> None:
+    """Visit AliExpress homepage first to establish a natural browsing session."""
+    try:
+        page.goto("https://www.aliexpress.com/", timeout=30_000,
+                  wait_until="domcontentloaded")
+        page.wait_for_timeout(random.randint(2_000, 4_000))
+        page.mouse.move(random.randint(200, 800), random.randint(100, 500))
+        page.wait_for_timeout(random.randint(500, 1_500))
+    except Exception as e:
+        logger.debug(f"[warmup] homepage visit failed (non-fatal): {e}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# SINGLE MERCHANT SCRAPER  v3.4
+# SINGLE MERCHANT SCRAPER  v3.6
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_merchant(merchant_id: str) -> Dict:
@@ -368,7 +359,11 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 ctx  = _make_context(browser, ua)
                 page = ctx.new_page()
 
-                # ── STEP 1: Navigate ─────────────────────────────────────────
+                # ── WARMUP: homepage first (attempt 1 only) ───────────────────
+                if attempt == 1:
+                    _warmup_session(page)
+
+                # ── STEP 1: Navigate ──────────────────────────────────────────
                 try:
                     page.goto(original_url, timeout=PAGE_TIMEOUT,
                               wait_until="domcontentloaded")
@@ -385,16 +380,14 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     else:
                         raise
 
-                # ── STEP 2: Follow ae:reload_path meta-redirect ──────────────
+                # ── STEP 2: Follow ae:reload_path meta-redirect ───────────────
                 try:
                     reload_url = page.evaluate("""() => {
                         const m = document.querySelector('meta[property="ae:reload_path"]');
                         return m ? m.getAttribute('content') : null;
                     }""")
                     if reload_url and reload_url.strip() != page.url.strip():
-                        logger.info(
-                            f"[merchant] {merchant_id} ae:reload_path → {reload_url}"
-                        )
+                        logger.info(f"[merchant] {merchant_id} ae:reload_path → {reload_url}")
                         try:
                             page.goto(reload_url, timeout=PAGE_TIMEOUT,
                                       wait_until="domcontentloaded")
@@ -407,64 +400,93 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 except Exception:
                     pass
 
-                # ── STEP 3: networkidle warm-up ──────────────────────────────
-                # This is NOT the extraction signal — just a warm-up to let
-                # the network settle before we start polling the DOM.
-                try:
-                    page.wait_for_load_state("networkidle", timeout=15_000)
-                except Exception:
-                    pass  # heavy pages may never reach networkidle — continue
-
-                # ── STEP 4: Scroll to trigger lazy-loaded sections ───────────
-                for _ in range(3):
-                    page.mouse.wheel(0, 700)
-                    page.wait_for_timeout(400)
-                page.wait_for_timeout(1_000)
-
-                # ── STEP 5: POLL DOM until item count appears ────────────────
-                # This is the KEY FIX. Instead of one evaluate() call that
-                # may fire before React mounts, we poll every 100 ms for up
-                # to 20 s. The moment React renders the span, we get the count.
-                js_count = _wait_for_item_count(page, poll_timeout_ms=20_000)
-
-                # If polling timed out, try one final evaluate() as fallback
-                if js_count is None:
-                    logger.debug(
-                        f"[merchant] {merchant_id} polling timed out — "
-                        f"trying single evaluate fallback"
-                    )
-                    try:
-                        js_count = page.evaluate(_JS_EXTRACT_COUNT)
-                    except Exception:
-                        pass
-
-                # Detect legitimate store ID migration
+                # ── STEP 3: Detect redirect and add extra wait ─────────────────
+                # Redirected stores (ID migration) take longer to initialize
+                # React state. We detect this early and add 5s extra buffer.
                 redirected_to = None
                 m_redir = re.search(r'/store/(\d+)/', page.url)
                 if m_redir and m_redir.group(1) != merchant_id:
                     redirected_to = m_redir.group(1)
                     logger.info(
-                        f"[merchant] {merchant_id} → store {redirected_to} (ID migration)"
+                        f"[merchant] {merchant_id} → store {redirected_to} "
+                        f"(ID migration — adding extra wait)"
                     )
+                    page.wait_for_timeout(5_000)   # extra buffer for redirected stores
 
-                # Block check on HTML skeleton (block signals ARE in skeleton)
-                html  = page.content()
-                lower = html.lower()
+                # ── STEP 4: networkidle (25s window) ──────────────────────────
+                # Not the extraction trigger — just waits for network to settle.
+                # Raised from 15s → 25s to give more time before polling starts.
+                try:
+                    page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
+                except Exception:
+                    pass  # timeout is normal on heavy pages — continue to polling
+
+                # ── STEP 5: Scroll to trigger lazy-loaded sections ────────────
+                for _ in range(3):
+                    page.mouse.wheel(0, random.randint(500, 900))
+                    page.wait_for_timeout(random.randint(300, 700))
+                page.wait_for_timeout(random.randint(800, 1_500))
+
+                # ── STEP 6: POLL DOM — 60s timeout ────────────────────────────
+                # KEY FIX: 60s poll covers the 85s pages seen in production.
+                # The poll starts AFTER networkidle (or its timeout), so the
+                # effective React-mount window is up to 60s from this point.
+                js_count = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
+
+                # Fallback single evaluate if polling timed out
+                if js_count is None:
+                    try:
+                        js_count = page.evaluate(_JS_EXTRACT_COUNT)
+                    except Exception:
+                        pass
+
+                # Refresh redirect detection after all navigations settle
+                m_redir2 = re.search(r'/store/(\d+)/', page.url)
+                if m_redir2 and m_redir2.group(1) != merchant_id:
+                    redirected_to = m_redir2.group(1)
+
+                # Block check (skeleton HTML has block signals even when JS renders)
+                html      = page.content()
+                html_size = len(html)
+                lower     = html.lower()
                 page.close()
                 ctx.close()
 
+                # ── CAPTCHA / block ───────────────────────────────────────────
                 is_blocked = any(sig in lower for sig in REAL_BLOCK_SIGNALS)
                 if is_blocked:
                     logger.warning(
                         f"[merchant] {merchant_id} — CAPTCHA/block (attempt {attempt})"
                     )
                     if attempt < MAX_RETRIES:
-                        time.sleep(random.uniform(15, 25))
+                        sleep_t = random.uniform(THROTTLE_DELAY_MIN, THROTTLE_DELAY_MAX)
+                        logger.info(
+                            f"[merchant] {merchant_id} sleeping {sleep_t:.0f}s (CAPTCHA)"
+                        )
+                        time.sleep(sleep_t)
                         continue
                     return {"merchant_id": merchant_id, "total_items": None,
                             "error": "Blocked/CAPTCHA after retries",
                             "redirected_to": redirected_to}
 
+                # ── Throttle detection (small page + no count) ────────────────
+                if js_count is None and html_size < THROTTLE_SIZE_KB * 1024:
+                    logger.warning(
+                        f"[merchant] {merchant_id} — likely throttled: "
+                        f"page {html_size//1024}KB (attempt {attempt})"
+                    )
+                    if attempt < MAX_RETRIES:
+                        sleep_t = random.uniform(THROTTLE_DELAY_MIN, THROTTLE_DELAY_MAX)
+                        logger.info(
+                            f"[merchant] {merchant_id} sleeping {sleep_t:.0f}s (throttle)"
+                        )
+                        time.sleep(sleep_t)
+                        continue
+                    return {"merchant_id": merchant_id, "total_items": None,
+                            "error": f"Throttled ({html_size//1024}KB) after all retries",
+                            "redirected_to": redirected_to}
+
+                # ── Success ───────────────────────────────────────────────────
                 if js_count is not None:
                     logger.info(
                         f"[merchant] {merchant_id} ✓ {js_count} items"
@@ -473,7 +495,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     return {"merchant_id": merchant_id, "total_items": js_count,
                             "error": "", "redirected_to": redirected_to}
 
-                # HTML regex fallback (rarely succeeds but worth trying)
+                # HTML regex fallback
                 count = _extract_item_count_from_html(html)
                 if count is not None:
                     logger.info(
@@ -482,16 +504,17 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     return {"merchant_id": merchant_id, "total_items": count,
                             "error": "", "redirected_to": redirected_to}
 
+                # Normal retry
                 if attempt < MAX_RETRIES:
                     logger.warning(
                         f"[merchant] {merchant_id} — count not found "
-                        f"(attempt {attempt}/{MAX_RETRIES}), retrying"
+                        f"({html_size//1024}KB, attempt {attempt}/{MAX_RETRIES})"
                     )
                     time.sleep(random.uniform(5, 10))
                     continue
 
                 return {"merchant_id": merchant_id, "total_items": None,
-                        "error": "Selector Missing after all retries",
+                        "error": f"Selector Missing ({html_size//1024}KB) after all retries",
                         "redirected_to": redirected_to}
 
         except Exception as exc:
@@ -548,24 +571,32 @@ def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BATCH RUNNER
+# BATCH RUNNER  — SEQUENTIAL
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
     logger.info(
-        f"[job:{job_id}] Batch {batch_idx:04d} start — {len(merchant_ids)} merchants"
+        f"[job:{job_id}] Batch {batch_idx:04d} start — "
+        f"{len(merchant_ids)} merchants (sequential)"
     )
     rows = []
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = {pool.submit(_scrape_merchant, mid): mid for mid in merchant_ids}
-        for future in as_completed(futures):
-            try:
-                row = future.result(timeout=300)
-            except Exception as e:
-                mid = futures[future]
-                row = {"merchant_id": mid, "total_items": None,
-                       "error": str(e)[:120], "redirected_to": None}
-            rows.append(row)
+    for i, mid in enumerate(merchant_ids):
+        try:
+            row = _scrape_merchant(mid)
+        except Exception as e:
+            row = {"merchant_id": mid, "total_items": None,
+                   "error": str(e)[:120], "redirected_to": None}
+        rows.append(row)
+
+        status = (f"✓ {row['total_items']}" if row.get("total_items") is not None
+                  else f"✗ {row.get('error','?')[:40]}")
+        logger.info(f"[job:{job_id}] [{i+1}/{len(merchant_ids)}] {mid} → {status}")
+
+        if i < len(merchant_ids) - 1:
+            delay = random.uniform(DELAY_MIN, DELAY_MAX)
+            logger.debug(f"[job:{job_id}] sleeping {delay:.1f}s before next merchant")
+            time.sleep(delay)
+
     _write_batch_csv(job_id, batch_idx, rows)
 
 
@@ -598,9 +629,11 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
             "batches_total": batches_total, "batches_done": 0, "batches_failed": 0,
         })
 
+    avg_per_merchant = (DELAY_MIN + DELAY_MAX) / 2 + 45  # delay + page load
+    est_minutes = total * avg_per_merchant / 60
     logger.info(
-        f"[job:{job_id}] Start — {total} merchants | "
-        f"{batches_total} batches of {BATCH_SIZE}"
+        f"[job:{job_id}] Start — {total} merchants | {batches_total} batches | "
+        f"~{est_minutes:.0f} min estimated"
     )
 
     for idx, batch in enumerate(batches):
@@ -633,7 +666,9 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
         )
 
         if idx < batches_total - 1:
-            time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+            batch_delay = random.uniform(15, 30)
+            logger.info(f"[job:{job_id}] inter-batch sleep {batch_delay:.0f}s")
+            time.sleep(batch_delay)
 
     try:
         _merge_batch_csvs(job_id, batches_total)
