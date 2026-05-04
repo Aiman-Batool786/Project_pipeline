@@ -1,6 +1,13 @@
 """
-FastAPI Server - HYBRID APPROACH v2.9
+FastAPI Server - HYBRID APPROACH v3.0
 Pipeline: Scrape → Store → Enhance → Categorize → Map → Excel
+
+Changelog v3.0:
+  - /merchant-debug updated to v4.0: uses XHR intercept + text-node DOM poll
+  - Removed fragile _JS_EXTRACT_COUNT / _wait_for_item_count imports
+  - Added _is_count_api_response, _try_parse_response_body,
+    _wait_for_item_count_textnode, _extract_store_id_from_url imports
+  - debug response now reports strategy_used + intercepted_api_url
 """
 
 from fastapi import FastAPI, HTTPException
@@ -33,10 +40,17 @@ from merchant_scraper import (
     get_job_status,
     get_output_path,
     list_all_jobs,
+    # browser / context helpers
     _make_context,
-    _JS_EXTRACT_COUNT,
+    # JS diagnostics (DOM dump only — no longer need _JS_EXTRACT_COUNT)
     _JS_DOM_DUMP,
-    _wait_for_item_count,
+    # Strategy helpers (v4.0)
+    _is_count_api_response,
+    _try_parse_response_body,
+    _wait_for_item_count_textnode,
+    _extract_store_id_from_url,
+    _extract_item_count_from_html,
+    # Config constants
     STORE_URL_TEMPLATE,
     USER_AGENTS,
     PAGE_TIMEOUT,
@@ -51,7 +65,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Octopia Template Pipeline", version="2.9.0")
+app = FastAPI(title="Octopia Template Pipeline", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -149,7 +163,7 @@ def startup_event():
     try:
         from db import create_all_tables
         create_all_tables()
-        logger.info("✅ API Ready — v2.9.0")
+        logger.info("✅ API Ready — v3.0.0")
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
@@ -163,7 +177,7 @@ def root():
     return {
         "status":  "running",
         "service": "Octopia Template Pipeline",
-        "version": "2.9.0",
+        "version": "3.0.0",
     }
 
 
@@ -719,24 +733,36 @@ def list_merchant_jobs():
 
 
 # =============================================================================
-# MERCHANT DEBUG  v3.4
-# KEY FIX: uses _wait_for_item_count() which POLLS the DOM every 100 ms
-# instead of a single page.evaluate() that fires before React mounts.
+# MERCHANT DEBUG  v4.0
+#
+# Three-strategy extraction (in priority order):
+#   1. XHR INTERCEPT  — page.on("response") registered before page.goto()
+#                       catches the raw JSON count from AliExpress's internal
+#                       API the moment it arrives. Zero DOM dependency.
+#   2. DOM TEXT POLL  — TreeWalker scans every text node for "N items" pattern.
+#                       No class/id/anchor dependency — survives A/B tests.
+#   3. HTML REGEX     — last resort scan of raw HTML for JSON fields or text.
+#
+# Redirect handling:
+#   AliExpress 301-redirects old merchant IDs to new ones at network level.
+#   We record the new ID in redirected_to but ALWAYS process the landed page —
+#   the item count belongs to the same store regardless of ID migration.
 # =============================================================================
 
 @app.post("/merchant-debug", tags=["Merchant Bulk"])
 def merchant_debug(req: MerchantDebugRequest):
     """
-    DEBUG — scrape ONE merchant with full diagnostic info.
+    DEBUG v4.0 — scrape ONE merchant with full diagnostic output.
 
-    v3.4 FIX — Root cause of "Selector Missing":
-      networkidle fires when no network requests for 500 ms, but React can
-      still be mid-render with zero network activity. A single page.evaluate()
-      at that moment returns null because the span isn't in the DOM yet.
-
-    Fix: _wait_for_item_count() polls the DOM every 100 ms for up to 20 s
-    using wait_for_function(). The moment React mounts the item count span,
-    we capture it — regardless of how long rendering takes.
+    Response fields:
+      success              — bool
+      total_items          — extracted count or null
+      debug.strategy_used  — "intercept" | "dom_poll" | "html_regex" | "none"
+      debug.intercepted_api_url — URL of the XHR that carried the count (if intercept won)
+      debug.intercept_count     — value from XHR intercept
+      debug.poll_count          — value from DOM text-node poll
+      debug.dom_dump            — DOM elements containing "item" text (for manual inspection)
+      debug.redirected_to       — new store ID if AliExpress redirected (informational)
 
     Input:  { "merchant_id": "246548581" }
     """
@@ -751,27 +777,57 @@ def merchant_debug(req: MerchantDebugRequest):
     t0  = time.time()
 
     debug = {
-        "url":                    url,
-        "page_loaded":            False,
-        "final_url":              None,
-        "html_size_bytes":        0,
-        "blocked":                False,
-        "reload_path_detected":   None,
-        "networkidle":            None,
-        "selector_hit":           None,
-        "poll_result":            None,
-        "js_count":               None,
-        "dom_dump":               None,   # NEW: shows what IS in the DOM
-        "redirected_to":          None,
+        "url":                     url,
+        "page_loaded":             False,
+        "final_url":               None,
+        "html_size_bytes":         0,
+        "blocked":                 False,
+        "reload_path_detected":    None,
+        "networkidle":             None,
+        # Strategy results
+        "intercepted_api_url":     None,
+        "intercept_count":         None,
+        "poll_count":              None,
+        "strategy_used":           None,
+        # Diagnostics
+        "dom_dump":                None,
+        "redirected_to":           None,
         "locale_cookies_injected": True,
-        "load_time_sec":          None,
-        "nav_error":              None,
+        "load_time_sec":           None,
+        "nav_error":               None,
     }
 
     try:
         with Camoufox(headless=True, os="windows") as browser:
             ctx  = _make_context(browser, ua)
             page = ctx.new_page()
+
+            # ── STRATEGY 1 SETUP: Register interceptor BEFORE navigation ──────
+            # Must be registered here so it catches XHR fired during page load.
+            intercepted_count = None
+            intercepted_url   = None
+
+            def on_response(response) -> None:
+                nonlocal intercepted_count, intercepted_url
+                if intercepted_count is not None:
+                    return  # already captured
+                try:
+                    if not _is_count_api_response(response.url):
+                        return
+                    if response.status not in (200, 304):
+                        return
+                    count = _try_parse_response_body(response)
+                    if count is not None:
+                        intercepted_count = count
+                        intercepted_url   = response.url
+                        logger.debug(
+                            f"[debug-intercept] {merchant_id} ✓ {count} "
+                            f"from {response.url[:80]}"
+                        )
+                except Exception as e:
+                    logger.debug(f"[debug-intercept] handler error: {e}")
+
+            page.on("response", on_response)
 
             # ── STEP 1: Navigate ──────────────────────────────────────────────
             try:
@@ -810,12 +866,12 @@ def merchant_debug(req: MerchantDebugRequest):
             except Exception as meta_err:
                 debug["nav_error"] = f"meta eval: {str(meta_err)[:80]}"
 
-            # ── STEP 3: networkidle warm-up (not the extraction signal) ───────
+            # ── STEP 3: networkidle warm-up ───────────────────────────────────
             try:
                 page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
                 debug["networkidle"] = "reached"
             except Exception:
-                debug["networkidle"] = "timeout — used fallback"
+                debug["networkidle"] = "timeout"
 
             # ── STEP 4: Scroll to trigger lazy-loaded sections ────────────────
             for _ in range(3):
@@ -823,23 +879,17 @@ def merchant_debug(req: MerchantDebugRequest):
                 page.wait_for_timeout(400)
             page.wait_for_timeout(1_000)
 
-            # ── STEP 5: POLL DOM until item count appears ─────────────────────
-            # This is the core fix. Polls every 100 ms for up to 20 s.
-            # Catches the element the moment React renders it.
-            polled_count = _wait_for_item_count(page, poll_timeout_ms=20_000)
-            debug["poll_result"] = polled_count
+            # ── STEP 5: Record intercept result after scroll ───────────────────
+            debug["intercept_count"]     = intercepted_count
+            debug["intercepted_api_url"] = intercepted_url
 
-            # Fallback: single evaluate if polling timed out
-            js_count = polled_count
-            if js_count is None:
-                try:
-                    js_count = page.evaluate(_JS_EXTRACT_COUNT)
-                    debug["js_count"] = js_count
-                except Exception:
-                    pass
+            # ── STEP 6: DOM text-node poll if intercept missed ────────────────
+            poll_count = None
+            if intercepted_count is None:
+                poll_count = _wait_for_item_count_textnode(page, poll_timeout_ms=20_000)
+                debug["poll_count"] = poll_count
 
-            # DOM DUMP — run always so we can see what IS in the DOM
-            # This is the key diagnostic when poll_result=null on a full page
+            # ── STEP 7: DOM dump — always run for diagnostics ─────────────────
             try:
                 debug["dom_dump"] = page.evaluate(_JS_DOM_DUMP)
             except Exception as dump_err:
@@ -855,12 +905,13 @@ def merchant_debug(req: MerchantDebugRequest):
 
         lower = html.lower()
 
-        # ── Redirect detection ────────────────────────────────────────────────
-        m_redir = _re.search(r'/store/(\d+)/', debug["final_url"] or "")
-        if m_redir and m_redir.group(1) != merchant_id:
-            debug["redirected_to"] = m_redir.group(1)
+        # ── Redirect detection (informational only) ───────────────────────────
+        landed_id = _extract_store_id_from_url(debug["final_url"] or "")
+        if landed_id and landed_id != merchant_id:
+            debug["redirected_to"] = landed_id
             debug["note"] = (
-                f"Store {merchant_id} → {debug['redirected_to']} (ID migration)"
+                f"Store {merchant_id} → {landed_id} "
+                f"(ID migration — normal, not an error)"
             )
 
         # ── Block detection ───────────────────────────────────────────────────
@@ -869,21 +920,48 @@ def merchant_debug(req: MerchantDebugRequest):
             return {"success": False, "merchant_id": merchant_id,
                     "total_items": None, "error": "Blocked/CAPTCHA", "debug": debug}
 
-        if js_count is not None:
-            return {"success": True, "merchant_id": merchant_id,
-                    "total_items": js_count, "error": None, "debug": debug}
+        # ── Return result from best strategy ──────────────────────────────────
+        if intercepted_count is not None:
+            debug["strategy_used"] = "intercept"
+            return {
+                "success": True, "merchant_id": merchant_id,
+                "total_items": intercepted_count, "error": None, "debug": debug,
+            }
 
-        debug["html_head_500"] = html[:500].replace("\n", " ")
+        if poll_count is not None:
+            debug["strategy_used"] = "dom_poll"
+            return {
+                "success": True, "merchant_id": merchant_id,
+                "total_items": poll_count, "error": None, "debug": debug,
+            }
+
+        # Strategy 3: raw HTML regex (no browser needed, runs on captured HTML)
+        html_count = _extract_item_count_from_html(html)
+        if html_count is not None:
+            debug["strategy_used"] = "html_regex"
+            return {
+                "success": True, "merchant_id": merchant_id,
+                "total_items": html_count, "error": None, "debug": debug,
+            }
+
+        # All strategies failed — expose html head for manual inspection
+        debug["strategy_used"]  = "none"
+        debug["html_head_500"]  = html[:500].replace("\n", " ")
         return {
             "success": False, "merchant_id": merchant_id, "total_items": None,
-            "error": "Selector Missing after polling — check debug.html_head_500",
+            "error": (
+                "All strategies failed — check debug.dom_dump for DOM structure "
+                "and debug.intercepted_api_url to see if XHR was captured"
+            ),
             "debug": debug,
         }
 
     except Exception as exc:
         debug["load_time_sec"] = round(time.time() - t0, 2)
-        return {"success": False, "merchant_id": merchant_id,
-                "total_items": None, "error": str(exc)[:300], "debug": debug}
+        return {
+            "success": False, "merchant_id": merchant_id,
+            "total_items": None, "error": str(exc)[:300], "debug": debug,
+        }
 
 
 # =============================================================================
@@ -1007,6 +1085,6 @@ def view_processing_logs(limit: int = 500):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v2.9")
+    logger.info("🚀 Octopia Template Pipeline v3.0")
     logger.info(f"📡 Server: http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
