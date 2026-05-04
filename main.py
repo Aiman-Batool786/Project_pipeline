@@ -35,10 +35,13 @@ from merchant_scraper import (
     list_all_jobs,
     _make_context,
     _JS_EXTRACT_COUNT,
+    _JS_DOM_DUMP,
     _wait_for_item_count,
     STORE_URL_TEMPLATE,
     USER_AGENTS,
     PAGE_TIMEOUT,
+    NETWORKIDLE_TIMEOUT,
+    POLL_TIMEOUT_MS,
     REAL_BLOCK_SIGNALS,
 )
 
@@ -756,8 +759,9 @@ def merchant_debug(req: MerchantDebugRequest):
         "reload_path_detected":   None,
         "networkidle":            None,
         "selector_hit":           None,
-        "poll_result":            None,   # what DOM polling found
-        "js_count":               None,   # fallback evaluate result
+        "poll_result":            None,
+        "js_count":               None,
+        "dom_dump":               None,   # NEW: shows what IS in the DOM
         "redirected_to":          None,
         "locale_cookies_injected": True,
         "load_time_sec":          None,
@@ -808,7 +812,7 @@ def merchant_debug(req: MerchantDebugRequest):
 
             # ── STEP 3: networkidle warm-up (not the extraction signal) ───────
             try:
-                page.wait_for_load_state("networkidle", timeout=15_000)
+                page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
                 debug["networkidle"] = "reached"
             except Exception:
                 debug["networkidle"] = "timeout — used fallback"
@@ -833,6 +837,13 @@ def merchant_debug(req: MerchantDebugRequest):
                     debug["js_count"] = js_count
                 except Exception:
                     pass
+
+            # DOM DUMP — run always so we can see what IS in the DOM
+            # This is the key diagnostic when poll_result=null on a full page
+            try:
+                debug["dom_dump"] = page.evaluate(_JS_DOM_DUMP)
+            except Exception as dump_err:
+                debug["dom_dump"] = {"error": str(dump_err)[:100]}
 
             debug["final_url"]     = page.url
             debug["load_time_sec"] = round(time.time() - t0, 2)
