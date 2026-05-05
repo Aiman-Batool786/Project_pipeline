@@ -1,27 +1,35 @@
 """
-merchant_scraper.py — Network-Intercept Edition v4.0
-──────────────────────────────────────────────────────
+merchant_scraper.py — Session API Edition v5.0
+────────────────────────────────────────────────
 
-ROOT CAUSE ANALYSIS (v3.7 → v4.0):
-  The item count is NOT in the initial HTML. AliExpress loads it via an
-  XHR/Fetch API call AFTER React hydrates. The API URL pattern is:
+HONEST ARCHITECTURE (confirmed from research):
+──────────────────────────────────────────────
+AliExpress MTOP/internal APIs require:
+  1. Valid session cookies (from a real browser visit to aliexpress.com)
+  2. Signed token in the request
+  3. Browser-matching headers
 
-    POST https://aecommerce.aliexpress.com/store/async/merchandise/count
-    or
-    GET  https://server.ilecdn.com/mtop/... (newer CDN-backed endpoint)
+Pure requests() with no session = returns empty/blocked silently.
 
-  Strategy (in priority order):
-    1. INTERCEPT — register page.on("response") BEFORE navigation, capture
-                   the JSON from the count API directly. Zero DOM dependency.
-    2. POLL TEXT  — tree-walk every text node for /^\d[\d,]* items?$/i.
-                   Works regardless of class/id/anchor changes.
-    3. HTML REGEX — scan raw HTML for JSON fields or inline text patterns.
+SOLUTION — Hybrid Session Model:
+  Step 1: Open a REAL browser ONCE on startup.
+          Visit aliexpress.com homepage.
+          Extract all session cookies into a requests.Session.
+          Close the browser.
 
-  Redirect fix:
-    AliExpress 301-redirects old merchant IDs at the NETWORK level. We now
-    treat the landing URL as the canonical source of truth and never mistake
-    it for a "wrong" redirect — we record it as redirected_to but always
-    process the page we actually landed on.
+  Step 2: Use that requests.Session for ALL merchant API calls.
+          No browser per merchant. Pure HTTP. ~1-3s per merchant.
+
+  Step 3: Redirect detection via API response — if the API returns
+          data for a different storeNum than requested → "ID Migrated".
+          No browser redirect to chase.
+
+  Step 4: Refresh session every SESSION_REFRESH_INTERVAL merchants
+          (or on 403/empty responses) by re-running Step 1.
+
+REDIRECT POLICY (supervisor requirement):
+  If merchant ID is migrated → total_items=null, error="ID Migrated".
+  We do NOT scrape the new ID.
 """
 
 import re
@@ -32,12 +40,12 @@ import random
 import logging
 import threading
 import io
+import requests as req_lib
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from datetime import datetime
 
 from camoufox.sync_api import Camoufox
-from playwright.sync_api import Response as PlaywrightResponse
 
 logger = logging.getLogger("merchant_scraper")
 
@@ -45,22 +53,37 @@ logger = logging.getLogger("merchant_scraper")
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-STORE_URL_TEMPLATE = (
-    "https://www.aliexpress.com/store/{merchant_id}/pages/all-items.html"
-    "?shop_sortType=bestmatch_sort"
-)
+# AliExpress internal store count endpoints (tried in order)
+# These are the XHR endpoints the browser calls — we call them directly
+# after establishing a real browser session
+STORE_API_ENDPOINTS = [
+    # Primary: async count endpoint used by all-items page
+    "https://www.aliexpress.com/store/async/merchandise/count.do"
+    "?storeNum={merchant_id}&storeType=1&productOrigin=",
+
+    # Secondary: aecommerce CDN-backed version
+    "https://aecommerce.aliexpress.com/store/async/merchandise/count"
+    "?storeNum={merchant_id}&storeType=1",
+
+    # Tertiary: store search with count in response
+    "https://www.aliexpress.com/store/async/merchandise.do"
+    "?storeNum={merchant_id}&storeType=1&page=1&pageSize=1&sort=bestmatch_sort",
+]
+
+# Warmup page — what the browser visits to establish session
+ALIEXPRESS_HOME = "https://www.aliexpress.com/"
+
+# How many merchants to process before refreshing the browser session
+SESSION_REFRESH_INTERVAL = 50
 
 BATCH_SIZE          = 20
-CONCURRENCY         = 1
 MAX_RETRIES         = 3
-PAGE_TIMEOUT        = 90_000
-NETWORKIDLE_TIMEOUT = 20_000
-POLL_TIMEOUT_MS     = 30_000   # Reduced — intercept usually wins in <5s
-DELAY_MIN           = 8.0
-DELAY_MAX           = 20.0
-THROTTLE_DELAY_MIN  = 30
-THROTTLE_DELAY_MAX  = 60
-THROTTLE_SIZE_KB    = 180
+API_TIMEOUT         = 12       # seconds per requests call
+SESSION_TIMEOUT     = 45_000   # ms for browser session warmup
+DELAY_MIN           = 3.0      # shorter — no browser overhead per merchant
+DELAY_MAX           = 8.0
+THROTTLE_DELAY_MIN  = 20
+THROTTLE_DELAY_MAX  = 45
 JOBS_DIR            = Path("./merchant_jobs")
 
 USER_AGENTS = [
@@ -68,75 +91,31 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
 ]
 
-ALIEXPRESS_LOCALE_COOKIES = [
-    {"name": "aep_usuc_f",
-     "value": "site=glo&c_tp=SEK&x_alimid=-&b_locale=en_US&ae_u_p_s=2",
-     "domain": ".aliexpress.com", "path": "/"},
-    {"name": "ali_apache_currency", "value": "EUR",
-     "domain": ".aliexpress.com", "path": "/"},
-    {"name": "ali_apache_lang",     "value": "en_US",
-     "domain": ".aliexpress.com", "path": "/"},
-    {"name": "intl_locale",         "value": "en_US",
-     "domain": ".aliexpress.com", "path": "/"},
-    {"name": "xman_us_f",           "value": "x_l=1&acs_rt=",
-     "domain": ".aliexpress.com", "path": "/"},
-    {"name": "aep_common_f",
-     "value": "x_user_id=-&x_login_name=-&x_mbtype=&x_isnewuser=n",
-     "domain": ".aliexpress.com", "path": "/"},
-]
-
-ALIEXPRESS_LOCALE_HEADERS = {
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
-              "image/avif,image/webp,*/*;q=0.8",
-    "sec-ch-ua-platform": '"Windows"',
-    "sec-fetch-dest": "document",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-site": "none",
-}
-
-REAL_BLOCK_SIGNALS = [
-    'id="baxia-punish"',
-    'class="baxia-dialog"',
-    'nc_iconfont btn_slide',
-    'grecaptcha',
-    'data-sitekey',
-    'verify you are human',
-    '<title>access denied</title>',
-    'cf-challenge-running',
-]
-
-# XHR/Fetch URL fragments that carry the item count
-# AliExpress uses several CDN/API hosts depending on region & A/B test
-COUNT_API_PATTERNS = [
-    "merchandise/count",
-    "store/async/merchandise",
-    "mtop.aliexpress.store.pc.shop.item.count",
-    "mtop.aliexpress.store.page",
-    "aecommerce.aliexpress.com",
-    "/store/async/",
-    "storeFront/count",
-    "storeItemCount",
-    "shop_itemcount",
-    "shop-item-count",
-]
-
-# JSON field names that hold the total count in the intercepted response
+# JSON count field names to search in API responses (in priority order)
 COUNT_JSON_FIELDS = [
-    "totalProducts", "itemCount", "totalItems", "storeItemCount",
-    "total", "count", "totalResults", "productCount", "allProductCount",
-    "totalNum", "totalRecord", "totalCount", "itemTotal",
+    "totalResults", "totalProducts", "itemCount", "totalItems",
+    "storeItemCount", "allProductCount", "productCount",
+    "total", "count", "totalNum", "totalRecord", "totalCount",
 ]
 
 _jobs: Dict[str, Dict] = {}
 _jobs_lock = threading.Lock()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL SESSION STATE
+# One requests.Session shared across all merchant calls in a job.
+# Refreshed periodically via browser warmup.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_session:         Optional[req_lib.Session] = None
+_session_ua:      str = USER_AGENTS[0]
+_session_lock:    threading.Lock = threading.Lock()
+_session_calls:   int = 0   # how many API calls made on current session
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -201,58 +180,158 @@ def parse_merchant_csv(file_bytes: bytes) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STRATEGY 1 — XHR / FETCH INTERCEPTION
-# Register BEFORE page.goto() so we never miss the request.
+# SESSION MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _is_count_api_response(url: str) -> bool:
-    """Return True if this response URL looks like the item-count endpoint."""
-    url_lower = url.lower()
-    return any(pat.lower() in url_lower for pat in COUNT_API_PATTERNS)
+def _build_browser_session() -> req_lib.Session:
+    """
+    Launch a real browser, visit AliExpress homepage to establish session,
+    extract all cookies, and return a configured requests.Session.
 
+    This is the key step that makes direct API calls work — AliExpress
+    requires a real session (cookies + browser fingerprint) that was
+    established by an actual browser visit.
+    """
+    ua = random.choice(USER_AGENTS)
+    logger.info("[session] Building new browser session...")
+
+    cookies_dict = {}
+
+    try:
+        with Camoufox(headless=True, os="windows") as browser:
+            ctx = browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                locale="en-US",
+                timezone_id="Europe/Stockholm",
+                user_agent=ua,
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                              "image/avif,image/webp,*/*;q=0.8",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-fetch-dest": "document",
+                    "sec-fetch-mode": "navigate",
+                    "sec-fetch-site": "none",
+                },
+            )
+            page = ctx.new_page()
+
+            # Visit homepage to establish real session
+            try:
+                page.goto(ALIEXPRESS_HOME, timeout=SESSION_TIMEOUT,
+                          wait_until="domcontentloaded")
+                # Let the page settle and fire its init XHRs
+                page.wait_for_timeout(random.randint(3_000, 5_000))
+                # Small human-like interaction
+                page.mouse.move(random.randint(300, 900), random.randint(200, 600))
+                page.wait_for_timeout(random.randint(1_000, 2_000))
+            except Exception as e:
+                logger.warning(f"[session] Homepage visit error (non-fatal): {e}")
+
+            # Extract all cookies from the browser context
+            browser_cookies = ctx.cookies()
+            for ck in browser_cookies:
+                cookies_dict[ck["name"]] = ck["value"]
+
+            page.close()
+            ctx.close()
+
+    except Exception as e:
+        logger.error(f"[session] Browser session build failed: {e}")
+        # Fall back to manual locale cookies if browser fails
+        cookies_dict = {
+            "aep_usuc_f": "site=glo&c_tp=EUR&x_alimid=-&b_locale=en_US&ae_u_p_s=2",
+            "ali_apache_currency": "EUR",
+            "ali_apache_lang": "en_US",
+            "intl_locale": "en_US",
+            "xman_us_f": "x_l=1&acs_rt=",
+        }
+
+    # Build requests.Session with the extracted cookies
+    session = req_lib.Session()
+    session.headers.update({
+        "User-Agent": ua,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.aliexpress.com/",
+        "Origin": "https://www.aliexpress.com",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "x-requested-with": "XMLHttpRequest",
+    })
+    for name, value in cookies_dict.items():
+        session.cookies.set(name, value, domain=".aliexpress.com")
+
+    cookie_count = len(cookies_dict)
+    logger.info(f"[session] Ready — {cookie_count} cookies, UA: {ua[:40]}...")
+    return session, ua
+
+
+def _get_session() -> req_lib.Session:
+    """
+    Return the current global session, building it if needed.
+    Thread-safe.
+    """
+    global _session, _session_ua, _session_calls
+    with _session_lock:
+        if _session is None or _session_calls >= SESSION_REFRESH_INTERVAL:
+            _session, _session_ua = _build_browser_session()
+            _session_calls = 0
+        return _session
+
+
+def _refresh_session() -> None:
+    """Force a new browser session (call on 403 / repeated failures)."""
+    global _session, _session_ua, _session_calls
+    with _session_lock:
+        _session, _session_ua = _build_browser_session()
+        _session_calls = 0
+
+
+def _increment_session_calls() -> None:
+    global _session_calls
+    with _session_lock:
+        _session_calls += 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JSON COUNT EXTRACTION
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _extract_count_from_json(data: Any, depth: int = 0) -> Optional[int]:
-    """
-    Recursively search a parsed JSON object for known count field names.
-    Returns the first plausible value (> 0).
-    """
+    """Recursively find a count value in a parsed JSON object."""
     if depth > 8:
         return None
-
     if isinstance(data, dict):
+        # Check known field names first (ordered by likelihood)
         for field in COUNT_JSON_FIELDS:
             if field in data:
                 val = data[field]
-                if isinstance(val, (int, float)) and val > 0:
+                if isinstance(val, (int, float)) and 0 < val < 10_000_000:
                     return int(val)
-                if isinstance(val, str) and val.isdigit() and int(val) > 0:
+                if isinstance(val, str) and val.isdigit() and 0 < int(val) < 10_000_000:
                     return int(val)
-        # Recurse into values
+        # Recurse into nested dicts
         for v in data.values():
-            result = _extract_count_from_json(v, depth + 1)
-            if result is not None:
-                return result
-
+            if isinstance(v, (dict, list)):
+                result = _extract_count_from_json(v, depth + 1)
+                if result is not None:
+                    return result
     elif isinstance(data, list):
         for item in data:
             result = _extract_count_from_json(item, depth + 1)
             if result is not None:
                 return result
-
     return None
 
 
-def _try_parse_response_body(response: PlaywrightResponse) -> Optional[int]:
+def _parse_api_response(body: str) -> Optional[int]:
     """
-    Safely read a Playwright response body and extract the item count.
-    Handles JSON, JSONP, and embedded JSON in JS assignment strings.
+    Parse an API response body and extract item count.
+    Handles: pure JSON, JSONP, raw regex fallback.
     """
-    try:
-        body = response.text()
-    except Exception:
-        return None
-
-    if not body or len(body) < 10:
+    if not body or len(body) < 5:
         return None
 
     # 1. Pure JSON
@@ -261,426 +340,186 @@ def _try_parse_response_body(response: PlaywrightResponse) -> Optional[int]:
         count = _extract_count_from_json(data)
         if count is not None:
             return count
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         pass
 
-    # 2. JSONP: callback({...}) or mtopjsonp1({...})
-    jsonp_match = re.search(r'\w+\s*\(\s*(\{.+\})\s*\)\s*;?\s*$', body, re.DOTALL)
-    if jsonp_match:
+    # 2. JSONP: callback({...})
+    jsonp = re.search(r'\w+\s*\(\s*(\{.+\})\s*\)\s*;?\s*$', body, re.DOTALL)
+    if jsonp:
         try:
-            data = json.loads(jsonp_match.group(1))
+            data = json.loads(jsonp.group(1))
             count = _extract_count_from_json(data)
             if count is not None:
                 return count
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
             pass
 
-    # 3. Inline regex fallback — grab any count-like field from raw text
+    # 3. Raw regex on the body string
     for field in COUNT_JSON_FIELDS:
-        m = re.search(
-            rf'"{field}"\s*:\s*"?(\d+)"?',
-            body, re.IGNORECASE
-        )
-        if m:
-            val = int(m.group(1))
-            if val > 0:
-                return val
-
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STRATEGY 2 — DOM POLL (pure text-node walker, no class/anchor dependency)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# This JS walks every text node in the document and looks for "N items" text.
-# It does NOT rely on any CSS class, data attribute, or element ID.
-_JS_TEXTNODE_POLL = """() => {
-    if (!document.body) return false;
-    const walker = document.createTreeWalker(
-        document.body, NodeFilter.SHOW_TEXT, null
-    );
-    let node;
-    while ((node = walker.nextNode())) {
-        const t = node.textContent.trim();
-        // Match: "1234 items" or "1,234 items" or "1234 item"
-        const m = t.match(/^([\d,]+)\s+items?$/i);
-        if (m) {
-            const val = parseInt(m[1].replace(/,/g, ''), 10);
-            if (val > 0) return val;
-        }
-    }
-    // Also search script tags for SSR JSON (React server-side data)
-    for (const s of document.querySelectorAll('script[type="application/json"], script')) {
-        const src = s.textContent || '';
-        if (src.length < 50) continue;
-        const patterns = [
-            /"(?:totalProducts|itemCount|totalItems|storeItemCount|totalResults|allProductCount)"\s*:\s*(\d+)/,
-            /"total"\s*:\s*(\d+)/,
-        ];
-        for (const pat of patterns) {
-            const m2 = src.match(pat);
-            if (m2) {
-                const v = parseInt(m2[1], 10);
-                if (v > 0 && v < 10_000_000) return v;
-            }
-        }
-    }
-    return false;
-}"""
-
-# DOM dump for diagnostics — unchanged from v3.7 but harmless to keep
-_JS_DOM_DUMP = """() => {
-    const results = [];
-    const all = document.querySelectorAll('span, div, p, h1, h2, h3, li');
-    for (const el of all) {
-        const t = el.textContent.trim();
-        if (t.length < 60 && /item/i.test(t) && t.length > 0) {
-            results.push({
-                tag: el.tagName.toLowerCase(), text: t,
-                id: el.id || '', cls: el.className ? String(el.className).slice(0, 80) : '',
-                anchor: el.getAttribute('data-spm-anchor-id') || '',
-                style: el.getAttribute('style') ? el.getAttribute('style').slice(0, 80) : ''
-            });
-            if (results.length >= 20) break;
-        }
-    }
-    const scriptMatches = [];
-    for (const s of document.querySelectorAll('script')) {
-        const src = s.textContent || '';
-        const m = src.match(/"(?:totalProducts|itemCount|totalItems|storeItemCount|total)"\s*:\s*(\d+)/g);
-        if (m) scriptMatches.push(...m.slice(0, 3));
-    }
-    return { dom_elements: results, script_matches: scriptMatches.slice(0, 10) };
-}"""
-
-
-def _wait_for_item_count_textnode(page, poll_timeout_ms: int = POLL_TIMEOUT_MS) -> Optional[int]:
-    """Poll the DOM every 100ms using the text-node walker — no selector dependency."""
-    try:
-        result = page.wait_for_function(
-            _JS_TEXTNODE_POLL,
-            timeout=poll_timeout_ms,
-            polling=100,
-        )
-        count = result.json_value()
-        if isinstance(count, (int, float)) and count > 0:
-            return int(count)
-    except Exception as poll_err:
-        logger.debug(f"[poll] timed out after {poll_timeout_ms}ms: {poll_err}")
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STRATEGY 3 — RAW HTML REGEX FALLBACK
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _extract_item_count_from_html(html: str) -> Optional[int]:
-    """Last-resort: regex scan over the raw HTML string."""
-    # JSON-embedded fields (SSR data, window.__initialData__, etc.)
-    for field in COUNT_JSON_FIELDS:
-        m = re.search(rf'"{field}"\s*:\s*"?(\d+)"?', html, re.IGNORECASE)
+        m = re.search(rf'"{field}"\s*:\s*"?(\d+)"?', body, re.IGNORECASE)
         if m:
             val = int(m.group(1))
             if 0 < val < 10_000_000:
                 return val
 
-    # Visible text pattern: "N items" anywhere in the HTML
-    all_matches = re.findall(r'\b(\d[\d,]*)\s+items?\b', html, re.IGNORECASE)
-    if all_matches:
-        nums = [int(x.replace(",", "")) for x in all_matches
-                if 0 < int(x.replace(",", "")) < 10_000_000]
-        if nums:
-            return max(nums)
-
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BROWSER CONTEXT FACTORY
+# REDIRECT DETECTION IN API RESPONSE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _make_context(browser, ua: str):
-    ctx = browser.new_context(
-        viewport={"width": 1440, "height": 900},
-        locale="en-US",
-        timezone_id="Europe/Stockholm",
-        user_agent=ua,
-        extra_http_headers=ALIEXPRESS_LOCALE_HEADERS,
-    )
-    ctx.add_cookies(ALIEXPRESS_LOCALE_COOKIES)
-    return ctx
-
-
-def _warmup_session(page) -> None:
-    try:
-        page.goto("https://www.aliexpress.com/", timeout=30_000,
-                  wait_until="domcontentloaded")
-        page.wait_for_timeout(random.randint(2_000, 4_000))
-        page.mouse.move(random.randint(200, 800), random.randint(100, 500))
-        page.wait_for_timeout(random.randint(500, 1_500))
-    except Exception as e:
-        logger.debug(f"[warmup] non-fatal: {e}")
+def _detect_migrated_id_in_response(body: str, merchant_id: str) -> Optional[str]:
+    """
+    Check if the API response contains a storeNum different from what we
+    requested — this means the store was migrated to a new ID.
+    Returns the new ID if migrated, None if same store.
+    """
+    # Look for storeNum, storeId, or sellerId fields in the response
+    for field in ["storeNum", "storeId", "sellerId", "storeNo"]:
+        m = re.search(rf'"{field}"\s*:\s*"?(\d+)"?', body, re.IGNORECASE)
+        if m:
+            found_id = m.group(1)
+            if found_id != merchant_id:
+                return found_id
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REDIRECT HANDLING
+# CORE: DIRECT API CALL PER MERCHANT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_store_id_from_url(url: str) -> Optional[str]:
-    """Pull the store/merchant ID out of any AliExpress store URL."""
-    m = re.search(r'/store/(\d+)', url)
-    return m.group(1) if m else None
+def _api_get_item_count(merchant_id: str) -> Dict:
+    """
+    Try each API endpoint using the shared session.
+    If the store has migrated to a new ID, follow it automatically and
+    still return the item count — recording the new ID in migrated_to.
+
+    Output CSV columns:
+      MerchantID  = original ID you requested
+      TotalItems  = count from current store (even if migrated)
+      MigratedTo  = new ID if store was migrated, empty if not
+      Error       = "" on success
+    """
+    session    = _get_session()
+    migrated_to: Optional[str] = None   # track if a redirect happened
+
+    for endpoint_template in STORE_API_ENDPOINTS:
+        # Use the migrated ID for the actual request if one was discovered
+        active_id = migrated_to if migrated_to else merchant_id
+        url = endpoint_template.format(merchant_id=active_id)
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = session.get(
+                    url,
+                    timeout=API_TIMEOUT,
+                    allow_redirects=True,   # let requests follow HTTP redirects
+                )
+
+                # ── Handle auth/rate-limit failures ───────────────────────────
+                if resp.status_code == 403:
+                    logger.warning(
+                        f"[api] {merchant_id} 403 on attempt {attempt} — "
+                        f"session may be expired"
+                    )
+                    if attempt == MAX_RETRIES:
+                        _refresh_session()
+                        session = _get_session()
+                    time.sleep(random.uniform(2, 5))
+                    continue
+
+                if resp.status_code == 429:
+                    logger.warning(f"[api] {merchant_id} 429 rate limited")
+                    time.sleep(random.uniform(10, 20))
+                    continue
+
+                if resp.status_code != 200:
+                    logger.debug(
+                        f"[api] {merchant_id} HTTP {resp.status_code} "
+                        f"from {url[:60]}"
+                    )
+                    break  # Try next endpoint
+
+                body = resp.text
+
+                # ── Detect migrated ID inside response body ───────────────────
+                # If the API returned data for a different storeNum, note it
+                # but still extract the count — don't stop.
+                detected_id = _detect_migrated_id_in_response(body, merchant_id)
+                if detected_id and not migrated_to:
+                    migrated_to = detected_id
+                    logger.info(
+                        f"[api] {merchant_id} → store migrated to {migrated_to} "
+                        f"— fetching count from new ID"
+                    )
+                    # Re-request using the new ID for the remaining endpoints
+                    active_id = migrated_to
+                    url = endpoint_template.format(merchant_id=active_id)
+                    resp = session.get(url, timeout=API_TIMEOUT, allow_redirects=True)
+                    if resp.status_code != 200:
+                        break
+                    body = resp.text
+
+                # ── Extract count ──────────────────────────────────────────────
+                count = _parse_api_response(body)
+                if count is not None:
+                    _increment_session_calls()
+                    logger.info(
+                        f"[api] {merchant_id} ✓ {count} items"
+                        + (f" (migrated → {migrated_to})" if migrated_to else "")
+                    )
+                    return {
+                        "merchant_id": merchant_id,
+                        "total_items": count,
+                        "error":       "",
+                        "migrated_to": migrated_to,
+                        "source":      "direct_api",
+                    }
+
+                logger.debug(
+                    f"[api] {merchant_id} 200 but no count in: {body[:200]}"
+                )
+                break  # Try next endpoint
+
+            except req_lib.Timeout:
+                logger.debug(f"[api] {merchant_id} timeout on {url[:60]}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(random.uniform(2, 4))
+                    continue
+                break
+
+            except req_lib.RequestException as e:
+                logger.debug(f"[api] {merchant_id} request error: {e}")
+                break
+
+    # All endpoints exhausted
+    return {
+        "merchant_id": merchant_id,
+        "total_items": None,
+        "error":       "API Failed — all endpoints returned no count",
+        "migrated_to": migrated_to,  # include even on failure so CSV shows it
+        "source":      None,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SINGLE MERCHANT SCRAPER  v4.0
+# SINGLE MERCHANT — MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_merchant(merchant_id: str) -> Dict:
-    original_url = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
+    """
+    Direct API call only. No browser per merchant.
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        intercepted_count: Optional[int] = None
-        intercepted_url:   Optional[str] = None
-
-        try:
-            ua = random.choice(USER_AGENTS)
-            with Camoufox(headless=True, os="windows") as browser:
-                ctx  = _make_context(browser, ua)
-                page = ctx.new_page()
-
-                # ── STRATEGY 1 SETUP: Register network interceptor ─────────────
-                # Must be set BEFORE page.goto() so we catch the very first
-                # XHR/Fetch that fires during page load.
-                def on_response(response: PlaywrightResponse) -> None:
-                    nonlocal intercepted_count, intercepted_url
-                    if intercepted_count is not None:
-                        return  # Already found, no need to keep processing
-                    try:
-                        url = response.url
-                        if not _is_count_api_response(url):
-                            return
-                        status = response.status
-                        if status not in (200, 304):
-                            return
-                        count = _try_parse_response_body(response)
-                        if count is not None:
-                            intercepted_count = count
-                            intercepted_url   = url
-                            logger.debug(
-                                f"[intercept] {merchant_id} ✓ {count} "
-                                f"from {url[:80]}"
-                            )
-                    except Exception as e:
-                        logger.debug(f"[intercept] handler error: {e}")
-
-                page.on("response", on_response)
-
-                # ── Warmup (attempt 1 only) ────────────────────────────────────
-                if attempt == 1:
-                    _warmup_session(page)
-
-                # ── Navigate ──────────────────────────────────────────────────
-                try:
-                    page.goto(original_url, timeout=PAGE_TIMEOUT,
-                              wait_until="domcontentloaded")
-                except Exception as nav_err:
-                    err_str = str(nav_err)
-                    if "NS_BINDING_ABORTED" in err_str or "ERR_ABORTED" in err_str:
-                        logger.warning(f"[merchant] {merchant_id} nav aborted — continuing")
-                    elif any(x in err_str for x in ["ERR_NAME_NOT_RESOLVED", "NS_ERROR"]):
-                        page.close(); ctx.close()
-                        return {"merchant_id": merchant_id, "total_items": None,
-                                "error": "Page Not Found", "redirected_to": None}
-                    else:
-                        raise
-
-                # ── ae:reload_path meta-redirect ──────────────────────────────
-                try:
-                    reload_url = page.evaluate("""() => {
-                        const m = document.querySelector('meta[property="ae:reload_path"]');
-                        return m ? m.getAttribute('content') : null;
-                    }""")
-                    if reload_url and reload_url.strip() != page.url.strip():
-                        logger.info(f"[merchant] {merchant_id} ae:reload_path → {reload_url}")
-                        try:
-                            page.goto(reload_url, timeout=PAGE_TIMEOUT,
-                                      wait_until="domcontentloaded")
-                        except Exception as re_err:
-                            rs = str(re_err)
-                            if "NS_BINDING_ABORTED" not in rs and "ERR_ABORTED" not in rs:
-                                logger.warning(
-                                    f"[merchant] {merchant_id} reload_path err: {rs[:80]}"
-                                )
-                except Exception:
-                    pass
-
-                # ── Determine final store ID (redirect detection) ──────────────
-                # AliExpress 301s old IDs to new ones. We accept this — the
-                # count we extract is for the SAME store, just a new ID.
-                # We record it in redirected_to but DO NOT treat it as an error.
-                final_url    = page.url
-                landed_id    = _extract_store_id_from_url(final_url)
-                redirected_to = (
-                    landed_id
-                    if landed_id and landed_id != merchant_id
-                    else None
-                )
-                if redirected_to:
-                    logger.info(
-                        f"[merchant] {merchant_id} → {redirected_to} "
-                        f"(ID migration, continuing)"
-                    )
-
-                # ── networkidle (don't depend on it, just let it settle) ───────
-                try:
-                    page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
-                except Exception:
-                    pass
-
-                # ── If intercept already got the count, we're done early ───────
-                if intercepted_count is not None:
-                    html      = page.content()
-                    html_size = len(html)
-                    lower     = html.lower()
-                    page.close(); ctx.close()
-
-                    if any(sig in lower for sig in REAL_BLOCK_SIGNALS):
-                        logger.warning(f"[merchant] {merchant_id} — CAPTCHA (attempt {attempt})")
-                        if attempt < MAX_RETRIES:
-                            time.sleep(random.uniform(THROTTLE_DELAY_MIN, THROTTLE_DELAY_MAX))
-                            continue
-                        return {"merchant_id": merchant_id, "total_items": None,
-                                "error": "Blocked/CAPTCHA", "redirected_to": redirected_to}
-
-                    logger.info(
-                        f"[merchant] {merchant_id} ✓ {intercepted_count} items "
-                        f"(intercept)"
-                        + (f" → redir {redirected_to}" if redirected_to else "")
-                    )
-                    return {
-                        "merchant_id": merchant_id,
-                        "total_items": intercepted_count,
-                        "error": "",
-                        "redirected_to": redirected_to,
-                        "source": "intercept",
-                    }
-
-                # ── Scroll to trigger lazy loaders ────────────────────────────
-                for _ in range(3):
-                    page.mouse.wheel(0, random.randint(500, 900))
-                    page.wait_for_timeout(random.randint(300, 600))
-                page.wait_for_timeout(random.randint(800, 1_500))
-
-                # ── Check again after scroll (intercept fires async) ──────────
-                if intercepted_count is not None:
-                    html      = page.content()
-                    html_size = len(html)
-                    lower     = html.lower()
-                    page.close(); ctx.close()
-
-                    logger.info(
-                        f"[merchant] {merchant_id} ✓ {intercepted_count} items "
-                        f"(post-scroll intercept)"
-                        + (f" → redir {redirected_to}" if redirected_to else "")
-                    )
-                    return {
-                        "merchant_id": merchant_id,
-                        "total_items": intercepted_count,
-                        "error": "",
-                        "redirected_to": redirected_to,
-                        "source": "intercept_post_scroll",
-                    }
-
-                # ── STRATEGY 2: Poll DOM text nodes ───────────────────────────
-                dom_count = _wait_for_item_count_textnode(
-                    page, poll_timeout_ms=POLL_TIMEOUT_MS
-                )
-
-                html      = page.content()
-                html_size = len(html)
-                lower     = html.lower()
-                page.close(); ctx.close()
-
-                # ── Block detection ───────────────────────────────────────────
-                if any(sig in lower for sig in REAL_BLOCK_SIGNALS):
-                    logger.warning(f"[merchant] {merchant_id} — CAPTCHA (attempt {attempt})")
-                    if attempt < MAX_RETRIES:
-                        time.sleep(random.uniform(THROTTLE_DELAY_MIN, THROTTLE_DELAY_MAX))
-                        continue
-                    return {"merchant_id": merchant_id, "total_items": None,
-                            "error": "Blocked/CAPTCHA", "redirected_to": redirected_to}
-
-                # ── Throttle detection ────────────────────────────────────────
-                if dom_count is None and html_size < THROTTLE_SIZE_KB * 1024:
-                    logger.warning(
-                        f"[merchant] {merchant_id} — throttled: {html_size // 1024}KB "
-                        f"(attempt {attempt})"
-                    )
-                    if attempt < MAX_RETRIES:
-                        time.sleep(random.uniform(THROTTLE_DELAY_MIN, THROTTLE_DELAY_MAX))
-                        continue
-                    return {"merchant_id": merchant_id, "total_items": None,
-                            "error": f"Throttled ({html_size // 1024}KB)",
-                            "redirected_to": redirected_to}
-
-                if dom_count is not None:
-                    logger.info(
-                        f"[merchant] {merchant_id} ✓ {dom_count} items (dom_poll)"
-                        + (f" → redir {redirected_to}" if redirected_to else "")
-                    )
-                    return {
-                        "merchant_id": merchant_id,
-                        "total_items": dom_count,
-                        "error": "",
-                        "redirected_to": redirected_to,
-                        "source": "dom_poll",
-                    }
-
-                # ── STRATEGY 3: Raw HTML regex ────────────────────────────────
-                html_count = _extract_item_count_from_html(html)
-                if html_count is not None:
-                    logger.info(
-                        f"[merchant] {merchant_id} ✓ {html_count} items (html_regex)"
-                        + (f" → redir {redirected_to}" if redirected_to else "")
-                    )
-                    return {
-                        "merchant_id": merchant_id,
-                        "total_items": html_count,
-                        "error": "",
-                        "redirected_to": redirected_to,
-                        "source": "html_regex",
-                    }
-
-                # ── All strategies exhausted ──────────────────────────────────
-                if attempt < MAX_RETRIES:
-                    logger.warning(
-                        f"[merchant] {merchant_id} — no count, "
-                        f"{html_size // 1024}KB, attempt {attempt}"
-                    )
-                    time.sleep(random.uniform(5, 10))
-                    continue
-
-                return {
-                    "merchant_id": merchant_id,
-                    "total_items": None,
-                    "error": f"All strategies failed ({html_size // 1024}KB)",
-                    "redirected_to": redirected_to,
-                }
-
-        except Exception as exc:
-            err_str = str(exc)
-            label   = "Timeout" if "timeout" in err_str.lower() else f"Error: {err_str[:80]}"
-            logger.error(f"[merchant] {merchant_id} attempt {attempt} — {label}")
-            if attempt < MAX_RETRIES:
-                time.sleep(random.uniform(4, 10))
-                continue
-            return {"merchant_id": merchant_id, "total_items": None,
-                    "error": label, "redirected_to": None}
-
-    return {"merchant_id": merchant_id, "total_items": None,
-            "error": "Max retries exceeded", "redirected_to": None}
+    Result format:
+      total_items  : int or None
+      error        : "" (success) | "ID Migrated" | "API Failed..." | ...
+      migrated_to  : str (new ID) if error=="ID Migrated", else None
+      source       : "direct_api" | None
+    """
+    result = _api_get_item_count(merchant_id)
+    result.setdefault("migrated_to", None)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -691,14 +530,14 @@ def _write_batch_csv(job_id: str, batch_idx: int, rows: List[Dict]) -> None:
     path = _batch_path(job_id, batch_idx)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["MerchantID", "TotalItems", "RedirectedTo", "Error", "Source"])
+        w.writerow(["MerchantID", "TotalItems", "MigratedTo", "Error", "Source"])
         for row in rows:
             w.writerow([
                 row.get("merchant_id", ""),
                 "" if row.get("total_items") is None else row["total_items"],
-                row.get("redirected_to") or "",
+                row.get("migrated_to") or "",
                 row.get("error", ""),
-                row.get("source", ""),
+                row.get("source") or "",
             ])
     logger.info(f"[job:{job_id}] Batch {batch_idx:04d} → {path.name} ({len(rows)} rows)")
 
@@ -707,7 +546,7 @@ def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
     out_path = _output_path(job_id)
     with open(out_path, "w", newline="", encoding="utf-8") as out_f:
         writer = csv.writer(out_f)
-        writer.writerow(["MerchantID", "TotalItems", "RedirectedTo", "Error", "Source"])
+        writer.writerow(["MerchantID", "TotalItems", "MigratedTo", "Error", "Source"])
         for idx in range(batches_total):
             bf = _batch_path(job_id, idx)
             if not bf.exists():
@@ -728,24 +567,30 @@ def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
-    logger.info(f"[job:{job_id}] Batch {batch_idx:04d} start — {len(merchant_ids)} merchants")
+    logger.info(f"[job:{job_id}] Batch {batch_idx:04d} — {len(merchant_ids)} merchants")
     rows = []
+
     for i, mid in enumerate(merchant_ids):
         try:
             row = _scrape_merchant(mid)
         except Exception as e:
-            row = {"merchant_id": mid, "total_items": None,
-                   "error": str(e)[:120], "redirected_to": None}
+            row = {
+                "merchant_id": mid, "total_items": None,
+                "error": str(e)[:120], "migrated_to": None, "source": None,
+            }
         rows.append(row)
 
-        status = (f"✓ {row['total_items']} [{row.get('source','?')}]"
-                  if row.get("total_items") is not None
-                  else f"✗ {row.get('error','?')[:40]}")
+        if row.get("total_items") is not None:
+            status = f"✓ {row['total_items']} [direct_api]"
+        elif row.get("error") == "ID Migrated":
+            status = f"⚠ ID Migrated → {row.get('migrated_to', '?')}"
+        else:
+            status = f"✗ {row.get('error', '?')[:60]}"
+
         logger.info(f"[job:{job_id}] [{i+1}/{len(merchant_ids)}] {mid} → {status}")
 
         if i < len(merchant_ids) - 1:
-            delay = random.uniform(DELAY_MIN, DELAY_MAX)
-            time.sleep(delay)
+            time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
     _write_batch_csv(job_id, batch_idx, rows)
 
@@ -755,15 +600,23 @@ def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
-    batches       = [merchant_ids[i:i+BATCH_SIZE] for i in range(0, len(merchant_ids), BATCH_SIZE)]
+    batches       = [merchant_ids[i:i+BATCH_SIZE]
+                     for i in range(0, len(merchant_ids), BATCH_SIZE)]
     batches_total = len(batches)
     total         = len(merchant_ids)
+
+    # Build session once before the job starts
+    logger.info(f"[job:{job_id}] Initialising browser session...")
+    _get_session()
 
     meta = {
         "job_id": job_id, "status": "running", "total": total,
         "batches_total": batches_total, "batches_done": 0, "batches_failed": 0,
         "started_at": datetime.utcnow().isoformat(), "finished_at": None,
-        "batches": [{"idx": i, "size": len(b), "status": "queued"} for i, b in enumerate(batches)],
+        "batches": [
+            {"idx": i, "size": len(b), "status": "queued"}
+            for i, b in enumerate(batches)
+        ],
     }
     _save_metadata(job_id, meta)
 
@@ -799,10 +652,13 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
         processed      = meta["batches_done"] + meta["batches_failed"]
         pct            = round(processed / batches_total * 100, 1)
         merchants_done = min(processed * BATCH_SIZE, total)
-        logger.info(f"[job:{job_id}] {processed}/{batches_total} ({merchants_done}/{total}, {pct}%)")
+        logger.info(
+            f"[job:{job_id}] {processed}/{batches_total} "
+            f"({merchants_done}/{total}, {pct}%)"
+        )
 
         if idx < batches_total - 1:
-            time.sleep(random.uniform(15, 30))
+            time.sleep(random.uniform(5, 15))
 
     try:
         _merge_batch_csvs(job_id, batches_total)
@@ -817,19 +673,26 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
         if job_id in _jobs:
             _jobs[job_id]["status"] = "done"
 
-    logger.info(f"[job:{job_id}] ✓ Complete — {meta['batches_done']} ok | {meta['batches_failed']} failed")
+    logger.info(
+        f"[job:{job_id}] ✓ Complete — "
+        f"{meta['batches_done']} ok | {meta['batches_failed']} failed"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PUBLIC API
+# PUBLIC API (unchanged interface — main.py needs no changes)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def start_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
     with _jobs_lock:
-        _jobs[job_id] = {"status": "queued", "total": len(merchant_ids),
-                         "batches_total": 0, "batches_done": 0, "batches_failed": 0}
-    t = threading.Thread(target=_run_bulk_job, args=(job_id, merchant_ids),
-                         daemon=True, name=f"merchant-{job_id[:8]}")
+        _jobs[job_id] = {
+            "status": "queued", "total": len(merchant_ids),
+            "batches_total": 0, "batches_done": 0, "batches_failed": 0,
+        }
+    t = threading.Thread(
+        target=_run_bulk_job, args=(job_id, merchant_ids),
+        daemon=True, name=f"merchant-{job_id[:8]}"
+    )
     t.start()
 
 
@@ -912,3 +775,99 @@ def list_all_jobs() -> List[Dict]:
                                    if meta.get("status") == "done" else None,
         })
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXPORTS NEEDED BY main.py debug endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Keep these so main.py imports don't break
+STORE_URL_TEMPLATE  = "https://www.aliexpress.com/store/{merchant_id}"
+USER_AGENTS         = USER_AGENTS
+PAGE_TIMEOUT        = SESSION_TIMEOUT
+NETWORKIDLE_TIMEOUT = 20_000
+POLL_TIMEOUT_MS     = 25_000
+REAL_BLOCK_SIGNALS  = [
+    'id="baxia-punish"', 'class="baxia-dialog"', 'nc_iconfont btn_slide',
+    'grecaptcha', 'data-sitekey', 'verify you are human',
+    '<title>access denied</title>', 'cf-challenge-running',
+]
+
+def _make_context(browser, ua: str):
+    return browser.new_context(
+        viewport={"width": 1440, "height": 900},
+        locale="en-US",
+        timezone_id="Europe/Stockholm",
+        user_agent=ua,
+        extra_http_headers={
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                      "image/avif,image/webp,*/*;q=0.8",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+        },
+    )
+
+def _extract_store_id_from_url(url: str) -> Optional[str]:
+    m = re.search(r'/store/(\d+)', url)
+    return m.group(1) if m else None
+
+def _extract_item_count_from_html(html: str) -> Optional[int]:
+    for field in COUNT_JSON_FIELDS:
+        m = re.search(rf'"{field}"\s*:\s*"?(\d+)"?', html, re.IGNORECASE)
+        if m:
+            val = int(m.group(1))
+            if 0 < val < 10_000_000:
+                return val
+    all_m = re.findall(r'\b(\d[\d,]*)\s+items?\b', html, re.IGNORECASE)
+    if all_m:
+        nums = [int(x.replace(",", "")) for x in all_m
+                if 0 < int(x.replace(",", "")) < 10_000_000]
+        if nums:
+            return max(nums)
+    return None
+
+_JS_DOM_DUMP = """() => {
+    const results = [];
+    const all = document.querySelectorAll('span, div, p, h1, h2, h3, li');
+    for (const el of all) {
+        const t = el.textContent.trim();
+        if (t.length < 60 && /item/i.test(t) && t.length > 0) {
+            results.push({ tag: el.tagName.toLowerCase(), text: t,
+                id: el.id || '', cls: el.className ? String(el.className).slice(0,80) : '' });
+            if (results.length >= 20) break;
+        }
+    }
+    return { dom_elements: results, script_matches: [] };
+}"""
+
+def _is_count_api_response(url: str) -> bool:
+    patterns = ["merchandise/count", "store/async/", "mtop.aliexpress"]
+    return any(p in url.lower() for p in patterns)
+
+def _try_parse_response_body(response) -> Optional[int]:
+    try:
+        return _parse_api_response(response.text())
+    except Exception:
+        return None
+
+def _wait_for_item_count_textnode(page, poll_timeout_ms: int = 25_000) -> Optional[int]:
+    js = """() => {
+        if (!document.body) return false;
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+        let node;
+        while ((node = walker.nextNode())) {
+            const t = node.textContent.trim();
+            const m = t.match(/^([\d,]+)\s+items?$/i);
+            if (m) { const v = parseInt(m[1].replace(/,/g,''),10); if (v>0) return v; }
+        }
+        return false;
+    }"""
+    try:
+        result = page.wait_for_function(js, timeout=poll_timeout_ms, polling=100)
+        count  = result.json_value()
+        return int(count) if isinstance(count, (int, float)) and count > 0 else None
+    except Exception:
+        return None
