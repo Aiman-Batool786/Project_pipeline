@@ -1,12 +1,6 @@
 """
-FastAPI Server - HYBRID APPROACH v4.0
+FastAPI Server - HYBRID APPROACH v2.9
 Pipeline: Scrape → Store → Enhance → Categorize → Map → Excel
-
-Changelog v4.0 (merchant_scraper v5.0):
-  - /merchant-debug uses direct API call (no browser per merchant)
-  - Session built once via browser, reused for all API calls
-  - Redirect policy: ID Migrated = null result, not a scraped store
-  - Removed all browser-per-merchant imports (_JS_EXTRACT_COUNT etc.)
 """
 
 from fastapi import FastAPI, HTTPException
@@ -39,18 +33,18 @@ from merchant_scraper import (
     get_job_status,
     get_output_path,
     list_all_jobs,
-    # v5.0 helpers
-    _api_get_item_count,
-    _build_browser_session,
-    _parse_api_response,
-    _extract_store_id_from_url,
-    _extract_item_count_from_html,
-    STORE_API_ENDPOINTS,
+    _make_context,
+    _JS_DOM_DUMP,
+    _JS_POLL_FOR_COUNT,
+    _wait_for_item_count,
+    STORE_URL_TEMPLATE,
     USER_AGENTS,
-    API_TIMEOUT,
+    PAGE_TIMEOUT,
+    NETWORKIDLE_TIMEOUT,
+    POLL_TIMEOUT_MS,
+    REAL_BLOCK_SIGNALS,
+    BLOCKED_SIZE_BYTES,
 )
-
-import requests as req_lib
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,7 +52,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Octopia Template Pipeline", version="4.0.0")
+app = FastAPI(title="Octopia Template Pipeline", version="2.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -156,7 +150,7 @@ def startup_event():
     try:
         from db import create_all_tables
         create_all_tables()
-        logger.info("✅ API Ready — v4.0.0")
+        logger.info("✅ API Ready — v2.9.0")
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
@@ -170,7 +164,7 @@ def root():
     return {
         "status":  "running",
         "service": "Octopia Template Pipeline",
-        "version": "4.0.0",
+        "version": "2.9.0",
     }
 
 
@@ -686,10 +680,10 @@ def merchant_job_status(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
     return {
-        "job_id":         job_id,
-        "status":         job.get("status", "unknown"),
-        "total":          job.get("total_merchants", job.get("total", 0)),
-        "done":           job.get("merchants_done", 0),
+        "job_id":   job_id,
+        "status":   job.get("status", "unknown"),
+        "total":    job.get("total_merchants", job.get("total", 0)),
+        "done":     job.get("merchants_done", 0),
         "progress_pct":   job.get("progress_pct", 0.0),
         "batches_total":  job.get("batches_total", 0),
         "batches_done":   job.get("batches_done", 0),
@@ -726,172 +720,152 @@ def list_merchant_jobs():
 
 
 # =============================================================================
-# MERCHANT DEBUG  v5.0
-#
-# Uses direct HTTP API call (same as bulk job).
-# Browser is used ONCE to build a session, then pure requests per merchant.
-#
-# Response shows:
-#   strategy        : "direct_api" | "ID Migrated" | "failed"
-#   total_items     : count or null
-#   endpoints_tried : which URLs were attempted and what they returned
+# MERCHANT DEBUG  v3.4
+# KEY FIX: uses _wait_for_item_count() which POLLS the DOM every 100 ms
+# instead of a single page.evaluate() that fires before React mounts.
 # =============================================================================
 
 @app.post("/merchant-debug", tags=["Merchant Bulk"])
 def merchant_debug(req: MerchantDebugRequest):
     """
-    DEBUG v5.0 — test a single merchant ID using direct API strategy.
+    DEBUG v4.0 — scrape ONE merchant, no redirect following.
 
-    Builds a fresh browser session for this debug call, then tries each
-    API endpoint and reports exactly what each one returned.
+    Enforces supervisor rule: only scrapes the GIVEN store ID.
+    If AliExpress redirects to a different ID, returns error="Redirected".
 
-    Input:  { "merchant_id": "1104990029" }
+    Returns dom_dump showing all elements containing "item" so you can
+    diagnose selector issues when poll_result=null on a full page.
     """
+    from camoufox.sync_api import Camoufox
+
     merchant_id = str(req.merchant_id).strip()
     if not merchant_id.isdigit():
         raise HTTPException(status_code=400, detail="merchant_id must be numeric")
 
-    t0 = time.time()
+    url = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
+    ua  = random.choice(USER_AGENTS)
+    t0  = time.time()
 
     debug = {
-        "merchant_id":      merchant_id,
-        "session_built":    False,
-        "session_cookies":  0,
-        "endpoints_tried":  [],
-        "strategy":         None,
-        "load_time_sec":    None,
+        "url": url, "page_loaded": False, "final_url": None,
+        "html_size_bytes": 0, "blocked": False,
+        "networkidle": None, "poll_result": None,
+        "dom_dump": None, "redirected_to": None,
+        "load_time_sec": None, "nav_error": None,
     }
 
-    # Step 1: Build a fresh browser session
     try:
-        session, ua = _build_browser_session()
-        debug["session_built"]   = True
-        debug["session_cookies"] = len(session.cookies)
-        debug["session_ua"]      = ua[:60]
-    except Exception as e:
-        debug["load_time_sec"] = round(time.time() - t0, 2)
-        return {
-            "success": False, "merchant_id": merchant_id,
-            "total_items": None,
-            "error": f"Session build failed: {e}",
-            "debug": debug,
-        }
+        with Camoufox(headless=True, os="windows") as browser:
+            ctx  = _make_context(browser, ua, merchant_id)
+            page = ctx.new_page()
 
-    # Step 2: Try each endpoint and record exactly what happened
-    final_count   = None
-    final_error   = None
-    migrated_to   = None
-
-    for endpoint_template in STORE_API_ENDPOINTS:
-        url = endpoint_template.format(merchant_id=merchant_id)
-        endpoint_result = {
-            "url":         url.split("?")[0],  # hide params for readability
-            "full_url":    url,
-            "status_code": None,
-            "body_length": None,
-            "body_sample": None,
-            "count_found": None,
-            "error":       None,
-        }
-
-        try:
-            resp = session.get(url, timeout=API_TIMEOUT, allow_redirects=False)
-            endpoint_result["status_code"] = resp.status_code
-
-            if resp.status_code in (301, 302):
-                location = resp.headers.get("Location", "")
-                endpoint_result["error"] = f"Redirect → {location[:100]}"
-                m_id = _re.search(r'storeNum=(\d+)|/store/(\d+)', location)
-                if m_id:
-                    new_id = m_id.group(1) or m_id.group(2)
-                    if new_id != merchant_id:
-                        endpoint_result["error"] = f"ID Migrated → {new_id}"
-                        migrated_to = new_id
-                debug["endpoints_tried"].append(endpoint_result)
-                continue
-
-            body = resp.text
-            endpoint_result["body_length"] = len(body)
-            endpoint_result["body_sample"] = body[:300]
-
-            if resp.status_code == 200:
-                # Check for ID migration in body
-                for field in ["storeNum", "storeId", "storeNo"]:
-                    m = _re.search(rf'"{field}"\s*:\s*"?(\d+)"?', body, re.IGNORECASE)
-                    if m and m.group(1) != merchant_id:
-                        migrated_to = m.group(1)
-                        endpoint_result["error"] = f"Body storeNum mismatch → {migrated_to}"
-                        break
-
-                if not migrated_to:
-                    count = _parse_api_response(body)
-                    endpoint_result["count_found"] = count
-                    if count is not None and final_count is None:
-                        final_count = count
-            else:
-                endpoint_result["error"] = f"HTTP {resp.status_code}"
-
-        except req_lib.Timeout:
-            endpoint_result["error"] = f"Timeout after {API_TIMEOUT}s"
-        except req_lib.RequestException as e:
-            endpoint_result["error"] = str(e)[:100]
-
-        debug["endpoints_tried"].append(endpoint_result)
-
-        if final_count is not None:
-            break  # Found it — no need to try more endpoints
-
-    debug["load_time_sec"] = round(time.time() - t0, 2)
-
-    # If migration detected but no count yet, retry all endpoints with new ID
-    if migrated_to and final_count is None:
-        for endpoint_template in STORE_API_ENDPOINTS:
-            url = endpoint_template.format(merchant_id=migrated_to)
+            # Navigate — route handler blocks other store IDs
             try:
-                resp = session.get(url, timeout=API_TIMEOUT, allow_redirects=True)
-                if resp.status_code == 200:
-                    count = _parse_api_response(resp.text)
-                    if count is not None:
-                        final_count = count
-                        debug["endpoints_tried"].append({
-                            "url":        url.split("?")[0],
-                            "full_url":   url,
-                            "note":       f"Retried with migrated ID {migrated_to}",
-                            "count_found": count,
-                            "status_code": 200,
-                            "error":      None,
-                        })
-                        break
+                page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
+                debug["page_loaded"] = True
+            except Exception as nav_err:
+                es = str(nav_err)
+                debug["nav_error"] = es[:200]
+                if any(x in es for x in ["blockedbyclient", "ERR_BLOCKED",
+                                          "NS_BINDING_ABORTED", "ERR_ABORTED"]):
+                    debug["page_loaded"] = True
+                    debug["nav_error"]   = "Redirect blocked or aborted — continuing"
+                elif any(x in es for x in ["ERR_NAME_NOT_RESOLVED", "NS_ERROR_UNKNOWN_HOST"]):
+                    page.close(); ctx.close()
+                    return {"success": False, "merchant_id": merchant_id,
+                            "total_items": None, "error": "Page Not Found", "debug": debug}
+                else:
+                    page.close(); ctx.close()
+                    return {"success": False, "merchant_id": merchant_id,
+                            "total_items": None, "error": f"Nav: {es[:150]}", "debug": debug}
+
+            # Check if JS navigation moved us to a different store
+            cur_url = page.url
+            m_cur = _re.search(r'/store/(\d+)/', cur_url)
+            if m_cur and m_cur.group(1) != merchant_id:
+                debug["redirected_to"] = m_cur.group(1)
+                # Navigate back to original
+                try:
+                    page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
+                except Exception:
+                    pass
+
+            # networkidle
+            try:
+                page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
+                debug["networkidle"] = "reached"
+            except Exception:
+                debug["networkidle"] = "timeout"
+
+            # Scroll
+            for _ in range(3):
+                page.mouse.wheel(0, 600)
+                page.wait_for_timeout(400)
+            page.wait_for_timeout(1_000)
+
+            # Final store ID check
+            final_url = page.url
+            m_final = _re.search(r'/store/(\d+)/', final_url)
+            final_id = m_final.group(1) if m_final else merchant_id
+            if final_id != merchant_id:
+                debug["redirected_to"] = final_id
+                debug["note"] = (
+                    f"Ended on store/{final_id} — supervisor rule: "
+                    f"reporting as Redirected (stale ID)"
+                )
+
+            # Poll DOM (60s)
+            polled = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
+            debug["poll_result"] = polled
+
+            # DOM dump — always run
+            try:
+                debug["dom_dump"] = page.evaluate(_JS_DOM_DUMP)
             except Exception as e:
-                debug["endpoints_tried"].append({
-                    "url":   url.split("?")[0],
-                    "note":  f"Retry with migrated ID {migrated_to} failed",
-                    "error": str(e)[:80],
-                })
+                debug["dom_dump"] = {"error": str(e)[:80]}
 
-    # Build response
-    if final_count is not None:
-        debug["strategy"] = "direct_api"
-        return {
-            "success":     True,
-            "merchant_id": merchant_id,
-            "total_items": final_count,
-            "error":       None,
-            "migrated_to": migrated_to,
-            "note":        (f"Store migrated to {migrated_to}, count from new store"
-                            if migrated_to else None),
-            "debug":       debug,
-        }
+            debug["final_url"]     = page.url
+            debug["load_time_sec"] = round(time.time() - t0, 2)
+            html = page.content()
+            debug["html_size_bytes"] = len(html)
+            page.close()
+            ctx.close()
 
-    debug["strategy"] = "failed"
-    return {
-        "success":     False,
-        "merchant_id": merchant_id,
-        "total_items": None,
-        "error":       "All API endpoints failed — check debug.endpoints_tried for details",
-        "migrated_to": migrated_to,
-        "debug":       debug,
-    }
+        lower = html.lower()
+        debug["blocked"] = any(sig in lower for sig in REAL_BLOCK_SIGNALS)
+
+        if debug["blocked"]:
+            return {"success": False, "merchant_id": merchant_id,
+                    "total_items": None, "error": "Blocked/CAPTCHA", "debug": debug}
+
+        # Supervisor rule: if redirected, report it
+        if debug.get("redirected_to") and debug["redirected_to"] != merchant_id:
+            return {"success": False, "merchant_id": merchant_id,
+                    "total_items": None,
+                    "error": f"Redirected to {debug['redirected_to']} (stale ID — supervisor rule)",
+                    "debug": debug}
+
+        if polled is not None:
+            return {"success": True, "merchant_id": merchant_id,
+                    "total_items": polled, "error": None, "debug": debug}
+
+        # Silent bot-detection
+        if debug["html_size_bytes"] < BLOCKED_SIZE_BYTES:
+            return {"success": False, "merchant_id": merchant_id,
+                    "total_items": None,
+                    "error": f"Bot-detection lite page ({debug['html_size_bytes']//1024}KB)",
+                    "debug": debug}
+
+        debug["html_head_500"] = html[:500].replace("\n", " ")
+        return {"success": False, "merchant_id": merchant_id, "total_items": None,
+                "error": "Selector Missing — check debug.dom_dump", "debug": debug}
+
+    except Exception as exc:
+        debug["load_time_sec"] = round(time.time() - t0, 2)
+        return {"success": False, "merchant_id": merchant_id,
+                "total_items": None, "error": str(exc)[:300], "debug": debug}
+
+
 
 
 # =============================================================================
@@ -968,9 +942,7 @@ def get_compliance_by_product(product_id: int):
             "SELECT * FROM compliance_info WHERE product_id = ?", (product_id,)
         ).fetchall()
         conn.close()
-        return [dict(r) for r in rows] if rows else {
-            "message": f"No compliance for product {product_id}"
-        }
+        return [dict(r) for r in rows] if rows else {"message": f"No compliance for product {product_id}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -988,9 +960,7 @@ def get_stats():
         stats = {}
         for table in tables:
             try:
-                stats[table] = conn.execute(
-                    f"SELECT COUNT(*) FROM {table}"
-                ).fetchone()[0]
+                stats[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             except Exception:
                 stats[table] = 0
         conn.close()
@@ -1019,6 +989,6 @@ def view_processing_logs(limit: int = 500):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v4.0")
+    logger.info("🚀 Octopia Template Pipeline v2.9")
     logger.info(f"📡 Server: http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
