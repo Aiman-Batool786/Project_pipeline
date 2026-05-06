@@ -1,24 +1,35 @@
 """
-merchant_scraper.py v5.0 — Alias-Redirect + 3-Layer Extraction
-───────────────────────────────────────────────────────────────
-CHANGES FROM v4.0:
+merchant_scraper.py  v6.0  — Synthesized Best Solution
+═══════════════════════════════════════════════════════
+CORE DESIGN DECISIONS (distilled from all AI analyses):
+
   1. REDIRECT = ALIAS, NOT FATAL
-     AliExpress canonicalises old store IDs to new ones.
-     We now scrape the landed page and return BOTH IDs.
-     Null is never returned just because the store ID changed.
+     AliExpress canonicalises stale store IDs (e.g. 910356374 → 1101540694).
+     We scrape the landed page and return both IDs. Null is NEVER returned
+     just because the store ID changed.
 
-  2. THREE-LAYER EXTRACTION WATERFALL
-     Layer 1 — JSON API response bodies (XHR / fetch intercept)
-     Layer 2 — Hydrated global state (window.runParams, __NEXT_DATA__, etc.)
-     Layer 3 — Broad DOM text fallback (TreeWalker + relaxed regex)
+  2. NO REDIRECT ABORTING
+     The old route.abort() on mismatched store IDs broke page hydration and
+     was the #1 reason for null results. Route handler now observe-only.
 
-  3. NO REDIRECT ABORTING IN ROUTE HANDLER
-     The old route handler that called route.abort() on redirects
-     was breaking page hydration. Now it only observes / logs.
+  3. THREE-LAYER EXTRACTION WATERFALL
+     Layer 1 — JSON API response bodies  (XHR / fetch interception)
+     Layer 2 — Hydrated global state     (window.runParams, __NEXT_DATA__ …)
+     Layer 3 — Broad DOM / TreeWalker    (relaxed regex, not exact-match)
 
   4. SCREENSHOT ON FAILURE
-     Any scrape that ends without a count saves a PNG screenshot
-     so you can see exactly what the browser saw.
+     Any scrape that ends without a count saves a PNG for inspection.
+
+  5. CLEAN RESULT SCHEMA
+     {
+       "merchant_id":        <input id>,
+       "canonical_store_id": <landed id, may differ>,
+       "total_items":        <int or null>,
+       "extraction_source":  "response_json" | "global_state" | "dom_poll",
+       "warning":            <alias note or null>,
+       "error":              <error string or "">,
+       "screenshot_path":    <path or null>
+     }
 """
 
 import re
@@ -44,20 +55,20 @@ logger = logging.getLogger("merchant_scraper")
 
 STORE_URL_TEMPLATE = (
     "https://www.aliexpress.com/store/{merchant_id}/pages/all-items.html"
-    "?shop_sortType=bestmatch_sort"
+    "?shop_sortType=bestmatch_sort&language=en"
 )
 
-BATCH_SIZE          = 20
-CONCURRENCY         = 1
-MAX_RETRIES         = 3
-PAGE_TIMEOUT        = 90_000
-NETWORKIDLE_TIMEOUT = 25_000
-POLL_TIMEOUT_MS     = 60_000
-DELAY_MIN           = 8.0
-DELAY_MAX           = 20.0
-BLOCKED_SIZE_BYTES  = 150_000
-JOBS_DIR            = Path("./merchant_jobs")
-SCREENSHOTS_DIR     = Path("./merchant_screenshots")
+BATCH_SIZE           = 20
+CONCURRENCY          = 1
+MAX_RETRIES          = 3
+PAGE_TIMEOUT         = 120_000   # 120 s — slow stores need this
+NETWORKIDLE_TIMEOUT  = 30_000
+POLL_TIMEOUT_MS      = 90_000    # 90 s DOM poll
+DELAY_MIN            = 10.0
+DELAY_MAX            = 25.0
+BLOCKED_SIZE_BYTES   = 200_000
+JOBS_DIR             = Path("./merchant_jobs")
+SCREENSHOTS_DIR      = Path("./merchant_screenshots")
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -71,16 +82,20 @@ USER_AGENTS = [
 
 BASE_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "sec-fetch-dest": "document",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-site": "none",
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "sec-fetch-dest":  "document",
+    "sec-fetch-mode":  "navigate",
+    "sec-fetch-site":  "none",
 }
 
 REAL_BLOCK_SIGNALS = [
-    'id="baxia-punish"', 'class="baxia-dialog"',
-    'nc_iconfont btn_slide', 'grecaptcha', 'data-sitekey',
-    'verify you are human', '<title>access denied</title>',
+    'id="baxia-punish"',
+    'class="baxia-dialog"',
+    'nc_iconfont btn_slide',
+    'grecaptcha',
+    'data-sitekey',
+    'verify you are human',
+    '<title>access denied</title>',
     'cf-challenge-running',
 ]
 
@@ -117,12 +132,8 @@ def _load_metadata(job_id: str) -> Optional[dict]:
     with open(path) as f:
         return json.load(f)
 
-
 def _save_screenshot(page, merchant_id: str, label: str = "debug") -> Optional[str]:
-    """
-    Save a PNG screenshot and return the file path (relative).
-    Returns None on any error so it never breaks the main flow.
-    """
+    """Save a PNG screenshot. Returns file path or None on error."""
     try:
         SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         ts       = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -135,9 +146,7 @@ def _save_screenshot(page, merchant_id: str, label: str = "debug") -> Optional[s
         logger.debug(f"[screenshot] failed: {e}")
         return None
 
-
 def _screenshot_to_b64(path: Optional[str]) -> Optional[str]:
-    """Read a saved screenshot PNG and return base64 string."""
     if not path:
         return None
     try:
@@ -178,7 +187,7 @@ def parse_merchant_csv(file_bytes: bytes) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JSON HELPERS — Layer 1 & 2 extraction
+# LAYER 1: JSON RESPONSE-BODY HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 COUNT_HINT_RE = re.compile(
@@ -225,7 +234,6 @@ def _best_count_from_json(data: Any, expected_ids: Optional[set] = None) -> Opti
     for item in flat:
         p = item["path"].lower()
         v = item["value"]
-
         if isinstance(v, str) and v.isdigit():
             v = int(v)
         if not isinstance(v, int):
@@ -245,15 +253,14 @@ def _best_count_from_json(data: Any, expected_ids: Optional[set] = None) -> Opti
 
         if score >= 10:
             candidates.append({
-                "count": v,
-                "path":  item["path"],
-                "score": score,
+                "count":       v,
+                "path":        item["path"],
+                "score":       score,
                 "matched_ids": sorted(expected_ids & ids_found),
             })
 
     if not candidates:
         return None
-
     candidates.sort(key=lambda x: (x["score"], x["count"]), reverse=True)
     return candidates[0]
 
@@ -264,111 +271,15 @@ def _extract_store_id(url: str) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JS EXTRACTORS
+# LAYER 2: HYDRATED GLOBALS  (JS injected into page)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_JS_DOM_DUMP = """() => {
-    const results = [];
-    const all = document.querySelectorAll('span, div, p, h1, h2, h3, li');
-    for (const el of all) {
-        const t = el.textContent.trim();
-        if (t.length < 80 && /item/i.test(t) && t.length > 0) {
-            results.push({
-                tag: el.tagName.toLowerCase(), text: t,
-                anchor: el.getAttribute('data-spm-anchor-id') || '',
-                cls: el.className ? String(el.className).slice(0,60) : ''
-            });
-            if (results.length >= 15) break;
-        }
-    }
-    const scriptMatches = [];
-    for (const s of document.querySelectorAll('script')) {
-        const m = (s.textContent||'').match(
-            /"(?:totalProducts|itemCount|totalItems|storeItemCount)"\s*:\s*(\d+)/g
-        );
-        if (m) scriptMatches.push(...m.slice(0,3));
-    }
-    return {dom_elements: results, script_matches: scriptMatches.slice(0,5)};
-}"""
-
-# Broadened poll — covers "324 items", "Products: 324", "324 results", etc.
-_JS_POLL_FOR_COUNT = r"""() => {
-    const patterns = [
-        /(\d[\d,]*)\s*(?:items?|products?|results?)\b/i,
-        /\b(?:items?|products?|results?)\s*[:(]?\s*(\d[\d,]*)\b/i,
-    ];
-
-    const norm = (s) => (s || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
-
-    const tryText = (txt) => {
-        txt = norm(txt);
-        for (const re of patterns) {
-            const m = txt.match(re);
-            if (m) {
-                const v = parseInt((m[1] || m[2]).replace(/,/g, ""), 10);
-                if (v > 0) return v;
-            }
-        }
-        return null;
-    };
-
-    // Anchor-based selectors (most specific first)
-    for (const el of document.querySelectorAll(
-            'span[data-spm-anchor-id*="store_pc_allItems_or_groupList"],' +
-            'span[data-spm-anchor-id*="store_pc_allItems"]')) {
-        const v = tryText(el.textContent);
-        if (v) return v;
-    }
-    for (const div of document.querySelectorAll(
-            'div[data-spm-anchor-id*="store_pc_allItems_or_groupList"],' +
-            'div[data-spm-anchor-id*="store_pc_allItems"]')) {
-        for (const span of div.querySelectorAll('span')) {
-            const v = tryText(span.textContent);
-            if (v) return v;
-        }
-    }
-
-    // Class/id hints
-    for (const el of document.querySelectorAll(
-            '[class*="total"],[class*="count"],[id*="total"],[id*="count"]')) {
-        const v = tryText(el.textContent);
-        if (v) return v;
-    }
-
-    // Broad element scan
-    for (const el of document.querySelectorAll('span, div, p, h1, h2, h3, li, strong, b')) {
-        const v = tryText(el.textContent);
-        if (v) return v;
-    }
-
-    // SSR JSON in script tags — extended key list
-    for (const s of document.querySelectorAll('script')) {
-        const m = (s.textContent||'').match(
-            /"(?:totalProducts|itemCount|totalItems|storeItemCount|productCount|goodsCount|total)"\s*:\s*(\d+)/
-        );
-        if (m) return parseInt(m[1], 10);
-    }
-
-    // TreeWalker — every text node
-    const walker = document.createTreeWalker(
-        document.body || document.documentElement, NodeFilter.SHOW_TEXT, null
-    );
-    let node;
-    while ((node = walker.nextNode())) {
-        const v = tryText(node.textContent);
-        if (v) return v;
-    }
-    return false;
-}"""
-
-# Layer 2: scan hydrated globals
 _JS_GLOBAL_CANDIDATES = r"""
 (expectedIds) => {
     const names = [
         "runParams", "__NEXT_DATA__", "__INITIAL_STATE__",
         "__PRELOADED_STATE__", "_page_config_"
     ];
-
     const countRe = /(item|items|product|products|goods|result|results).{0,20}(count|total|num|size)|(count|total|num|size).{0,20}(item|items|product|products|goods|result|results)/i;
     const idRe    = /(store|shop|seller|merchant).{0,10}id/i;
 
@@ -386,7 +297,8 @@ _JS_GLOBAL_CANDIDATES = r"""
                 else if (typeof v === "number") {
                     const p = `${path}[${i}]`;
                     if (countRe.test(p) && v > 0 && v < 500000) {
-                        hits.push({ source: path.split(".")[0], path: p, count: v, score: 10, matched_store_id: meta.storeId || null });
+                        hits.push({ source: path.split(".")[0], path: p, count: v,
+                                    score: 10, matched_store_id: meta.storeId || null });
                     }
                 }
             });
@@ -404,7 +316,8 @@ _JS_GLOBAL_CANDIDATES = r"""
                 if (countRe.test(p)) score += 10;
                 if (nextMeta.storeId && expectedIds.includes(nextMeta.storeId)) score += 3;
                 if (score >= 10 && v > 0 && v < 500000) {
-                    hits.push({ source: path.split(".")[0], path: p, count: v, score, matched_store_id: nextMeta.storeId || null });
+                    hits.push({ source: path.split(".")[0], path: p, count: v,
+                                score, matched_store_id: nextMeta.storeId || null });
                 }
             } else if (v && typeof v === "object") {
                 walk(v, p, nextMeta);
@@ -414,9 +327,7 @@ _JS_GLOBAL_CANDIDATES = r"""
 
     for (const n of names) {
         try {
-            if (window[n] && typeof window[n] === "object") {
-                walk(window[n], n, {});
-            }
+            if (window[n] && typeof window[n] === "object") walk(window[n], n, {});
         } catch(e) {}
     }
 
@@ -426,27 +337,116 @@ _JS_GLOBAL_CANDIDATES = r"""
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# LAYER 3: BROAD DOM POLL  (relaxed regex, TreeWalker fallback)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_JS_POLL_FOR_COUNT = r"""() => {
+    const patterns = [
+        /(\d[\d,]*)\s*(?:items?|products?|results?)\b/i,
+        /\b(?:items?|products?|results?)\s*[:(]?\s*(\d[\d,]*)\b/i,
+    ];
+    const norm = (s) => (s || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+    const tryText = (txt) => {
+        txt = norm(txt);
+        for (const re of patterns) {
+            const m = txt.match(re);
+            if (m) {
+                const raw = m[1] || m[2];
+                if (!raw) continue;
+                const v = parseInt(raw.replace(/,/g, ""), 10);
+                if (v > 0 && v < 1000000) return v;
+            }
+        }
+        return null;
+    };
+
+    // 1. Anchor-based (most specific, 2024 AliExpress)
+    for (const el of document.querySelectorAll(
+            'span[data-spm-anchor-id*="store_pc_allItems_or_groupList"],' +
+            'span[data-spm-anchor-id*="store_pc_allItems"]')) {
+        const v = tryText(el.textContent); if (v) return v;
+    }
+    for (const div of document.querySelectorAll(
+            'div[data-spm-anchor-id*="store_pc_allItems_or_groupList"],' +
+            'div[data-spm-anchor-id*="store_pc_allItems"]')) {
+        for (const span of div.querySelectorAll('span')) {
+            const v = tryText(span.textContent); if (v) return v;
+        }
+    }
+
+    // 2. Class/id hints
+    for (const el of document.querySelectorAll(
+            '[class*="total"],[class*="count"],[id*="total"],[id*="count"],' +
+            '.store-overview-total-product-count,[class*="product-count"]')) {
+        const v = tryText(el.textContent); if (v) return v;
+    }
+
+    // 3. Broad element scan
+    for (const el of document.querySelectorAll('span,div,p,h1,h2,h3,li,strong,b')) {
+        const v = tryText(el.textContent); if (v) return v;
+    }
+
+    // 4. SSR JSON keys in <script> tags — extended list
+    for (const s of document.querySelectorAll('script')) {
+        const m = (s.textContent||'').match(
+            /"(?:totalProducts?|itemCount|totalItems?|storeItemCount|productCount|goodsCount|totalNum)"\s*:\s*(\d+)/
+        );
+        if (m) return parseInt(m[1], 10);
+    }
+
+    // 5. JSON-LD structured data
+    for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+        try {
+            const data = JSON.parse(script.textContent);
+            if (data.numberOfItems) return parseInt(data.numberOfItems, 10);
+            if (data.mainEntity && data.mainEntity.numberOfItems)
+                return parseInt(data.mainEntity.numberOfItems, 10);
+        } catch(e) {}
+    }
+
+    // 6. data-attribute on container
+    const container = document.querySelector('[data-total-items]');
+    if (container) {
+        const m = String(container.getAttribute('data-total-items')).match(/\d+/);
+        if (m) return parseInt(m[0], 10);
+    }
+
+    // 7. TreeWalker — every text node (last resort)
+    const walker = document.createTreeWalker(
+        document.body || document.documentElement, NodeFilter.SHOW_TEXT, null
+    );
+    let node;
+    while ((node = walker.nextNode())) {
+        const v = tryText(node.textContent);
+        if (v) return v;
+    }
+
+    return false;
+}"""
+
+
 def _wait_for_item_count(page, poll_timeout_ms: int = POLL_TIMEOUT_MS) -> Optional[int]:
     try:
         result = page.wait_for_function(
-            _JS_POLL_FOR_COUNT, timeout=poll_timeout_ms, polling=100
+            _JS_POLL_FOR_COUNT, timeout=poll_timeout_ms, polling=150
         )
         count = result.json_value()
         if isinstance(count, (int, float)) and count > 0:
             return int(count)
     except Exception as e:
-        logger.debug(f"[poll] timeout: {e}")
+        logger.debug(f"[poll] timeout/error: {e}")
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BROWSER CONTEXT — observe-only, no blocking
+# BROWSER CONTEXT  — observe-only, NO redirect aborting
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_context(browser, ua: str, merchant_id: str = ""):
     """
-    Context that OBSERVES store navigation but never aborts it.
-    Aborting redirected store requests was breaking page hydration.
+    Creates a browser context that OBSERVES store navigation but never aborts it.
+    The old route.abort() on mismatched store IDs broke page hydration; removed.
     """
     ctx = browser.new_context(
         viewport={"width": 1440, "height": 900},
@@ -461,21 +461,22 @@ def _make_context(browser, ua: str, merchant_id: str = ""):
             m = re.search(r'/store/(\d+)/', url)
             if m and merchant_id and m.group(1) != merchant_id:
                 logger.info(
-                    f"[route] {merchant_id}: AliExpress is canonicalising "
-                    f"→ store/{m.group(1)} (letting it through)"
+                    f"[route] {merchant_id}: AliExpress canonicalising "
+                    f"→ store/{m.group(1)} — allowing through"
                 )
-        route.continue_()
+        route.continue_()   # ← always continue; never abort
 
     ctx.route("**/*", _route_handler)
     return ctx
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SINGLE MERCHANT SCRAPER  v5.0 — 3-layer extraction
+# SINGLE MERCHANT SCRAPER  — 3-layer waterfall
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_merchant(merchant_id: str) -> Dict:
-    url = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
+    url      = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
+    input_id = merchant_id
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -484,11 +485,10 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 ctx  = _make_context(browser, ua, merchant_id)
                 page = ctx.new_page()
 
-                input_id  = merchant_id
-                landed_id = merchant_id   # updated after navigation
+                landed_id     = input_id
                 alias_warning = None
 
-                # ── Layer 1: JSON response capture ────────────────────────────
+                # ── Layer 1 setup: capture JSON response bodies ───────────────
                 response_hits: List[Dict] = []
 
                 def _on_response(resp):
@@ -499,48 +499,53 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                             x in url_l for x in ["/api/", "/ajax/", "search", "store", "mtop"]
                         ):
                             return
-                        data  = resp.json()
-                        cand  = _best_count_from_json(data, expected_ids={input_id, landed_id})
+                        data = resp.json()
+                        cand = _best_count_from_json(data, expected_ids={input_id, landed_id})
                         if cand:
-                            response_hits.append({"source": "response", "url": resp.url, **cand})
+                            response_hits.append({
+                                "source": "response", "url": resp.url, **cand
+                            })
                     except Exception:
                         pass
 
                 page.on("response", _on_response)
 
-                # ── Navigate ──────────────────────────────────────────────────
+                # ── Navigate (allow all redirects naturally) ──────────────────
                 try:
                     page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
                 except Exception as nav_err:
                     err_str = str(nav_err)
+                    # Abort errors from internal route continuations are harmless
                     if any(x in err_str for x in [
                         "blockedbyclient", "ERR_BLOCKED",
-                        "NS_BINDING_ABORTED", "ERR_ABORTED"
+                        "NS_BINDING_ABORTED", "ERR_ABORTED",
                     ]):
-                        logger.info(f"[merchant] {merchant_id} nav aborted — checking DOM")
+                        logger.info(f"[merchant] {merchant_id} nav aborted signal — checking DOM")
                     elif any(x in err_str for x in [
-                        "ERR_NAME_NOT_RESOLVED", "NS_ERROR_UNKNOWN_HOST"
+                        "ERR_NAME_NOT_RESOLVED", "NS_ERROR_UNKNOWN_HOST",
                     ]):
                         page.close(); ctx.close()
-                        return {"merchant_id": merchant_id, "total_items": None,
-                                "error": "DNS failed / Page not found"}
+                        return {"merchant_id": input_id, "total_items": None,
+                                "canonical_store_id": input_id,
+                                "error": "DNS failed / page not found",
+                                "warning": None, "extraction_source": None,
+                                "screenshot_path": None}
                     else:
                         raise
 
-                # ── Detect landed store ID ────────────────────────────────────
-                cur_url   = page.url
-                landed_id = _extract_store_id(cur_url) or input_id
+                # ── Detect landed store ID ─────────────────────────────────────
+                landed_id = _extract_store_id(page.url) or input_id
                 if landed_id != input_id:
                     alias_warning = f"AliExpress canonicalised {input_id} → {landed_id}"
-                    logger.info(f"[merchant] {merchant_id} alias detected: {alias_warning}")
+                    logger.info(f"[merchant] {merchant_id}: {alias_warning}")
 
-                # ── networkidle ───────────────────────────────────────────────
+                # ── Wait for networkidle ───────────────────────────────────────
                 try:
                     page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
                 except Exception:
-                    pass
+                    pass  # timeout here is normal; continue anyway
 
-                # ── Human-like scroll ─────────────────────────────────────────
+                # ── Human-like scroll to trigger lazy loading ─────────────────
                 for _ in range(3):
                     page.mouse.wheel(0, random.randint(400, 800))
                     page.wait_for_timeout(random.randint(300, 600))
@@ -551,17 +556,17 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 if landed_id != input_id and not alias_warning:
                     alias_warning = f"AliExpress canonicalised {input_id} → {landed_id}"
 
-                # ── Layer 2: Hydrated globals ─────────────────────────────────
+                # ── Layer 2: scan hydrated globals ────────────────────────────
                 global_hits: List[Dict] = []
                 try:
                     global_hits = page.evaluate(_JS_GLOBAL_CANDIDATES, [input_id, landed_id])
                 except Exception as e:
                     logger.debug(f"[merchant] {merchant_id} global scan failed: {e}")
 
-                # ── Layer 3: DOM poll (60s) ───────────────────────────────────
+                # ── Layer 3: broad DOM poll (90 s) ────────────────────────────
                 dom_hit = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
 
-                # ── Check page for real block signals ─────────────────────────
+                # ── Grab HTML for block detection ─────────────────────────────
                 html      = page.content()
                 html_size = len(html)
                 lower     = html.lower()
@@ -570,40 +575,44 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 if is_blocked:
                     screenshot_path = _save_screenshot(page, merchant_id, "captcha")
                     page.close(); ctx.close()
-                    logger.warning(f"[merchant] {merchant_id} CAPTCHA/block detected (attempt {attempt})")
+                    logger.warning(
+                        f"[merchant] {merchant_id} CAPTCHA/block (attempt {attempt})"
+                    )
                     if attempt < MAX_RETRIES:
                         time.sleep(random.uniform(30, 60))
                         continue
-                    return {"merchant_id": merchant_id, "total_items": None,
-                            "error": "Blocked/CAPTCHA",
-                            "screenshot_path": screenshot_path}
+                    return {
+                        "merchant_id":        input_id,
+                        "canonical_store_id": landed_id,
+                        "total_items":        None,
+                        "error":              "Blocked/CAPTCHA",
+                        "warning":            alias_warning,
+                        "extraction_source":  None,
+                        "screenshot_path":    screenshot_path,
+                    }
 
                 # ── Pick best candidate across all layers ─────────────────────
-                best_count: Optional[int] = None
-                best_source = None
+                best_count:  Optional[int] = None
+                best_source: Optional[str] = None
 
-                # Response JSON wins
-                if response_hits:
+                if response_hits:                        # Layer 1 wins
                     best_count  = response_hits[0]["count"]
                     best_source = "response_json"
 
-                # Global state next
-                if best_count is None and global_hits:
+                if best_count is None and global_hits:   # Layer 2
                     best_count  = global_hits[0]["count"]
                     best_source = "global_state"
 
-                # DOM fallback
-                if best_count is None and dom_hit is not None:
+                if best_count is None and dom_hit:        # Layer 3
                     best_count  = dom_hit
                     best_source = "dom_poll"
 
                 if best_count is not None:
                     page.close(); ctx.close()
+                    canonical_note = f" (canonical={landed_id})" if alias_warning else ""
                     logger.info(
                         f"[merchant] {merchant_id} ✓ {best_count} items "
-                        f"(source={best_source}"
-                        + (f", canonical={landed_id}" if alias_warning else "")
-                        + ")"
+                        f"[{best_source}]{canonical_note}"
                     )
                     return {
                         "merchant_id":        input_id,
@@ -612,6 +621,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                         "error":              "",
                         "warning":            alias_warning,
                         "extraction_source":  best_source,
+                        "screenshot_path":    None,
                     }
 
                 # ── Silent bot-detection: page too small ──────────────────────
@@ -625,18 +635,24 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     if attempt < MAX_RETRIES:
                         time.sleep(random.uniform(30, 60))
                         continue
-                    return {"merchant_id": merchant_id, "total_items": None,
-                            "error": f"Bot-detection lite page ({html_size//1024}KB)",
-                            "screenshot_path": screenshot_path}
+                    return {
+                        "merchant_id":        input_id,
+                        "canonical_store_id": landed_id,
+                        "total_items":        None,
+                        "error":              f"Bot-detection lite page ({html_size//1024}KB)",
+                        "warning":            alias_warning,
+                        "extraction_source":  None,
+                        "screenshot_path":    screenshot_path,
+                    }
 
-                # ── Full page but nothing found ───────────────────────────────
+                # ── Full page but no count found — save debug artefacts ───────
                 screenshot_path = _save_screenshot(page, merchant_id, "no_count")
                 page.close(); ctx.close()
 
                 if attempt < MAX_RETRIES:
                     logger.warning(
-                        f"[merchant] {merchant_id} no count found, {html_size//1024}KB, "
-                        f"attempt {attempt}"
+                        f"[merchant] {merchant_id} no count ({html_size//1024}KB), "
+                        f"attempt {attempt} — retrying"
                     )
                     time.sleep(random.uniform(5, 15))
                     continue
@@ -647,6 +663,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     "total_items":        None,
                     "error":              f"Selector missing ({html_size//1024}KB)",
                     "warning":            alias_warning,
+                    "extraction_source":  None,
                     "screenshot_path":    screenshot_path,
                 }
 
@@ -657,26 +674,45 @@ def _scrape_merchant(merchant_id: str) -> Dict:
             if attempt < MAX_RETRIES:
                 time.sleep(random.uniform(5, 15))
                 continue
-            return {"merchant_id": merchant_id, "total_items": None, "error": label}
+            return {
+                "merchant_id":        input_id,
+                "canonical_store_id": input_id,
+                "total_items":        None,
+                "error":              label,
+                "warning":            None,
+                "extraction_source":  None,
+                "screenshot_path":    None,
+            }
 
-    return {"merchant_id": merchant_id, "total_items": None,
-            "error": "Max retries exceeded"}
+    return {
+        "merchant_id":        input_id,
+        "canonical_store_id": input_id,
+        "total_items":        None,
+        "error":              "Max retries exceeded",
+        "warning":            None,
+        "extraction_source":  None,
+        "screenshot_path":    None,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BATCH WRITER
+# BATCH WRITER / MERGER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _write_batch_csv(job_id: str, batch_idx: int, rows: List[Dict]) -> None:
     path = _batch_path(job_id, batch_idx)
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["MerchantID", "CanonicalStoreID", "TotalItems", "Warning", "Error"])
+        w.writerow([
+            "MerchantID", "CanonicalStoreID", "TotalItems",
+            "ExtractionSource", "Warning", "Error",
+        ])
         for row in rows:
             w.writerow([
                 row.get("merchant_id", ""),
                 row.get("canonical_store_id", row.get("merchant_id", "")),
                 "" if row.get("total_items") is None else row["total_items"],
+                row.get("extraction_source", ""),
                 row.get("warning", ""),
                 row.get("error", ""),
             ])
@@ -687,7 +723,10 @@ def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
     out_path = _output_path(job_id)
     with open(out_path, "w", newline="", encoding="utf-8") as out_f:
         writer = csv.writer(out_f)
-        writer.writerow(["MerchantID", "CanonicalStoreID", "TotalItems", "Warning", "Error"])
+        writer.writerow([
+            "MerchantID", "CanonicalStoreID", "TotalItems",
+            "ExtractionSource", "Warning", "Error",
+        ])
         for idx in range(batches_total):
             bf = _batch_path(job_id, idx)
             if not bf.exists():
@@ -696,7 +735,7 @@ def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
                 reader = csv.reader(in_f)
                 next(reader, None)
                 for row in reader:
-                    while len(row) < 5:
+                    while len(row) < 6:
                         row.append("")
                     writer.writerow(row)
     logger.info(f"[job:{job_id}] Merged {batches_total} batches → output.csv")
@@ -714,11 +753,17 @@ def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
         try:
             row = _scrape_merchant(mid)
         except Exception as e:
-            row = {"merchant_id": mid, "total_items": None, "error": str(e)[:120]}
+            row = {
+                "merchant_id": mid, "canonical_store_id": mid,
+                "total_items": None, "error": str(e)[:120],
+                "warning": None, "extraction_source": None,
+            }
         rows.append(row)
 
-        status = (f"✓ {row['total_items']}" if row.get("total_items") is not None
-                  else f"✗ {row.get('error','')[:40]}")
+        if row.get("total_items") is not None:
+            status = f"✓ {row['total_items']} [{row.get('extraction_source','')}]"
+        else:
+            status = f"✗ {row.get('error','')[:50]}"
         logger.info(f"[job:{job_id}] [{i+1}/{len(merchant_ids)}] {mid} → {status}")
 
         if i < len(merchant_ids) - 1:
@@ -775,7 +820,10 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
         processed      = meta["batches_done"] + meta["batches_failed"]
         merchants_done = min(processed * BATCH_SIZE, total)
         pct            = round(processed / batches_total * 100, 1)
-        logger.info(f"[job:{job_id}] {processed}/{batches_total} ({merchants_done}/{total}, {pct}%)")
+        logger.info(
+            f"[job:{job_id}] {processed}/{batches_total} "
+            f"({merchants_done}/{total}, {pct}%)"
+        )
 
         if idx < batches_total - 1:
             time.sleep(random.uniform(15, 30))
@@ -804,10 +852,14 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
 
 def start_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
     with _jobs_lock:
-        _jobs[job_id] = {"status": "queued", "total": len(merchant_ids),
-                         "batches_total": 0, "batches_done": 0, "batches_failed": 0}
-    t = threading.Thread(target=_run_bulk_job, args=(job_id, merchant_ids),
-                         daemon=True, name=f"merchant-{job_id[:8]}")
+        _jobs[job_id] = {
+            "status": "queued", "total": len(merchant_ids),
+            "batches_total": 0, "batches_done": 0, "batches_failed": 0,
+        }
+    t = threading.Thread(
+        target=_run_bulk_job, args=(job_id, merchant_ids),
+        daemon=True, name=f"merchant-{job_id[:8]}"
+    )
     t.start()
 
 
