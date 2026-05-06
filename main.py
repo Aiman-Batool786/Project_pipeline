@@ -1,5 +1,5 @@
 """
-FastAPI Server - HYBRID APPROACH v2.9
+FastAPI Server - HYBRID APPROACH v3.0
 Pipeline: Scrape → Store → Enhance → Categorize → Map → Excel
 """
 
@@ -26,7 +26,7 @@ import random
 import time
 import re as _re
 from fastapi import UploadFile, File, BackgroundTasks
-from fastapi.responses import Response as FastAPIResponse
+from fastapi.responses import Response as FastAPIResponse, FileResponse
 from merchant_scraper import (
     parse_merchant_csv,
     start_bulk_job,
@@ -34,9 +34,14 @@ from merchant_scraper import (
     get_output_path,
     list_all_jobs,
     _make_context,
+    _extract_store_id,
     _JS_DOM_DUMP,
     _JS_POLL_FOR_COUNT,
+    _JS_GLOBAL_CANDIDATES,
+    _best_count_from_json,
     _wait_for_item_count,
+    _save_screenshot,
+    _screenshot_to_b64,
     STORE_URL_TEMPLATE,
     USER_AGENTS,
     PAGE_TIMEOUT,
@@ -44,6 +49,7 @@ from merchant_scraper import (
     POLL_TIMEOUT_MS,
     REAL_BLOCK_SIGNALS,
     BLOCKED_SIZE_BYTES,
+    SCREENSHOTS_DIR,
 )
 
 logging.basicConfig(
@@ -52,7 +58,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Octopia Template Pipeline", version="2.9.0")
+app = FastAPI(title="Octopia Template Pipeline", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -150,7 +156,9 @@ def startup_event():
     try:
         from db import create_all_tables
         create_all_tables()
-        logger.info("✅ API Ready — v2.9.0")
+        # Ensure screenshot dir exists on startup
+        SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        logger.info("✅ API Ready — v3.0.0")
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
@@ -164,7 +172,7 @@ def root():
     return {
         "status":  "running",
         "service": "Octopia Template Pipeline",
-        "version": "2.9.0",
+        "version": "3.0.0",
     }
 
 
@@ -720,21 +728,53 @@ def list_merchant_jobs():
 
 
 # =============================================================================
-# MERCHANT DEBUG  v3.4
-# KEY FIX: uses _wait_for_item_count() which POLLS the DOM every 100 ms
-# instead of a single page.evaluate() that fires before React mounts.
+# SCREENSHOT ENDPOINT
+# Serve debug screenshots saved by the scraper.
+# GET /merchant-screenshot/<filename>
+# =============================================================================
+
+@app.get("/merchant-screenshot/{filename}", tags=["Merchant Bulk"])
+def serve_merchant_screenshot(filename: str):
+    """
+    Serve a saved debug screenshot PNG.
+    Filenames are returned in the 'debug.screenshot_path' field of /merchant-debug.
+    """
+    # Security: only allow safe filenames (no path traversal)
+    if not _re.match(r'^[\w\-\.]+\.png$', filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    path = SCREENSHOTS_DIR / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"Screenshot not found: {filename}")
+
+    return FileResponse(str(path), media_type="image/png",
+                        headers={"Content-Disposition": f'inline; filename="{filename}"'})
+
+
+# =============================================================================
+# MERCHANT DEBUG  v5.0
+# - No redirect = null rule; alias redirects are followed and scraped
+# - 3-layer extraction: JSON responses → hydrated globals → DOM poll
+# - Screenshot saved on any failure; base64 + URL returned in response
 # =============================================================================
 
 @app.post("/merchant-debug", tags=["Merchant Bulk"])
 def merchant_debug(req: MerchantDebugRequest):
     """
-    DEBUG v4.0 — scrape ONE merchant, no redirect following.
+    DEBUG v5.0 — scrape ONE merchant with full diagnostics.
 
-    Enforces supervisor rule: only scrapes the GIVEN store ID.
-    If AliExpress redirects to a different ID, returns error="Redirected".
+    Alias redirects (AliExpress store ID canonicalisation) are now
+    followed and scraped instead of returning null.
 
-    Returns dom_dump showing all elements containing "item" so you can
-    diagnose selector issues when poll_result=null on a full page.
+    Three extraction layers are tried in order:
+      1. JSON API response bodies
+      2. Hydrated window globals (__NEXT_DATA__, runParams, etc.)
+      3. Broad DOM text poll (60 s)
+
+    On any failure a screenshot is captured. It is returned as:
+      - debug.screenshot_filename  — filename only
+      - debug.screenshot_url       — URL to GET the PNG
+      - debug.screenshot_b64       — base64-encoded PNG (inline preview)
     """
     from camoufox.sync_api import Camoufox
 
@@ -742,16 +782,29 @@ def merchant_debug(req: MerchantDebugRequest):
     if not merchant_id.isdigit():
         raise HTTPException(status_code=400, detail="merchant_id must be numeric")
 
-    url = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
-    ua  = random.choice(USER_AGENTS)
-    t0  = time.time()
+    url      = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
+    ua       = random.choice(USER_AGENTS)
+    t0       = time.time()
+    input_id = merchant_id
 
-    debug = {
-        "url": url, "page_loaded": False, "final_url": None,
-        "html_size_bytes": 0, "blocked": False,
-        "networkidle": None, "poll_result": None,
-        "dom_dump": None, "redirected_to": None,
-        "load_time_sec": None, "nav_error": None,
+    debug: Dict[str, Any] = {
+        "url":              url,
+        "page_loaded":      False,
+        "final_url":        None,
+        "html_size_bytes":  0,
+        "blocked":          False,
+        "networkidle":      None,
+        "poll_result":      None,
+        "response_hits":    [],
+        "global_hits":      [],
+        "dom_dump":         None,
+        "canonical_store_id": None,
+        "alias_warning":    None,
+        "load_time_sec":    None,
+        "nav_error":        None,
+        "screenshot_filename": None,
+        "screenshot_url":      None,
+        "screenshot_b64":      None,
     }
 
     try:
@@ -759,106 +812,169 @@ def merchant_debug(req: MerchantDebugRequest):
             ctx  = _make_context(browser, ua, merchant_id)
             page = ctx.new_page()
 
-            # Navigate — route handler blocks other store IDs
+            # ── Layer 1: capture JSON response bodies ─────────────────────────
+            response_hits: List[Dict] = []
+            landed_id = input_id
+
+            def _on_response(resp):
+                try:
+                    ct    = (resp.headers or {}).get("content-type", "")
+                    url_l = resp.url.lower()
+                    if "json" not in ct.lower() and not any(
+                        x in url_l for x in ["/api/", "/ajax/", "search", "store", "mtop"]
+                    ):
+                        return
+                    data = resp.json()
+                    cand = _best_count_from_json(data, expected_ids={input_id, landed_id})
+                    if cand:
+                        response_hits.append({"source": "response", "url": resp.url, **cand})
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+
+            # ── Navigate ──────────────────────────────────────────────────────
             try:
                 page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
                 debug["page_loaded"] = True
             except Exception as nav_err:
                 es = str(nav_err)
                 debug["nav_error"] = es[:200]
-                if any(x in es for x in ["blockedbyclient", "ERR_BLOCKED",
-                                          "NS_BINDING_ABORTED", "ERR_ABORTED"]):
+                if any(x in es for x in [
+                    "blockedbyclient", "ERR_BLOCKED",
+                    "NS_BINDING_ABORTED", "ERR_ABORTED"
+                ]):
                     debug["page_loaded"] = True
-                    debug["nav_error"]   = "Redirect blocked or aborted — continuing"
+                    debug["nav_error"]   = "Nav aborted/redirected — continuing"
                 elif any(x in es for x in ["ERR_NAME_NOT_RESOLVED", "NS_ERROR_UNKNOWN_HOST"]):
+                    screenshot_path = _save_screenshot(page, merchant_id, "dns_error")
+                    _attach_screenshot(debug, screenshot_path, merchant_id)
                     page.close(); ctx.close()
                     return {"success": False, "merchant_id": merchant_id,
                             "total_items": None, "error": "Page Not Found", "debug": debug}
                 else:
+                    screenshot_path = _save_screenshot(page, merchant_id, "nav_error")
+                    _attach_screenshot(debug, screenshot_path, merchant_id)
                     page.close(); ctx.close()
                     return {"success": False, "merchant_id": merchant_id,
                             "total_items": None, "error": f"Nav: {es[:150]}", "debug": debug}
 
-            # Check if JS navigation moved us to a different store
-            cur_url = page.url
-            m_cur = _re.search(r'/store/(\d+)/', cur_url)
-            if m_cur and m_cur.group(1) != merchant_id:
-                debug["redirected_to"] = m_cur.group(1)
-                # Navigate back to original
-                try:
-                    page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
-                except Exception:
-                    pass
+            # ── Detect alias ──────────────────────────────────────────────────
+            landed_id = _extract_store_id(page.url) or input_id
+            if landed_id != input_id:
+                debug["alias_warning"]    = f"AliExpress canonicalised {input_id} → {landed_id}"
+                debug["canonical_store_id"] = landed_id
+                logger.info(f"[debug] {merchant_id} alias: {debug['alias_warning']}")
 
-            # networkidle
+            # ── networkidle ───────────────────────────────────────────────────
             try:
                 page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
                 debug["networkidle"] = "reached"
             except Exception:
                 debug["networkidle"] = "timeout"
 
-            # Scroll
+            # ── Scroll ────────────────────────────────────────────────────────
             for _ in range(3):
                 page.mouse.wheel(0, 600)
                 page.wait_for_timeout(400)
             page.wait_for_timeout(1_000)
 
-            # Final store ID check
-            final_url = page.url
-            m_final = _re.search(r'/store/(\d+)/', final_url)
-            final_id = m_final.group(1) if m_final else merchant_id
-            if final_id != merchant_id:
-                debug["redirected_to"] = final_id
-                debug["note"] = (
-                    f"Ended on store/{final_id} — supervisor rule: "
-                    f"reporting as Redirected (stale ID)"
-                )
+            # Re-read alias after JS settle
+            landed_id = _extract_store_id(page.url) or landed_id
+            debug["canonical_store_id"] = landed_id
+            if landed_id != input_id and not debug.get("alias_warning"):
+                debug["alias_warning"] = f"AliExpress canonicalised {input_id} → {landed_id}"
 
-            # Poll DOM (60s)
+            # ── Layer 2: hydrated globals ─────────────────────────────────────
+            global_hits: List[Dict] = []
+            try:
+                global_hits = page.evaluate(_JS_GLOBAL_CANDIDATES, [input_id, landed_id])
+            except Exception as e:
+                logger.debug(f"[debug] global scan failed: {e}")
+
+            # ── Layer 3: DOM poll (60s) ───────────────────────────────────────
             polled = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
-            debug["poll_result"] = polled
 
-            # DOM dump — always run
+            # ── DOM dump ─────────────────────────────────────────────────────
             try:
                 debug["dom_dump"] = page.evaluate(_JS_DOM_DUMP)
             except Exception as e:
                 debug["dom_dump"] = {"error": str(e)[:80]}
 
-            debug["final_url"]     = page.url
-            debug["load_time_sec"] = round(time.time() - t0, 2)
+            debug["final_url"]        = page.url
+            debug["load_time_sec"]    = round(time.time() - t0, 2)
+            debug["response_hits"]    = response_hits[:5]
+            debug["global_hits"]      = global_hits[:5]
+            debug["poll_result"]      = polled
+
             html = page.content()
             debug["html_size_bytes"] = len(html)
+            lower = html.lower()
+
+            # ── Check real block/CAPTCHA ──────────────────────────────────────
+            debug["blocked"] = any(sig in lower for sig in REAL_BLOCK_SIGNALS)
+
+            if debug["blocked"]:
+                screenshot_path = _save_screenshot(page, merchant_id, "captcha")
+                _attach_screenshot(debug, screenshot_path, merchant_id)
+                page.close(); ctx.close()
+                return {"success": False, "merchant_id": merchant_id,
+                        "canonical_store_id": landed_id,
+                        "total_items": None, "error": "Blocked/CAPTCHA", "debug": debug}
+
             page.close()
             ctx.close()
 
-        lower = html.lower()
-        debug["blocked"] = any(sig in lower for sig in REAL_BLOCK_SIGNALS)
+            # ── Pick best count across all layers ─────────────────────────────
+            best_count:  Optional[int] = None
+            best_source: Optional[str] = None
 
-        if debug["blocked"]:
-            return {"success": False, "merchant_id": merchant_id,
-                    "total_items": None, "error": "Blocked/CAPTCHA", "debug": debug}
+            if response_hits:
+                best_count  = response_hits[0]["count"]
+                best_source = "response_json"
+            if best_count is None and global_hits:
+                best_count  = global_hits[0]["count"]
+                best_source = "global_state"
+            if best_count is None and polled is not None:
+                best_count  = polled
+                best_source = "dom_poll"
 
-        # Supervisor rule: if redirected, report it
-        if debug.get("redirected_to") and debug["redirected_to"] != merchant_id:
-            return {"success": False, "merchant_id": merchant_id,
-                    "total_items": None,
-                    "error": f"Redirected to {debug['redirected_to']} (stale ID — supervisor rule)",
-                    "debug": debug}
+            if best_count is not None:
+                return {
+                    "success":            True,
+                    "merchant_id":        input_id,
+                    "canonical_store_id": landed_id,
+                    "total_items":        best_count,
+                    "extraction_source":  best_source,
+                    "warning":            debug.get("alias_warning"),
+                    "error":              None,
+                    "debug":              debug,
+                }
 
-        if polled is not None:
-            return {"success": True, "merchant_id": merchant_id,
-                    "total_items": polled, "error": None, "debug": debug}
+            # ── Nothing found — take screenshot ──────────────────────────────
+            # Page already closed above; re-open just for screenshot if needed.
+            # Instead, save HTML head for diagnosis.
+            debug["html_head_500"] = html[:500].replace("\n", " ")
 
-        # Silent bot-detection
-        if debug["html_size_bytes"] < BLOCKED_SIZE_BYTES:
-            return {"success": False, "merchant_id": merchant_id,
-                    "total_items": None,
-                    "error": f"Bot-detection lite page ({debug['html_size_bytes']//1024}KB)",
-                    "debug": debug}
+            # Silent bot-detection
+            if debug["html_size_bytes"] < BLOCKED_SIZE_BYTES:
+                return {
+                    "success":            False,
+                    "merchant_id":        input_id,
+                    "canonical_store_id": landed_id,
+                    "total_items":        None,
+                    "error":              f"Bot-detection lite page ({debug['html_size_bytes']//1024}KB)",
+                    "debug":              debug,
+                }
 
-        debug["html_head_500"] = html[:500].replace("\n", " ")
-        return {"success": False, "merchant_id": merchant_id, "total_items": None,
-                "error": "Selector Missing — check debug.dom_dump", "debug": debug}
+            return {
+                "success":            False,
+                "merchant_id":        input_id,
+                "canonical_store_id": landed_id,
+                "total_items":        None,
+                "error":              "Selector Missing — check debug.dom_dump and debug.global_hits",
+                "debug":              debug,
+            }
 
     except Exception as exc:
         debug["load_time_sec"] = round(time.time() - t0, 2)
@@ -866,6 +982,18 @@ def merchant_debug(req: MerchantDebugRequest):
                 "total_items": None, "error": str(exc)[:300], "debug": debug}
 
 
+def _attach_screenshot(debug: dict, screenshot_path: Optional[str], merchant_id: str) -> None:
+    """
+    Attach screenshot info to the debug dict.
+    Populates screenshot_filename, screenshot_url, and screenshot_b64.
+    """
+    if not screenshot_path:
+        return
+    from pathlib import Path as _Path
+    filename = _Path(screenshot_path).name
+    debug["screenshot_filename"] = filename
+    debug["screenshot_url"]      = f"/merchant-screenshot/{filename}"
+    debug["screenshot_b64"]      = _screenshot_to_b64(screenshot_path)
 
 
 # =============================================================================
@@ -989,6 +1117,6 @@ def view_processing_logs(limit: int = 500):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v2.9")
+    logger.info("🚀 Octopia Template Pipeline v3.0")
     logger.info(f"📡 Server: http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
