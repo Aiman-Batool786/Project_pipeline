@@ -426,6 +426,36 @@ _JS_POLL_FOR_COUNT = r"""() => {
 }"""
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DOM DUMP  (diagnostic — used by /merchant-debug endpoint in main.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_JS_DOM_DUMP = """() => {
+    const results = [];
+    const all = document.querySelectorAll('span, div, p, h1, h2, h3, li');
+    for (const el of all) {
+        const t = el.textContent.trim();
+        if (t.length < 80 && /item/i.test(t) && t.length > 0) {
+            results.push({
+                tag:    el.tagName.toLowerCase(),
+                text:   t,
+                anchor: el.getAttribute('data-spm-anchor-id') || '',
+                cls:    el.className ? String(el.className).slice(0, 60) : ''
+            });
+            if (results.length >= 15) break;
+        }
+    }
+    const scriptMatches = [];
+    for (const s of document.querySelectorAll('script')) {
+        const m = (s.textContent || '').match(
+            /"(?:totalProducts|itemCount|totalItems|storeItemCount|productCount|goodsCount|totalNum)"\s*:\s*(\d+)/g
+        );
+        if (m) scriptMatches.push(...m.slice(0, 3));
+    }
+    return { dom_elements: results, script_matches: scriptMatches.slice(0, 5) };
+}"""
+
+
 def _wait_for_item_count(page, poll_timeout_ms: int = POLL_TIMEOUT_MS) -> Optional[int]:
     try:
         result = page.wait_for_function(
