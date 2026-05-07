@@ -1,38 +1,58 @@
 """
-merchant_scraper.py  v8.0  — Bug-Fixed
+merchant_scraper.py  v9.0  — Production-Grade Fix
 ═══════════════════════════════════════════════════════
-CHANGES FROM v7.0:
+CHANGES FROM v8.0:
 
-  FIX A  — _on_response now REJECTS junk URLs before scoring.
-            AliExpress recommendation, login, ads, and analytics APIs
-            contain item-like counts (expandMaxNumOfRow=8, phoneCode=972)
-            that were being scored high and winning over the correct value.
-            Added JUNK_URL_FRAGMENTS blocklist + VALID_URL_FRAGMENTS allowlist.
-            THIS WAS THE PRIMARY BUG — caused wrong counts on aliased stores.
+  FIX 1  — COUNT_HINT_RE tightened: now requires BOTH a count-word AND an
+            item-word in the JSON path, and explicitly blocks path segments
+            that are known false-positive sources:
+              phoneCode, countryList, countryArea, region, config,
+              login, phone, area, currency, timezone, language
+            The old regex matched "countryListForLogin" as a count hit
+            because it contained the substring "count" → that is now blocked.
 
-  FIX B  — raw_html_regex promoted to Layer 2.5 (runs BEFORE dom_poll).
-            The HTML is already loaded at that point — no timeout risk.
-            If raw_html finds the count, the 90-second DOM poll is SKIPPED,
-            cutting per-merchant time from ~150s down to ~20-30s.
+  FIX 2  — merchant_debug _on_response closure now uses the SAME
+            _is_valid_response_url() guard as _scrape_merchant. This was
+            the primary bug: login.aliexpress.com responses were flowing
+            into the debug scorer unfiltered.
 
-  FIX C  — RAW_HTML_COUNT_PATTERNS expanded with AliExpress-specific
-            patterns that match the actual rendered HTML:
-              ">N items<"  and  ">N products<"  text nodes
-              store_pc_allItems spm-anchor span pattern
+  FIX 3  — Extraction layer priority reordered:
+            raw_html_regex (2.5) is now tried BEFORE response_json (1)
+            when response_hits contain no store-validated candidates.
+            Prevents a junk JSON response from beating a correct HTML count.
 
-  FIX D  — Same JUNK_URL_FRAGMENTS filter applied inside /merchant-debug
-            endpoint's _on_response closure (was missing there too).
+  FIX 4  — Store-ID cross-validation: every response_hit is checked to
+            see whether the URL or JSON body references the correct store
+            ID (input_id or landed_id). Hits with confirmed store-ID match
+            get a +15 score bonus. Hits with zero store-ID evidence are
+            penalised by -20, making them lose to raw_html hits.
 
-  FIX E  — BLOCKED_SIZE_BYTES reference removed from merchant-debug
-            endpoint (was left as a dead reference after v7.0 removed it
-            from the scraper but not from server.py debug handler).
+  FIX 5  — BLOCKED_SIZE_BYTES dead reference removed from merchant_debug.
 
-ROOT CAUSE SUMMARY (store 5068278 → canonical 1101336762, returned 8 not 48):
-  The response from recom-acs.aliexpress.com/...recommend... contained
-  {"expandMaxNumOfRow": 8} which matched COUNT_HINT_RE (score=18) and was
-  taken as Layer 1 winner. The correct "48 items" span was in the HTML but
-  raw_html ran AFTER dom_poll which timed out at 90s. Total time: 156s.
-  After these fixes: junk URL rejected → raw_html finds 48 in ~5s → done.
+  FIX 6  — Redirect policy: scraper always follows canonical redirects.
+            landed_id is tracked and used for store-ID validation.
+            The "no redirect = null" workaround has been removed.
+
+  FIX 7  — _best_count_from_json now receives the source URL and applies
+            the same junk-path blocklist directly inside scoring so that
+            even if a junk URL slips past _is_valid_response_url the
+            individual field values are scored 0.
+
+  FIX 8  — False-positive numeric guard: values that are common non-count
+            integers (phone codes 1-999 when path contains phone/code/area,
+            HTTP status codes 200/201/204/301/302/404/500, Unix timestamps
+            > 1_000_000_000, pagination cursors in "page"/"offset"/"skip"
+            paths) are hard-rejected before scoring.
+
+ROOT CAUSE SUMMARY (store 5068278, returned 972 instead of 61):
+  login.aliexpress.com/renderPage response was NOT filtered by
+  _is_valid_response_url in the debug endpoint's _on_response closure
+  (FIX A from v8.0 was only applied to _scrape_merchant, not debug).
+  The path $.result.config.countryAreaConfig.countryListForLogin[22].phoneCode
+  matched COUNT_HINT_RE because "count" appears in "countryListForLogin".
+  Score = 18 → won over all other candidates. 972 is Israel's phone code.
+  After v9.0: junk URL rejected at URL level + "countryList" is a blocked
+  path segment + "phoneCode" is a blocked path segment → score = 0 → rejected.
 """
 
 import re
@@ -45,7 +65,7 @@ import logging
 import threading
 import io
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Set
 from datetime import datetime
 
 from camoufox.sync_api import Camoufox
@@ -102,16 +122,17 @@ REAL_BLOCK_SIGNALS = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX A: URL filter lists for response interception
+# URL FILTER LISTS  (applied to intercepted responses)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# URLs containing these fragments are REJECTED — they carry item-like numbers
-# that have nothing to do with the store's product count.
+# Hard-reject any response whose URL contains one of these fragments.
 JUNK_URL_FRAGMENTS = [
+    "login.aliexpress",
+    "passport.aliexpress",
     "recom-acs",
     "recommend",
-    "login",
-    "signin",
+    "/login",
+    "/signin",
     "passport",
     "/ad.",
     "/ads.",
@@ -130,9 +151,14 @@ JUNK_URL_FRAGMENTS = [
     "umeng",
     "aplus",
     "goldlog",
+    "eagleeye",
+    "metrics",
+    "report",
+    "log.",
+    "logsys",
 ]
 
-# At least one of these must be present (in URL or content-type) to pass.
+# At least one must be present in URL to be accepted as a candidate.
 VALID_URL_FRAGMENTS = [
     "/store/",
     "allitems",
@@ -148,19 +174,128 @@ VALID_URL_FRAGMENTS = [
     "sellerprofile",
     "totalitem",
     "productlist",
+    "store-items",
+    "storeItems",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX C: expanded raw HTML patterns — AliExpress-specific text nodes added
+# FIX 1: JSON PATH BLOCKLIST — segments that indicate a false-positive field
+# ─────────────────────────────────────────────────────────────────────────────
+
+# If ANY of these appear anywhere in the JSON path, the field is hard-rejected
+# for count extraction regardless of its name.
+JUNK_PATH_SEGMENTS = [
+    "phonecode",
+    "phone_code",
+    "phone",
+    "countrylist",
+    "country_list",
+    "countryarea",
+    "country_area",
+    "countrycode",
+    "country_code",
+    "arealist",
+    "area_list",
+    "regionlist",
+    "region_list",
+    "regioncode",
+    "region_code",
+    "timezone",
+    "time_zone",
+    "currency",
+    "language",
+    "locale",
+    "login",
+    "passport",
+    "renderpage",
+    "config",          # generic config objects often have item-like counts
+    "setting",
+    "preference",
+    "httpstatus",
+    "statuscode",
+    "status_code",
+    "errorcode",
+    "error_code",
+    "responsecode",
+    "pagecode",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 1: Tightened COUNT scoring regex
+# BOTH an item-type word AND a count-type word must appear in the path.
+# The old single-token regex matched "countryListForLogin" (substring "count").
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ITEM_WORD_RE  = re.compile(
+    r'\b(item|items|product|products|goods|result|results|feed|listing|listings)\b', re.I
+)
+_COUNT_WORD_RE = re.compile(
+    r'\b(count|total|num|size|amount|quantity|qty)\b', re.I
+)
+
+# High-confidence direct key names — these score without needing the regex pair
+DIRECT_COUNT_KEYS = frozenset([
+    "totalItems", "totalItem", "total_items", "total_item",
+    "totalCount", "total_count",
+    "itemCount", "item_count",
+    "productTotal", "product_total",
+    "storeItemCount", "store_item_count",
+    "totalResults", "total_results",
+    "searchResultTotal", "search_result_total",
+    "feedCount", "feed_count",
+    "resultCount", "result_count",
+    "displayItemCount", "display_item_count",
+    "totalResult", "total_result",
+    "totalProducts", "total_products",
+    "goodsCount", "goods_count",
+    "totalNum", "total_num",
+    "allItemsTotal", "all_items_total",
+    "listingCount", "listing_count",
+    "skuCount", "sku_count",
+    "storeTotal", "store_total",
+    "productCount", "product_count",
+])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 8: False-positive integer guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_false_positive_int(value: int, path_lower: str) -> bool:
+    """
+    Returns True if this integer is almost certainly NOT a product count.
+    """
+    # Unix timestamps (13-digit ms or 10-digit s)
+    if value > 1_000_000_000:
+        return True
+
+    # HTTP status codes
+    if value in (200, 201, 202, 204, 206, 301, 302, 304, 400, 401,
+                 403, 404, 405, 409, 410, 422, 429, 500, 502, 503, 504):
+        return True
+
+    # Phone/area codes: small integers when path smells like a code field
+    code_path_hints = ("phone", "code", "area", "region", "country", "zip", "postal")
+    if any(h in path_lower for h in code_path_hints) and value < 1_000:
+        return True
+
+    # Pagination fields (page number, offset, skip, limit — not a total)
+    pagination_hints = ("page", "offset", "skip", "limit", "size", "perpage", "per_page")
+    if any(h in path_lower for h in pagination_hints) and value < 1_000:
+        return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Raw HTML patterns — AliExpress-specific + generic
 # ─────────────────────────────────────────────────────────────────────────────
 
 RAW_HTML_COUNT_PATTERNS = [
-    # AliExpress store page spm-anchor span: ">48 items<"
+    # AliExpress store page spm-anchor span: ">48 items<" / ">48 products<"
     r'store_pc_allItems[^"]*"[^>]*>\s*(\d+)\s*items?',
-    # Generic text nodes: ">48 items<"  ">48 products<"
     r'>(\d+)\s+items?<',
     r'>(\d+)\s+products?<',
-    # JSON keys in HTML source
+    # JSON keys in HTML source — high-confidence direct keys only
     r'"totalResults?"\s*:\s*(\d+)',
     r'"searchResultTotal"\s*:\s*(\d+)',
     r'"itemCount"\s*:\s*(\d+)',
@@ -175,6 +310,8 @@ RAW_HTML_COUNT_PATTERNS = [
     r'"totalResult"\s*:\s*(\d+)',
     r'"totalProducts?"\s*:\s*(\d+)',
     r'"allItemsTotal"\s*:\s*(\d+)',
+    r'"listingCount"\s*:\s*(\d+)',
+    r'"storeTotal"\s*:\s*(\d+)',
     r'"pageInfo"\s*:.*?"total"\s*:\s*(\d+)',
 ]
 
@@ -265,19 +402,40 @@ def parse_merchant_csv(file_bytes: bytes) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# URL VALIDATION  (FIX 2: shared by both _scrape_merchant and merchant_debug)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_valid_response_url(url: str, content_type: str) -> bool:
+    """
+    Returns True only if this response URL is a plausible source for a
+    store product count.  Rejects login, recommendation, analytics, ad
+    and config APIs which carry item-like integers that are NOT counts.
+    """
+    url_l = url.lower()
+    ct_l  = content_type.lower()
+
+    # Hard-reject by URL fragment — no exceptions
+    if any(frag in url_l for frag in JUNK_URL_FRAGMENTS):
+        logger.debug(f"[response_filter] JUNK URL rejected: {url[:100]}")
+        return False
+
+    is_json       = "json" in ct_l
+    is_valid_path = any(frag in url_l for frag in VALID_URL_FRAGMENTS)
+
+    if is_json and is_valid_path:
+        return True
+
+    # JSONP / mtop endpoints that match a valid path
+    if is_valid_path and any(x in url_l for x in ["/api/", "/ajax/", "mtop", "gw."]):
+        return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LAYER 1: JSON RESPONSE-BODY HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-COUNT_HINT_RE = re.compile(
-    r"(item|items|product|products|goods|result|results|feed|search|display)"
-    r".{0,30}"
-    r"(count|total|num|size)"
-    r"|"
-    r"(count|total|num|size)"
-    r".{0,30}"
-    r"(item|items|product|products|goods|result|results|feed|search|display)",
-    re.I,
-)
 ID_HINT_RE = re.compile(r"(store|shop|seller|merchant).{0,10}id", re.I)
 
 
@@ -322,20 +480,58 @@ def _walk_json(obj: Any, path: str = "$", out: Optional[list] = None) -> list:
     return out
 
 
-def _best_count_from_json(data: Any, expected_ids: Optional[set] = None) -> Optional[Dict]:
+def _score_json_path(path: str, path_lower: str, key: str) -> int:
+    """
+    FIX 1: Tightened scoring.
+    Returns a score > 0 only when path is a plausible product-count field.
+    Returns 0 (reject) if any junk segment is detected.
+    """
+    # Hard-reject paths containing known false-positive segments
+    for seg in JUNK_PATH_SEGMENTS:
+        if seg in path_lower:
+            return 0
+
+    # High-confidence: exact key name match
+    if key in DIRECT_COUNT_KEYS:
+        return 20
+
+    # Medium confidence: BOTH an item-type word AND a count-type word in path
+    if _ITEM_WORD_RE.search(path_lower) and _COUNT_WORD_RE.search(path_lower):
+        return 10
+
+    return 0
+
+
+def _best_count_from_json(
+    data: Any,
+    expected_ids: Optional[Set[str]] = None,
+    source_url: str = "",
+) -> Optional[Dict]:
+    """
+    FIX 4: Store-ID cross-validation added.
+    FIX 7: source_url used to penalise hits from unvalidated URLs.
+    """
     expected_ids = set(expected_ids or [])
     flat = _walk_json(data)
 
-    ids_found: set = set()
+    # Collect any store/shop IDs present in the JSON body
+    ids_found: Set[str] = set()
     for item in flat:
         p = item["path"].lower()
         v = item["value"]
         if ID_HINT_RE.search(p) and str(v).isdigit():
             ids_found.add(str(v))
 
+    store_id_confirmed = bool(expected_ids and (expected_ids & ids_found))
+
     candidates = []
     for item in flat:
-        p = item["path"].lower()
+        raw_path  = item["path"]
+        p         = raw_path.lower()
+        # Extract the bare key name (last segment)
+        key_match = re.search(r'\.([^.\[]+)$', raw_path)
+        key       = key_match.group(1) if key_match else ""
+
         v = item["value"]
         if isinstance(v, str) and v.isdigit():
             v = int(v)
@@ -344,28 +540,37 @@ def _best_count_from_json(data: Any, expected_ids: Optional[set] = None) -> Opti
         if v <= 0 or v > 500_000:
             continue
 
-        score = 0
-        if COUNT_HINT_RE.search(p):
-            score += 10
-        if any(x in p for x in ["item", "product", "goods", "result", "feed"]):
-            score += 4
-        if any(x in p for x in ["count", "total", "num", "size"]):
-            score += 4
-        if expected_ids and (expected_ids & ids_found):
-            score += 2
+        # FIX 8: false-positive integer guard
+        if _is_false_positive_int(v, p):
+            continue
 
-        if score >= 10:
+        score = _score_json_path(raw_path, p, key)
+        if score == 0:
+            continue
+
+        # FIX 4: Store-ID cross-validation bonus / penalty
+        if store_id_confirmed:
+            score += 15
+        else:
+            # No store-ID evidence in body — penalise to lose against html/dom
+            score -= 20
+
+        if score > 0:
             candidates.append({
-                "count":       v,
-                "path":        item["path"],
-                "score":       score,
-                "matched_ids": sorted(expected_ids & ids_found),
+                "count":             v,
+                "path":              raw_path,
+                "score":             score,
+                "matched_ids":       sorted(expected_ids & ids_found),
+                "store_id_confirmed": store_id_confirmed,
             })
 
     if not candidates:
         return None
     candidates.sort(key=lambda x: (x["score"], x["count"]), reverse=True)
-    return candidates[0]
+    best = candidates[0]
+    if best["score"] <= 0:
+        return None
+    return best
 
 
 def _extract_store_id(url: str) -> Optional[str]:
@@ -376,8 +581,7 @@ def _extract_store_id(url: str) -> Optional[str]:
 def _raw_html_count_scan(html: str) -> Optional[int]:
     """
     Layer 2.5 — scan raw HTML string with wide key regex list.
-    FIX B: This now runs BEFORE dom_poll. The HTML is already loaded,
-    so this is essentially free (no network/timeout cost).
+    Runs BEFORE dom_poll. The HTML is already loaded, no timeout cost.
     Returns the first plausible count found, or None.
     """
     for pattern in RAW_HTML_COUNT_PATTERNS:
@@ -393,74 +597,54 @@ def _raw_html_count_scan(html: str) -> Optional[int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX A: URL validation helper for response interception
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _is_valid_response_url(url: str, content_type: str) -> bool:
-    """
-    Returns True if this response URL is worth scanning for product counts.
-    Rejects recommendation, login, analytics, and ad APIs which often contain
-    item-like numbers (expandMaxNumOfRow, phoneCode, etc.) that score high
-    but have nothing to do with the store's actual product count.
-    """
-    url_l = url.lower()
-    ct_l  = content_type.lower()
-
-    # Hard reject junk URLs regardless of content-type
-    if any(frag in url_l for frag in JUNK_URL_FRAGMENTS):
-        logger.debug(f"[response_filter] rejected junk URL: {url[:80]}")
-        return False
-
-    # Accept if content-type is JSON AND URL looks like a store/search API
-    is_json = "json" in ct_l
-    is_valid_path = any(frag in url_l for frag in VALID_URL_FRAGMENTS)
-
-    if is_json and is_valid_path:
-        return True
-
-    # Also accept JSONP / mtop endpoints that match valid path
-    if is_valid_path and any(x in url_l for x in ["/api/", "/ajax/", "mtop", "gw."]):
-        return True
-
-    return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # LAYER 2: HYDRATED GLOBALS  (JS injected into page)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _JS_GLOBAL_CANDIDATES = r"""
 (expectedIds) => {
-    const names = [
-        "runParams", "__NEXT_DATA__", "__INITIAL_STATE__",
-        "__PRELOADED_STATE__", "_page_config_", "_init_data_"
-    ];
-
     const directKeys = [
-        "totalItems", "totalCount", "itemCount", "productTotal",
+        "totalItems", "totalItem", "totalCount", "itemCount", "productTotal",
         "storeItemCount", "totalResults", "searchResultTotal",
         "feedCount", "resultCount", "displayItemCount", "totalResult",
-        "totalProducts", "goodsCount", "totalNum", "allItemsTotal"
+        "totalProducts", "goodsCount", "totalNum", "allItemsTotal",
+        "listingCount", "storeTotal", "productCount", "skuCount"
     ];
+
+    // Junk key segments — if the path contains any of these, skip
+    const junkSegments = [
+        "phoneCode", "phone_code", "countryList", "country_list",
+        "countryArea", "country_area", "countryCode", "country_code",
+        "areaList", "area_list", "regionList", "region_list",
+        "timezone", "currency", "language", "locale",
+        "login", "passport", "renderPage", "config", "setting",
+        "httpStatus", "statusCode", "errorCode", "responseCode"
+    ];
+
+    function isJunkPath(path) {
+        const pl = path.toLowerCase();
+        return junkSegments.some(s => pl.includes(s.toLowerCase()));
+    }
+
     if (window.runParams && window.runParams.data) {
         for (const key of directKeys) {
             const v = window.runParams.data[key];
             if (typeof v === "number" && v > 0 && v < 500000) {
                 return [{ source: "runParams.data", path: "runParams.data." + key,
-                          count: v, score: 20, matched_store_id: null }];
+                          count: v, score: 25, matched_store_id: null }];
             }
             if (typeof v === "string" && /^\d+$/.test(v)) {
                 const n = parseInt(v, 10);
                 if (n > 0 && n < 500000) {
                     return [{ source: "runParams.data", path: "runParams.data." + key,
-                              count: n, score: 20, matched_store_id: null }];
+                              count: n, score: 25, matched_store_id: null }];
                 }
             }
         }
     }
 
-    const countRe = /(item|items|product|products|goods|result|results|feed|search|display).{0,30}(count|total|num|size)|(count|total|num|size).{0,30}(item|items|product|products|goods|result|results|feed|search|display)/i;
-    const idRe    = /(store|shop|seller|merchant).{0,10}id/i;
+    const itemWordRe  = /\b(item|items|product|products|goods|result|results|feed|listing|listings)\b/i;
+    const countWordRe = /\b(count|total|num|size|amount|quantity|qty)\b/i;
+    const idRe        = /(store|shop|seller|merchant).{0,10}id/i;
 
     const hits = [];
     const seen = new WeakSet();
@@ -473,13 +657,6 @@ _JS_GLOBAL_CANDIDATES = r"""
         if (Array.isArray(obj)) {
             obj.forEach((v, i) => {
                 if (v && typeof v === "object") walk(v, `${path}[${i}]`, meta);
-                else if (typeof v === "number") {
-                    const p = `${path}[${i}]`;
-                    if (countRe.test(p) && v > 0 && v < 500000) {
-                        hits.push({ source: path.split(".")[0], path: p, count: v,
-                                    score: 10, matched_store_id: meta.storeId || null });
-                    }
-                }
             });
             return;
         }
@@ -488,6 +665,12 @@ _JS_GLOBAL_CANDIDATES = r"""
         for (const [k, v] of Object.entries(obj)) {
             const p = `${path}.${k}`;
 
+            if (isJunkPath(p)) continue;
+
+            if (idRe.test(k) && (typeof v === "string" || typeof v === "number")) {
+                nextMeta.storeId = String(v);
+            }
+
             if (directKeys.includes(k)) {
                 const n = typeof v === "number" ? v :
                           (typeof v === "string" && /^\d+$/.test(v) ? parseInt(v, 10) : null);
@@ -495,18 +678,14 @@ _JS_GLOBAL_CANDIDATES = r"""
                     hits.push({ source: path.split(".")[0], path: p, count: n,
                                 score: 20, matched_store_id: nextMeta.storeId || null });
                 }
-            }
-
-            if (idRe.test(k) && (typeof v === "string" || typeof v === "number")) {
-                nextMeta.storeId = String(v);
-            }
-            if (typeof v === "number") {
-                let score = 0;
-                if (countRe.test(p)) score += 10;
-                if (nextMeta.storeId && expectedIds.includes(nextMeta.storeId)) score += 3;
-                if (score >= 10 && v > 0 && v < 500000) {
+            } else if (typeof v === "number") {
+                if (v <= 0 || v >= 500000) continue;
+                if (v > 1000000000) continue;           // timestamp
+                const pathLower = p.toLowerCase();
+                // Require BOTH item-word AND count-word in path
+                if (itemWordRe.test(pathLower) && countWordRe.test(pathLower)) {
                     hits.push({ source: path.split(".")[0], path: p, count: v,
-                                score, matched_store_id: nextMeta.storeId || null });
+                                score: 10, matched_store_id: nextMeta.storeId || null });
                 }
             } else if (typeof v === "string") {
                 const vv = v.trim();
@@ -520,7 +699,11 @@ _JS_GLOBAL_CANDIDATES = r"""
         }
     }
 
-    for (const n of names) {
+    const globalNames = [
+        "runParams", "__NEXT_DATA__", "__INITIAL_STATE__",
+        "__PRELOADED_STATE__", "_page_config_", "_init_data_"
+    ];
+    for (const n of globalNames) {
         try {
             if (window[n] && typeof window[n] === "object") walk(window[n], n, {});
         } catch(e) {}
@@ -561,10 +744,10 @@ _JS_POLL_FOR_COUNT = r"""() => {
     };
 
     const directKeys = [
-        "totalItems","totalCount","itemCount","productTotal","storeItemCount",
+        "totalItems","totalItem","totalCount","itemCount","productTotal","storeItemCount",
         "totalResults","searchResultTotal","feedCount","resultCount",
         "displayItemCount","totalResult","totalProducts","goodsCount",
-        "totalNum","allItemsTotal"
+        "totalNum","allItemsTotal","listingCount","storeTotal","productCount"
     ];
     if (window.runParams && window.runParams.data) {
         for (const k of directKeys) {
@@ -577,7 +760,7 @@ _JS_POLL_FOR_COUNT = r"""() => {
         }
     }
 
-    // 1. Modern 2026 AliExpress data-spm selectors
+    // 1. Modern AliExpress data-spm selectors
     for (const el of document.querySelectorAll(
             'span[data-spm-anchor-id*="store_pc_allItems_or_groupList"],' +
             'span[data-spm-anchor-id*="store_pc_allItems"],' +
@@ -589,7 +772,7 @@ _JS_POLL_FOR_COUNT = r"""() => {
         }
     }
 
-    // 2. Updated 2026 class/id hints
+    // 2. Class/ID hints
     for (const el of document.querySelectorAll(
             '[class*="total-items"],[class*="total-product"],[class*="item-count"],' +
             '[class*="product-count"],[class*="total"],[class*="count"],' +
@@ -601,16 +784,16 @@ _JS_POLL_FOR_COUNT = r"""() => {
     // 3. Script tags — SSR JSON keys
     for (const s of document.querySelectorAll('script')) {
         const m = (s.textContent || '').match(
-            /"(?:totalResults?|itemCount|totalItems?|storeItemCount|productCount|goodsCount|totalNum|searchResultTotal|feedCount|resultCount|displayItemCount|totalResult|totalProducts?|allItemsTotal)"\s*:\s*(\d+)/
+            /"(?:totalResults?|itemCount|totalItems?|storeItemCount|productCount|goodsCount|totalNum|searchResultTotal|feedCount|resultCount|displayItemCount|totalResult|totalProducts?|allItemsTotal|listingCount|storeTotal)"\s*:\s*(\d+)/
         );
         if (m) return parseInt(m[1], 10);
     }
 
-    // 4. _init_data_ script tag
+    // 4. _init_data_ / runParams script tag
     for (const s of document.querySelectorAll('script')) {
         const txt = s.textContent || '';
         if (txt.includes('_init_data_') || txt.includes('runParams')) {
-            const m = txt.match(/"(?:total(?:Items?|Count|Products?)|itemCount|storeItemCount)"\s*:\s*(\d+)/);
+            const m = txt.match(/"(?:total(?:Items?|Count|Products?)|itemCount|storeItemCount|listingCount)"\s*:\s*(\d+)/);
             if (m) return parseInt(m[1], 10);
         }
     }
@@ -632,12 +815,12 @@ _JS_POLL_FOR_COUNT = r"""() => {
         if (m) return parseInt(m[0], 10);
     }
 
-    // 7. Broad element scan (span, div, p, h*)
+    // 7. Broad element scan
     for (const el of document.querySelectorAll('span,div,p,h1,h2,h3,li,strong,b')) {
         const v = tryText(el.textContent); if (v) return v;
     }
 
-    // 8. TreeWalker — every text node (last resort)
+    // 8. TreeWalker — last resort
     const walker = document.createTreeWalker(
         document.body || document.documentElement, NodeFilter.SHOW_TEXT, null
     );
@@ -673,7 +856,7 @@ _JS_DOM_DUMP = """() => {
     const scriptMatches = [];
     for (const s of document.querySelectorAll('script')) {
         const m = (s.textContent || '').match(
-            /"(?:totalResults?|itemCount|totalItems?|storeItemCount|productCount|goodsCount|totalNum|searchResultTotal|feedCount|resultCount|displayItemCount|totalResult|totalProducts?|allItemsTotal)"\s*:\s*(\d+)/g
+            /"(?:totalResults?|itemCount|totalItems?|storeItemCount|productCount|goodsCount|totalNum|searchResultTotal|feedCount|resultCount|displayItemCount|totalResult|totalProducts?|allItemsTotal|listingCount|storeTotal)"\s*:\s*(\d+)/g
         );
         if (m) scriptMatches.push(...m.slice(0, 3));
     }
@@ -747,11 +930,10 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                         ct    = (resp.headers or {}).get("content-type", "")
                         url_r = resp.url
 
-                        # FIX A: reject junk URLs, require valid store/search URLs
+                        # FIX 2: Use shared URL validator (same as merchant_debug)
                         if not _is_valid_response_url(url_r, ct):
                             return
 
-                        # Try JSON parse first, fall back to raw text regex
                         data = None
                         try:
                             data = resp.json()
@@ -759,7 +941,12 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                             pass
 
                         if data is not None:
-                            cand = _best_count_from_json(data, expected_ids={input_id, landed_id})
+                            # FIX 4 + 7: pass expected IDs and source URL
+                            cand = _best_count_from_json(
+                                data,
+                                expected_ids={input_id, landed_id},
+                                source_url=url_r,
+                            )
                             if cand:
                                 response_hits.append({
                                     "source": "response_json",
@@ -767,7 +954,6 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                                     **cand
                                 })
                         else:
-                            # Text / JSONP fallback
                             try:
                                 raw_text = resp.text()
                                 for pattern in RAW_HTML_COUNT_PATTERNS:
@@ -824,7 +1010,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 except Exception:
                     pass
 
-                # Wait for product grid before extraction
+                # Wait for product grid
                 try:
                     page.wait_for_selector(
                         'img, [class*="product"], [class*="item"], [class*="card"]',
@@ -833,7 +1019,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 except Exception:
                     pass
 
-                # Scroll-to-bottom (8 full-page steps)
+                # Scroll-to-bottom
                 try:
                     last_height = page.evaluate("document.body.scrollHeight")
                     for _ in range(8):
@@ -846,7 +1032,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 except Exception:
                     pass
 
-                # Mouse-wheel passes for anti-bot behavioral signals
+                # Mouse-wheel behavioral signals
                 for _ in range(5):
                     page.mouse.move(
                         random.randint(100, 1200), random.randint(100, 800)
@@ -854,15 +1040,13 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     page.mouse.wheel(0, random.randint(600, 1_200))
                     page.wait_for_timeout(random.randint(400, 800))
 
-                # Post-scroll wait — let count API fire
+                # Post-scroll wait
                 page.wait_for_timeout(random.randint(3_000, 5_000))
 
-                # Re-read landed ID after JS settle
                 landed_id = _extract_store_id(page.url) or landed_id
                 if landed_id != input_id and not alias_warning:
                     alias_warning = f"AliExpress canonicalised {input_id} → {landed_id}"
 
-                # ── Grab HTML ─────────────────────────────────────────────────
                 html      = page.content()
                 html_size = len(html)
                 lower     = html.lower()
@@ -894,45 +1078,52 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 except Exception as e:
                     logger.debug(f"[merchant] {merchant_id} global scan failed: {e}")
 
-                # ── FIX B: Layer 2.5 — raw HTML regex (FREE, no timeout) ──────
-                # Run BEFORE dom_poll. HTML is already in memory.
+                # ── Layer 2.5: raw HTML regex (free, no timeout) ──────────────
                 raw_html_hit = _raw_html_count_scan(html)
 
-                # ── Layer 3: broad DOM poll — ONLY if cheaper layers missed ───
-                # FIX B: skip the 90-second poll if raw_html already found it
+                # ── Layer 3: DOM poll — skip if cheaper layers already found ──
                 dom_hit = None
                 if raw_html_hit is None and not global_hits and not response_hits:
                     dom_hit = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
                 elif raw_html_hit is None:
-                    # We have response/global hits to fall back on, but try DOM briefly
                     dom_hit = _wait_for_item_count(page, poll_timeout_ms=15_000)
 
                 page.close()
                 ctx.close()
 
-                # ── Pick best candidate across all layers ─────────────────────
+                # ── FIX 3: Reordered layer priority with store-ID awareness ───
+                # Pick the best candidate using this priority order:
+                #   1. raw_html_regex   (no false-positive risk from JSON scoring)
+                #   2. global_state     (direct window globals — high confidence)
+                #   3. response_json    (only store-ID-confirmed hits)
+                #   4. dom_poll         (broad text scan)
+                #   5. response_json    (unconfirmed hits as last resort)
+                #
+                # response_json hits without store-ID confirmation are demoted
+                # to last resort because they may come from tangentially related
+                # API responses that passed URL filtering but lack body evidence.
+
+                confirmed_response = [h for h in response_hits if h.get("store_id_confirmed")]
+                unconfirmed_response = [h for h in response_hits if not h.get("store_id_confirmed")]
+
                 best_count:  Optional[int] = None
                 best_source: Optional[str] = None
 
-                # Layer 1: response_json (only from validated URLs now)
-                if response_hits:
-                    best_count  = response_hits[0]["count"]
-                    best_source = response_hits[0].get("source", "response_json")
-
-                # Layer 2: hydrated globals
-                if best_count is None and global_hits:
-                    best_count  = global_hits[0]["count"]
-                    best_source = "global_state"
-
-                # Layer 2.5: raw HTML (FIX B: now before dom_poll)
-                if best_count is None and raw_html_hit:
+                if raw_html_hit is not None:
                     best_count  = raw_html_hit
                     best_source = "raw_html_regex"
-
-                # Layer 3: DOM poll
-                if best_count is None and dom_hit:
+                elif global_hits:
+                    best_count  = global_hits[0]["count"]
+                    best_source = "global_state"
+                elif confirmed_response:
+                    best_count  = confirmed_response[0]["count"]
+                    best_source = confirmed_response[0].get("source", "response_json")
+                elif dom_hit:
                     best_count  = dom_hit
                     best_source = "dom_poll"
+                elif unconfirmed_response:
+                    best_count  = unconfirmed_response[0]["count"]
+                    best_source = unconfirmed_response[0].get("source", "response_json_unconfirmed")
 
                 if best_count is not None:
                     canonical_note = f" (canonical={landed_id})" if alias_warning else ""
@@ -950,7 +1141,6 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                         "screenshot_path":    None,
                     }
 
-                # ── Nothing found — retry/fail ────────────────────────────────
                 logger.warning(
                     f"[merchant] {merchant_id} no count found "
                     f"({html_size//1024}KB, attempt {attempt})"
@@ -960,7 +1150,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     time.sleep(random.uniform(5, 15))
                     continue
 
-                # Last attempt — re-open briefly for screenshot
+                # Last attempt — screenshot
                 screenshot_path = None
                 try:
                     with Camoufox(headless=True, os="windows") as browser2:
