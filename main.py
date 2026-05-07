@@ -48,7 +48,7 @@ from merchant_scraper import (
     NETWORKIDLE_TIMEOUT,
     POLL_TIMEOUT_MS,
     REAL_BLOCK_SIGNALS,
-    BLOCKED_SIZE_BYTES,
+    # BLOCKED_SIZE_BYTES,
     SCREENSHOTS_DIR,
 )
 
