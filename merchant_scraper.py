@@ -1,42 +1,38 @@
 """
-merchant_scraper.py  v7.0  — Synthesized & Hardened
+merchant_scraper.py  v8.0  — Bug-Fixed
 ═══════════════════════════════════════════════════════
-CHANGES FROM v6.0 (all fixes synthesized from multi-AI analysis):
+CHANGES FROM v7.0:
 
-  FIX 1  — _walk_json now recursively decodes embedded JSON strings.
-            AliExpress frequently nests {"data": "{\"totalResults\":324}"}
-            which the old walker silently skipped. MAJOR fix.
+  FIX A  — _on_response now REJECTS junk URLs before scoring.
+            AliExpress recommendation, login, ads, and analytics APIs
+            contain item-like counts (expandMaxNumOfRow=8, phoneCode=972)
+            that were being scored high and winning over the correct value.
+            Added JUNK_URL_FRAGMENTS blocklist + VALID_URL_FRAGMENTS allowlist.
+            THIS WAS THE PRIMARY BUG — caused wrong counts on aliased stores.
 
-  FIX 2  — COUNT_HINT_RE broadened to catch searchResultTotal, feedCount,
-            resultCount, displayItemCount, totalResult, totalNum.
+  FIX B  — raw_html_regex promoted to Layer 2.5 (runs BEFORE dom_poll).
+            The HTML is already loaded at that point — no timeout risk.
+            If raw_html finds the count, the 90-second DOM poll is SKIPPED,
+            cutting per-merchant time from ~150s down to ~20-30s.
 
-  FIX 3  — Response interception now has a TEXT FALLBACK: if .json() fails
-            (JSONP, BOM, invalid JSON), raw regex is run on the text body.
+  FIX C  — RAW_HTML_COUNT_PATTERNS expanded with AliExpress-specific
+            patterns that match the actual rendered HTML:
+              ">N items<"  and  ">N products<"  text nodes
+              store_pc_allItems spm-anchor span pattern
 
-  FIX 4  — Raw HTML regex scan added as Layer 3.5 — scans page.content()
-            directly with a wide key list before falling back to DOM poll.
+  FIX D  — Same JUNK_URL_FRAGMENTS filter applied inside /merchant-debug
+            endpoint's _on_response closure (was missing there too).
 
-  FIX 5  — Scrolling upgraded: 8 full-page scroll steps (scroll-to-bottom
-            style) + 5 mouse-wheel passes + explicit 4-second post-scroll
-            wait to let the count API fire.
+  FIX E  — BLOCKED_SIZE_BYTES reference removed from merchant-debug
+            endpoint (was left as a dead reference after v7.0 removed it
+            from the scraper but not from server.py debug handler).
 
-  FIX 6  — Product-grid wait added before running Layer 2/3. Ensures JS
-            has fully hydrated before global state is scanned.
-
-  FIX 7  — BLOCKED_SIZE_BYTES check removed. React shell pages (~80 KB)
-            are valid pages, not bot detections. Removed false positives.
-
-  FIX 8  — _JS_POLL_FOR_COUNT updated with 2026 AliExpress selectors,
-            window.runParams direct key scan, and _init_data_ script tag
-            detection. Also added "of N" pagination pattern.
-
-  FIX 9  — _JS_GLOBAL_CANDIDATES updated with wider key list for
-            window.runParams and __NEXT_DATA__.
-
-  ARCHITECTURE NOTE:
-  Tor / residential proxies are NOT needed yet. Camoufox fingerprinting
-  is solid. All failures traced to extraction logic, not bot detection.
-  If success rate stays below 50% after these fixes → add proxies then.
+ROOT CAUSE SUMMARY (store 5068278 → canonical 1101336762, returned 8 not 48):
+  The response from recom-acs.aliexpress.com/...recommend... contained
+  {"expandMaxNumOfRow": 8} which matched COUNT_HINT_RE (score=18) and was
+  taken as Layer 1 winner. The correct "48 items" span was in the HTML but
+  raw_html ran AFTER dom_poll which timed out at 90s. Total time: 156s.
+  After these fixes: junk URL rejected → raw_html finds 48 in ~5s → done.
 """
 
 import re
@@ -73,7 +69,6 @@ NETWORKIDLE_TIMEOUT  = 30_000
 POLL_TIMEOUT_MS      = 90_000    # 90 s DOM poll
 DELAY_MIN            = 10.0
 DELAY_MAX            = 25.0
-# FIX 7: removed BLOCKED_SIZE_BYTES — React shell pages (~80KB) are valid
 JOBS_DIR             = Path("./merchant_jobs")
 SCREENSHOTS_DIR      = Path("./merchant_screenshots")
 
@@ -106,8 +101,66 @@ REAL_BLOCK_SIGNALS = [
     'cf-challenge-running',
 ]
 
-# FIX 4: wide key list for raw HTML regex scan (Layer 3.5)
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX A: URL filter lists for response interception
+# ─────────────────────────────────────────────────────────────────────────────
+
+# URLs containing these fragments are REJECTED — they carry item-like numbers
+# that have nothing to do with the store's product count.
+JUNK_URL_FRAGMENTS = [
+    "recom-acs",
+    "recommend",
+    "login",
+    "signin",
+    "passport",
+    "/ad.",
+    "/ads.",
+    "analytics",
+    "tracking",
+    "beacon",
+    "mtop.relationrecommend",
+    "mtop.user",
+    "mtop.login",
+    "mtop.member",
+    "countrylistforlogin",
+    "renderpage",
+    "captcha",
+    "punish",
+    "risk",
+    "umeng",
+    "aplus",
+    "goldlog",
+]
+
+# At least one of these must be present (in URL or content-type) to pass.
+VALID_URL_FRAGMENTS = [
+    "/store/",
+    "allitems",
+    "all-items",
+    "shopstoreitem",
+    "storeitem",
+    "mtop.aliexpress.store",
+    "mtop.aliexpress.search",
+    "search.mtop",
+    "itemcount",
+    "storefront",
+    "store_pc",
+    "sellerprofile",
+    "totalitem",
+    "productlist",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX C: expanded raw HTML patterns — AliExpress-specific text nodes added
+# ─────────────────────────────────────────────────────────────────────────────
+
 RAW_HTML_COUNT_PATTERNS = [
+    # AliExpress store page spm-anchor span: ">48 items<"
+    r'store_pc_allItems[^"]*"[^>]*>\s*(\d+)\s*items?',
+    # Generic text nodes: ">48 items<"  ">48 products<"
+    r'>(\d+)\s+items?<',
+    r'>(\d+)\s+products?<',
+    # JSON keys in HTML source
     r'"totalResults?"\s*:\s*(\d+)',
     r'"searchResultTotal"\s*:\s*(\d+)',
     r'"itemCount"\s*:\s*(\d+)',
@@ -215,8 +268,6 @@ def parse_merchant_csv(file_bytes: bytes) -> List[str]:
 # LAYER 1: JSON RESPONSE-BODY HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-# FIX 2: broadened regex — catches searchResultTotal, feedCount, resultCount,
-#         displayItemCount, totalResult, totalNum in addition to old patterns
 COUNT_HINT_RE = re.compile(
     r"(item|items|product|products|goods|result|results|feed|search|display)"
     r".{0,30}"
@@ -231,11 +282,7 @@ ID_HINT_RE = re.compile(r"(store|shop|seller|merchant).{0,10}id", re.I)
 
 
 def _walk_json(obj: Any, path: str = "$", out: Optional[list] = None) -> list:
-    """
-    FIX 1: Recursively walk JSON, AND decode embedded JSON strings.
-    AliExpress frequently nests {"data": "{\"totalResults\":324}"} — this
-    was silently skipped in v6.0 and is the #1 cause of missed counts.
-    """
+    """Recursively walk JSON, AND decode embedded JSON strings."""
     if out is None:
         out = []
     if isinstance(obj, dict):
@@ -245,7 +292,6 @@ def _walk_json(obj: Any, path: str = "$", out: Optional[list] = None) -> list:
                 _walk_json(v, p, out)
             elif isinstance(v, str):
                 out.append({"path": p, "value": v})
-                # FIX 1: attempt to decode embedded JSON strings
                 vv = v.strip()
                 if (vv.startswith("{") and vv.endswith("}")) or \
                    (vv.startswith("[") and vv.endswith("]")):
@@ -329,12 +375,13 @@ def _extract_store_id(url: str) -> Optional[str]:
 
 def _raw_html_count_scan(html: str) -> Optional[int]:
     """
-    FIX 4: Layer 3.5 — scan raw HTML string with wide key regex list.
-    Catches SSR-injected JSON that DOM poll and global state miss.
+    Layer 2.5 — scan raw HTML string with wide key regex list.
+    FIX B: This now runs BEFORE dom_poll. The HTML is already loaded,
+    so this is essentially free (no network/timeout cost).
     Returns the first plausible count found, or None.
     """
     for pattern in RAW_HTML_COUNT_PATTERNS:
-        for m in re.finditer(pattern, html, re.I):
+        for m in re.finditer(pattern, html, re.I | re.S):
             try:
                 val = int(m.group(1))
                 if 1 <= val <= 500_000:
@@ -346,8 +393,40 @@ def _raw_html_count_scan(html: str) -> Optional[int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FIX A: URL validation helper for response interception
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_valid_response_url(url: str, content_type: str) -> bool:
+    """
+    Returns True if this response URL is worth scanning for product counts.
+    Rejects recommendation, login, analytics, and ad APIs which often contain
+    item-like numbers (expandMaxNumOfRow, phoneCode, etc.) that score high
+    but have nothing to do with the store's actual product count.
+    """
+    url_l = url.lower()
+    ct_l  = content_type.lower()
+
+    # Hard reject junk URLs regardless of content-type
+    if any(frag in url_l for frag in JUNK_URL_FRAGMENTS):
+        logger.debug(f"[response_filter] rejected junk URL: {url[:80]}")
+        return False
+
+    # Accept if content-type is JSON AND URL looks like a store/search API
+    is_json = "json" in ct_l
+    is_valid_path = any(frag in url_l for frag in VALID_URL_FRAGMENTS)
+
+    if is_json and is_valid_path:
+        return True
+
+    # Also accept JSONP / mtop endpoints that match valid path
+    if is_valid_path and any(x in url_l for x in ["/api/", "/ajax/", "mtop", "gw."]):
+        return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LAYER 2: HYDRATED GLOBALS  (JS injected into page)
-# FIX 9: wider key list, explicit window.runParams direct-key scan
 # ─────────────────────────────────────────────────────────────────────────────
 
 _JS_GLOBAL_CANDIDATES = r"""
@@ -357,7 +436,6 @@ _JS_GLOBAL_CANDIDATES = r"""
         "__PRELOADED_STATE__", "_page_config_", "_init_data_"
     ];
 
-    // FIX 9: direct key scan on window.runParams (fastest path)
     const directKeys = [
         "totalItems", "totalCount", "itemCount", "productTotal",
         "storeItemCount", "totalResults", "searchResultTotal",
@@ -410,7 +488,6 @@ _JS_GLOBAL_CANDIDATES = r"""
         for (const [k, v] of Object.entries(obj)) {
             const p = `${path}.${k}`;
 
-            // direct key hit (highest confidence)
             if (directKeys.includes(k)) {
                 const n = typeof v === "number" ? v :
                           (typeof v === "string" && /^\d+$/.test(v) ? parseInt(v, 10) : null);
@@ -432,7 +509,6 @@ _JS_GLOBAL_CANDIDATES = r"""
                                 score, matched_store_id: nextMeta.storeId || null });
                 }
             } else if (typeof v === "string") {
-                // FIX 1 in JS: decode embedded JSON strings
                 const vv = v.trim();
                 if ((vv.startsWith("{") && vv.endsWith("}")) ||
                     (vv.startsWith("[") && vv.endsWith("]"))) {
@@ -458,8 +534,6 @@ _JS_GLOBAL_CANDIDATES = r"""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LAYER 3: BROAD DOM POLL
-# FIX 8: updated selectors, window.runParams direct scan, _init_data_ tag,
-#         "of N" pagination pattern, improved 2026 AliExpress class names
 # ─────────────────────────────────────────────────────────────────────────────
 
 _JS_POLL_FOR_COUNT = r"""() => {
@@ -486,7 +560,6 @@ _JS_POLL_FOR_COUNT = r"""() => {
         return null;
     };
 
-    // FIX 9: direct window.runParams scan (fastest)
     const directKeys = [
         "totalItems","totalCount","itemCount","productTotal","storeItemCount",
         "totalResults","searchResultTotal","feedCount","resultCount",
@@ -525,7 +598,7 @@ _JS_POLL_FOR_COUNT = r"""() => {
         const v = tryText(el.textContent); if (v) return v;
     }
 
-    // 3. Script tags — SSR JSON keys (FIX 8: wider key list)
+    // 3. Script tags — SSR JSON keys
     for (const s of document.querySelectorAll('script')) {
         const m = (s.textContent || '').match(
             /"(?:totalResults?|itemCount|totalItems?|storeItemCount|productCount|goodsCount|totalNum|searchResultTotal|feedCount|resultCount|displayItemCount|totalResult|totalProducts?|allItemsTotal)"\s*:\s*(\d+)/
@@ -533,7 +606,7 @@ _JS_POLL_FOR_COUNT = r"""() => {
         if (m) return parseInt(m[1], 10);
     }
 
-    // 4. FIX 8: _init_data_ script tag (common on store pages)
+    // 4. _init_data_ script tag
     for (const s of document.querySelectorAll('script')) {
         const txt = s.textContent || '';
         if (txt.includes('_init_data_') || txt.includes('runParams')) {
@@ -622,7 +695,7 @@ def _wait_for_item_count(page, poll_timeout_ms: int = POLL_TIMEOUT_MS) -> Option
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BROWSER CONTEXT  — observe-only, NO redirect aborting
+# BROWSER CONTEXT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_context(browser, ua: str, merchant_id: str = ""):
@@ -672,13 +745,13 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 def _on_response(resp):
                     try:
                         ct    = (resp.headers or {}).get("content-type", "")
-                        url_l = resp.url.lower()
-                        if "json" not in ct.lower() and not any(
-                            x in url_l for x in ["/api/", "/ajax/", "search", "store", "mtop"]
-                        ):
+                        url_r = resp.url
+
+                        # FIX A: reject junk URLs, require valid store/search URLs
+                        if not _is_valid_response_url(url_r, ct):
                             return
 
-                        # FIX 3: text fallback — try .json() first, fall back to raw regex
+                        # Try JSON parse first, fall back to raw text regex
                         data = None
                         try:
                             data = resp.json()
@@ -689,10 +762,12 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                             cand = _best_count_from_json(data, expected_ids={input_id, landed_id})
                             if cand:
                                 response_hits.append({
-                                    "source": "response_json", "url": resp.url, **cand
+                                    "source": "response_json",
+                                    "url":    url_r,
+                                    **cand
                                 })
                         else:
-                            # FIX 3: raw text regex fallback
+                            # Text / JSONP fallback
                             try:
                                 raw_text = resp.text()
                                 for pattern in RAW_HTML_COUNT_PATTERNS:
@@ -702,10 +777,10 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                                         if 1 <= val <= 500_000:
                                             response_hits.append({
                                                 "source": "response_text_regex",
-                                                "url": resp.url,
-                                                "count": val,
-                                                "path": "raw_text_regex",
-                                                "score": 15,
+                                                "url":    url_r,
+                                                "count":  val,
+                                                "path":   "raw_text_regex",
+                                                "score":  15,
                                             })
                                             break
                             except Exception:
@@ -749,18 +824,16 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 except Exception:
                     pass
 
-                # FIX 6: wait for product grid before extraction
-                # This ensures JS hydration is complete before we scan globals/DOM
+                # Wait for product grid before extraction
                 try:
                     page.wait_for_selector(
                         'img, [class*="product"], [class*="item"], [class*="card"]',
                         timeout=20_000
                     )
                 except Exception:
-                    pass  # not fatal — some pages render differently
+                    pass
 
-                # FIX 5: aggressive scroll-to-bottom (8 full-page steps)
-                # AliExpress count API fires after behavioral scroll confidence
+                # Scroll-to-bottom (8 full-page steps)
                 try:
                     last_height = page.evaluate("document.body.scrollHeight")
                     for _ in range(8):
@@ -773,7 +846,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 except Exception:
                     pass
 
-                # FIX 5: additional mouse-wheel passes for anti-bot behavioral signals
+                # Mouse-wheel passes for anti-bot behavioral signals
                 for _ in range(5):
                     page.mouse.move(
                         random.randint(100, 1200), random.randint(100, 800)
@@ -781,7 +854,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     page.mouse.wheel(0, random.randint(600, 1_200))
                     page.wait_for_timeout(random.randint(400, 800))
 
-                # FIX 5: post-scroll wait — let count API fire
+                # Post-scroll wait — let count API fire
                 page.wait_for_timeout(random.randint(3_000, 5_000))
 
                 # Re-read landed ID after JS settle
@@ -821,34 +894,45 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 except Exception as e:
                     logger.debug(f"[merchant] {merchant_id} global scan failed: {e}")
 
-                # ── Layer 3: broad DOM poll (90 s) ────────────────────────────
-                dom_hit = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
+                # ── FIX B: Layer 2.5 — raw HTML regex (FREE, no timeout) ──────
+                # Run BEFORE dom_poll. HTML is already in memory.
+                raw_html_hit = _raw_html_count_scan(html)
+
+                # ── Layer 3: broad DOM poll — ONLY if cheaper layers missed ───
+                # FIX B: skip the 90-second poll if raw_html already found it
+                dom_hit = None
+                if raw_html_hit is None and not global_hits and not response_hits:
+                    dom_hit = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
+                elif raw_html_hit is None:
+                    # We have response/global hits to fall back on, but try DOM briefly
+                    dom_hit = _wait_for_item_count(page, poll_timeout_ms=15_000)
 
                 page.close()
                 ctx.close()
-
-                # ── Layer 3.5: raw HTML regex scan (FIX 4) ───────────────────
-                raw_html_hit = _raw_html_count_scan(html)
 
                 # ── Pick best candidate across all layers ─────────────────────
                 best_count:  Optional[int] = None
                 best_source: Optional[str] = None
 
-                if response_hits:                        # Layer 1 wins
+                # Layer 1: response_json (only from validated URLs now)
+                if response_hits:
                     best_count  = response_hits[0]["count"]
                     best_source = response_hits[0].get("source", "response_json")
 
-                if best_count is None and global_hits:   # Layer 2
+                # Layer 2: hydrated globals
+                if best_count is None and global_hits:
                     best_count  = global_hits[0]["count"]
                     best_source = "global_state"
 
-                if best_count is None and dom_hit:        # Layer 3
-                    best_count  = dom_hit
-                    best_source = "dom_poll"
-
-                if best_count is None and raw_html_hit:  # Layer 3.5
+                # Layer 2.5: raw HTML (FIX B: now before dom_poll)
+                if best_count is None and raw_html_hit:
                     best_count  = raw_html_hit
                     best_source = "raw_html_regex"
+
+                # Layer 3: DOM poll
+                if best_count is None and dom_hit:
+                    best_count  = dom_hit
+                    best_source = "dom_poll"
 
                 if best_count is not None:
                     canonical_note = f" (canonical={landed_id})" if alias_warning else ""
@@ -866,8 +950,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                         "screenshot_path":    None,
                     }
 
-                # ── Nothing found — save debug screenshot and retry/fail ───────
-                # FIX 7: removed BLOCKED_SIZE_BYTES check (React shell ~80KB is valid)
+                # ── Nothing found — retry/fail ────────────────────────────────
                 logger.warning(
                     f"[merchant] {merchant_id} no count found "
                     f"({html_size//1024}KB, attempt {attempt})"
@@ -877,7 +960,7 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     time.sleep(random.uniform(5, 15))
                     continue
 
-                # Last attempt — we need a page for screenshot; re-open briefly
+                # Last attempt — re-open briefly for screenshot
                 screenshot_path = None
                 try:
                     with Camoufox(headless=True, os="windows") as browser2:
