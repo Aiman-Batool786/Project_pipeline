@@ -817,13 +817,31 @@ def merchant_debug(req: MerchantDebugRequest):
             landed_id = input_id
 
             def _on_response(resp):
-                try:
-                    ct    = (resp.headers or {}).get("content-type", "")
-                    url_l = resp.url.lower()
-                    if "json" not in ct.lower() and not any(
-                        x in url_l for x in ["/api/", "/ajax/", "search", "store", "mtop"]
-                    ):
-                        return
+    try:
+        url_l = resp.url.lower()
+        
+        # REJECT: recommendation, login, ads, analytics APIs — these contain
+        # item counts that have nothing to do with the store
+        JUNK_URL_FRAGMENTS = [
+            "recom-acs", "recommend", "login", "signin", "passport",
+            "ad.", "ads.", "analytics", "tracking", "beacon",
+            "mtop.relationrecommend", "mtop.user", "mtop.login",
+        ]
+        if any(frag in url_l for frag in JUNK_URL_FRAGMENTS):
+            return
+
+        # REQUIRE: must be a store/search/item API call
+        VALID_URL_FRAGMENTS = [
+            "/store/", "allitems", "all-items", "shopstoreitem",
+            "mtop.aliexpress.store", "mtop.aliexpress.search",
+            "search.mtop", "itemcount", "storeitem",
+        ]
+        ct = (resp.headers or {}).get("content-type", "")
+        is_json_ct = "json" in ct.lower()
+        is_valid_url = any(x in url_l for x in VALID_URL_FRAGMENTS)
+        
+        if not is_json_ct and not is_valid_url:
+            return
                     data = resp.json()
                     cand = _best_count_from_json(data, expected_ids={input_id, landed_id})
                     if cand:
