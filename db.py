@@ -16,6 +16,10 @@ Tables:
   specification_audit_log — Diff: original vs enhanced vs template
   restricted_keywords     — Keywords forbidden in descriptions / specs
                             (loaded from desc_and_spec_restricted_keywords CSV)
+  processed_ids           — Global deduplication table for merchant scraper
+                            (mirrors the table in dedup.db — kept here so
+                            create_all_tables() is the single authoritative
+                            schema call at startup)
 """
 
 import sqlite3
@@ -289,9 +293,35 @@ def create_all_tables():
         added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
+    # ── PROCESSED IDS TABLE (DEDUPLICATION) ───────────────────────────────
+    # Global deduplication table for the merchant bulk scraper.
+    #
+    # The merchant_scraper module keeps its own copy of this table in a
+    # separate file (dedup.db) so it survives independently of this DB.
+    # We also create it here so that create_all_tables() — called at
+    # FastAPI startup — guarantees the table exists in products.db as a
+    # fallback reference and for any tooling that queries products.db
+    # directly.
+    #
+    # The PRIMARY KEY on `id` enforces uniqueness at the DB level.
+    # _try_claim_id() in merchant_scraper.py uses INSERT OR IGNORE inside
+    # an EXCLUSIVE transaction to atomically claim an ID — exactly one
+    # thread/process wins the race; all others see rowcount == 0 and skip.
+    #
+    # Schema mirrors dedup.db so the two files stay in sync:
+    #   id           — merchant store ID (numeric string)
+    #   job_id       — UUID of the bulk job that first processed this ID
+    #   processed_at — wall-clock time of first claim (auto-set by SQLite)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS processed_ids (
+        id           TEXT PRIMARY KEY,
+        job_id       TEXT,
+        processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+
     conn.commit()
     conn.close()
-    print("All tables created (including restricted_keywords and restricted_categories)")
+    print("All tables created (including restricted_keywords, restricted_categories, and processed_ids)")
 
 
 # =============================================================================
@@ -421,6 +451,68 @@ def filter_restricted_keywords(text: str, keywords: list = None) -> tuple:
             found.append(kw)
             cleaned = pattern.sub('[REMOVED]', cleaned)
 
+
+# =============================================================================
+# DEDUPLICATION HELPERS (products.db mirror)
+# =============================================================================
+
+def get_processed_ids(job_id: str = None) -> list:
+    """
+    Return processed merchant IDs from products.db.
+
+    Args:
+        job_id: If provided, filter to only that job's IDs.
+                If None, return all processed IDs across all jobs.
+
+    Returns:
+        List of merchant ID strings.
+
+    Useful for reporting / auditing from the main products DB without
+    having to open the separate dedup.db file.
+    """
+    conn = create_connection()
+    try:
+        cursor = conn.cursor()
+        if job_id:
+            cursor.execute(
+                "SELECT id FROM processed_ids WHERE job_id = ? ORDER BY processed_at",
+                (job_id,)
+            )
+        else:
+            cursor.execute("SELECT id FROM processed_ids ORDER BY processed_at")
+        return [row[0] for row in cursor.fetchall()]
+    except Exception as e:
+        print(f"[db] Error reading processed_ids: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def get_processed_id_count(job_id: str = None) -> int:
+    """
+    Return the count of processed merchant IDs.
+
+    Args:
+        job_id: If provided, count only IDs for that job.
+                If None, count all IDs across all jobs.
+    """
+    conn = create_connection()
+    try:
+        cursor = conn.cursor()
+        if job_id:
+            cursor.execute(
+                "SELECT COUNT(*) FROM processed_ids WHERE job_id = ?",
+                (job_id,)
+            )
+        else:
+            cursor.execute("SELECT COUNT(*) FROM processed_ids")
+        row = cursor.fetchone()
+        return row[0] if row else 0
+    except Exception as e:
+        print(f"[db] Error counting processed_ids: {e}")
+        return 0
+    finally:
+        conn.close()
 
 
 # =============================================================================
