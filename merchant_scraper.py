@@ -169,6 +169,10 @@ RAW_HTML_COUNT_PATTERNS = [
 _jobs: Dict[str, Dict] = {}
 _jobs_lock = threading.Lock()
 
+# stop_events: job_id → threading.Event
+# Set the event to request graceful stop between batches/merchants.
+_stop_events: Dict[str, threading.Event] = {}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TOR HELPERS
@@ -930,8 +934,14 @@ def _merge_batch_csvs(job_id: str, batches_total: int) -> Path:
 
 def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
     logger.info(f"[job:{job_id}] Batch {batch_idx:04d} — {len(merchant_ids)} merchants")
+    stop_ev = _stop_events.get(job_id)
     rows = []
     for i, mid in enumerate(merchant_ids):
+        # Check stop signal before each merchant
+        if stop_ev and stop_ev.is_set():
+            logger.info(f"[job:{job_id}] Stop requested — skipping remaining merchants in batch {batch_idx:04d}")
+            break
+
         try:
             row = _scrape_merchant(mid)
         except Exception as e:
@@ -942,6 +952,9 @@ def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
         logger.info(f"[job:{job_id}] [{i+1}/{len(merchant_ids)}] {mid} → {status}")
 
         if i < len(merchant_ids) - 1:
+            # Also check stop during the inter-merchant sleep
+            if stop_ev and stop_ev.is_set():
+                break
             time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
     _write_batch_csv(job_id, batch_idx, rows)
@@ -968,7 +981,18 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
 
     logger.info(f"[job:{job_id}] Start — {total} merchants | {batches_total} batches | Tor={'on' if TOR_ENABLED else 'off'}")
 
+    stop_ev = _stop_events.get(job_id)
+
     for idx, batch in enumerate(batches):
+        # Check stop signal before starting each batch
+        if stop_ev and stop_ev.is_set():
+            logger.info(f"[job:{job_id}] Stop requested — halting before batch {idx:04d}")
+            # Mark remaining queued batches as stopped
+            for rem in range(idx, batches_total):
+                if meta["batches"][rem]["status"] == "queued":
+                    meta["batches"][rem]["status"] = "stopped"
+            break
+
         meta["batches"][idx]["status"] = "running"
         _save_metadata(job_id, meta)
         try:
@@ -993,21 +1017,32 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
         logger.info(f"[job:{job_id}] {processed}/{batches_total} ({merchants_done}/{total}, {pct}%)")
 
         if idx < batches_total - 1:
+            if stop_ev and stop_ev.is_set():
+                logger.info(f"[job:{job_id}] Stop requested during inter-batch sleep — halting")
+                break
             time.sleep(random.uniform(15, 30))
+
+    # Determine final status
+    was_stopped = stop_ev is not None and stop_ev.is_set()
 
     try:
         _merge_batch_csvs(job_id, batches_total)
     except Exception as e:
         logger.error(f"[job:{job_id}] Merge failed: {e}")
 
-    meta["status"]      = "done"
-    meta["finished_at"] = datetime.utcnow().isoformat()
+    final_status            = "stopped" if was_stopped else "done"
+    meta["status"]          = final_status
+    meta["finished_at"]     = datetime.utcnow().isoformat()
     _save_metadata(job_id, meta)
     with _jobs_lock:
         if job_id in _jobs:
-            _jobs[job_id]["status"] = "done"
+            _jobs[job_id]["status"] = final_status
 
-    logger.info(f"[job:{job_id}] ✓ Complete — {meta['batches_done']} ok | {meta['batches_failed']} failed")
+    # Clean up stop event
+    with _jobs_lock:
+        _stop_events.pop(job_id, None)
+
+    logger.info(f"[job:{job_id}] {'⛔ Stopped' if was_stopped else '✓ Complete'} — {meta['batches_done']} ok | {meta['batches_failed']} failed")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1017,8 +1052,54 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
 def start_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
     with _jobs_lock:
         _jobs[job_id] = {"status": "queued", "total": len(merchant_ids), "batches_total": 0, "batches_done": 0, "batches_failed": 0}
+        _stop_events[job_id] = threading.Event()   # cleared = running
     t = threading.Thread(target=_run_bulk_job, args=(job_id, merchant_ids), daemon=True, name=f"merchant-{job_id[:8]}")
     t.start()
+
+
+def stop_job(job_id: str) -> Dict:
+    """
+    Request graceful stop for a running or queued job.
+    Sets the stop event so the job thread exits after the current merchant
+    finishes (does NOT kill mid-scrape — the running merchant completes,
+    then the loop breaks cleanly).
+
+    Returns a status dict indicating whether the stop was accepted.
+    """
+    with _jobs_lock:
+        mem    = dict(_jobs.get(job_id, {}))
+        ev     = _stop_events.get(job_id)
+        status = mem.get("status", "unknown")
+
+    if not mem and _load_metadata(job_id) is None:
+        return {"success": False, "job_id": job_id, "error": "Job not found"}
+
+    if status in ("done", "stopped"):
+        return {"success": False, "job_id": job_id, "error": f"Job already {status}", "status": status}
+
+    if ev is None:
+        # Job exists on disk (server restarted) but no live thread — mark stopped directly
+        meta = _load_metadata(job_id)
+        if meta:
+            meta["status"]      = "stopped"
+            meta["finished_at"] = datetime.utcnow().isoformat()
+            _save_metadata(job_id, meta)
+        return {"success": True, "job_id": job_id, "message": "Job marked stopped (no live thread found)", "status": "stopped"}
+
+    ev.set()   # signal the thread to stop after current merchant
+
+    # Update in-memory status immediately so status endpoint reflects it
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]["status"] = "stopping"
+
+    logger.info(f"[job:{job_id}] ⛔ Stop requested by user")
+    return {
+        "success": True,
+        "job_id":  job_id,
+        "message": "Stop signal sent. The current merchant will finish, then the job halts. Already-completed batches are saved and downloadable.",
+        "status":  "stopping",
+    }
 
 
 def get_job_status(job_id: str) -> Optional[Dict]:
