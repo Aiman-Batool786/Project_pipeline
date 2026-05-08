@@ -1,29 +1,14 @@
 """
-FastAPI Server - HYBRID APPROACH v4.0
+FastAPI Server - HYBRID APPROACH v3.1
 Pipeline: Scrape → Store → Enhance → Categorize → Map → Excel
 
-CHANGES FROM v3.0:
-  FIX 1  — merchant_debug _on_response now uses _is_valid_response_url()
-            (the same shared guard used by _scrape_merchant). The old inline
-            check let login.aliexpress.com responses through unfiltered,
-            causing 972 (Israel phone code) to be returned as item count.
-
-  FIX 2  — BLOCKED_SIZE_BYTES dead reference removed from merchant_debug.
-            The variable was deleted in v7.0 of merchant_scraper but the
-            debug endpoint still referenced it → NameError crash.
-
-  FIX 3  — merchant_debug now runs raw HTML regex scan (Layer 2.5) before
-            the 90-second DOM poll, identical to _scrape_merchant v9.0.
-
-  FIX 4  — merchant_debug picks best count with SAME priority order as
-            _scrape_merchant v9.0:
-              raw_html_regex → global_state → confirmed_response_json
-              → dom_poll → unconfirmed_response_json
-
-  FIX 5  — _best_count_from_json call passes source_url= kwarg (v9.0 sig).
-
-  FIX 6  — _attach_screenshot signature simplified (merchant_id arg removed,
-            was unused).
+v3.1 changes (merchant debug fixes):
+  FIX D — /merchant-debug _on_response now uses _is_valid_response_url()
+           to reject junk recommendation/login/analytics APIs. Same fix
+           applied to the bulk scraper in merchant_scraper.py v8.0.
+  FIX E — Removed dead BLOCKED_SIZE_BYTES reference in /merchant-debug
+           (was removed from merchant_scraper.py in v7.0 but the debug
+           handler still referenced it, causing a NameError on failure).
 """
 
 from fastapi import FastAPI, HTTPException
@@ -56,6 +41,7 @@ from merchant_scraper import (
     get_job_status,
     get_output_path,
     list_all_jobs,
+    stop_job,                        # graceful stop endpoint
     _make_context,
     _extract_store_id,
     _JS_DOM_DUMP,
@@ -65,8 +51,9 @@ from merchant_scraper import (
     _wait_for_item_count,
     _save_screenshot,
     _screenshot_to_b64,
-    _is_valid_response_url,    # FIX 1: shared URL filter now imported
-    _raw_html_count_scan,      # FIX 3: raw HTML layer
+    _is_valid_response_url,
+    _raw_html_count_scan,
+    RAW_HTML_COUNT_PATTERNS,
     STORE_URL_TEMPLATE,
     USER_AGENTS,
     PAGE_TIMEOUT,
@@ -74,7 +61,6 @@ from merchant_scraper import (
     POLL_TIMEOUT_MS,
     REAL_BLOCK_SIGNALS,
     SCREENSHOTS_DIR,
-    # NOTE: BLOCKED_SIZE_BYTES intentionally NOT imported — removed in v9.0
 )
 
 logging.basicConfig(
@@ -83,7 +69,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Octopia Template Pipeline", version="4.0.0")
+app = FastAPI(title="Octopia Template Pipeline", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -182,7 +168,7 @@ def startup_event():
         from db import create_all_tables
         create_all_tables()
         SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-        logger.info("✅ API Ready — v4.0.0")
+        logger.info("✅ API Ready — v3.1.0")
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
@@ -196,7 +182,7 @@ def root():
     return {
         "status":  "running",
         "service": "Octopia Template Pipeline",
-        "version": "4.0.0",
+        "version": "3.1.0",
     }
 
 
@@ -712,10 +698,10 @@ def merchant_job_status(job_id: str):
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
     return {
-        "job_id":         job_id,
-        "status":         job.get("status", "unknown"),
-        "total":          job.get("total_merchants", job.get("total", 0)),
-        "done":           job.get("merchants_done", 0),
+        "job_id":   job_id,
+        "status":   job.get("status", "unknown"),
+        "total":    job.get("total_merchants", job.get("total", 0)),
+        "done":     job.get("merchants_done", 0),
         "progress_pct":   job.get("progress_pct", 0.0),
         "batches_total":  job.get("batches_total", 0),
         "batches_done":   job.get("batches_done", 0),
@@ -751,24 +737,54 @@ def list_merchant_jobs():
     return {"jobs": jobs, "count": len(jobs)}
 
 
+@app.post("/merchant-stop/{job_id}", tags=["Merchant Bulk"])
+def stop_merchant_job(job_id: str):
+    """
+    Gracefully stop a running or queued bulk merchant job.
+
+    The currently-scraping merchant will finish before the job halts —
+    it is NOT killed mid-request. All batches completed so far are saved
+    and immediately downloadable via /merchant-download/{job_id}.
+
+    Status transitions:
+      running  → stopping  (stop signal sent, waiting for current merchant)
+      stopping → stopped   (job thread exits after current merchant)
+      queued   → stopped   (job cancelled before it started)
+      done     → 409 error (already finished)
+      stopped  → 409 error (already stopped)
+
+    Example:
+      POST /merchant-stop/52e3f877-3c97-4738-bc10-0e4291979166
+    """
+    result = stop_job(job_id)
+    if not result.get("success"):
+        status_code = 404 if "not found" in result.get("error", "").lower() else 409
+        raise HTTPException(status_code=status_code, detail=result.get("error", "Could not stop job"))
+    return result
+
+
+
 # =============================================================================
 # SCREENSHOT ENDPOINT
 # =============================================================================
 
 @app.get("/merchant-screenshot/{filename}", tags=["Merchant Bulk"])
 def serve_merchant_screenshot(filename: str):
-    """Serve a saved debug screenshot PNG."""
     if not _re.match(r'^[\w\-\.]+\.png$', filename):
         raise HTTPException(status_code=400, detail="Invalid filename")
+
     path = SCREENSHOTS_DIR / filename
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"Screenshot not found: {filename}")
+
     return FileResponse(str(path), media_type="image/png",
                         headers={"Content-Disposition": f'inline; filename="{filename}"'})
 
 
 # =============================================================================
 # MERCHANT DEBUG  v6.0
+# FIX D: _on_response now uses _is_valid_response_url() to reject junk APIs
+# FIX E: removed dead BLOCKED_SIZE_BYTES reference
 # =============================================================================
 
 @app.post("/merchant-debug", tags=["Merchant Bulk"])
@@ -776,15 +792,17 @@ def merchant_debug(req: MerchantDebugRequest):
     """
     DEBUG v6.0 — scrape ONE merchant with full diagnostics.
 
-    Extraction layers (identical to _scrape_merchant v9.0):
-      1    JSON API response bodies  (URL-filtered via _is_valid_response_url)
-      2    Hydrated window globals   (__NEXT_DATA__, runParams, etc.)
-      2.5  Raw HTML regex scan       (free, no timeout)
-      3    Broad DOM text poll       (up to 90 s, skipped if cheaper layers found it)
+    FIX D: Response interception now rejects recommendation, login, analytics,
+    and ad APIs. Previously, recom-acs.aliexpress.com responses containing
+    expandMaxNumOfRow=8 were winning over the correct store count.
 
-    Winner priority:
-      raw_html_regex → global_state → confirmed_response_json
-      → dom_poll → unconfirmed_response_json
+    FIX E: Removed BLOCKED_SIZE_BYTES (deleted in scraper v7.0, was still
+    referenced here causing a NameError on the failure path).
+
+    Three extraction layers tried in order:
+      1. JSON API response bodies (validated URLs only)
+      2. Hydrated window globals (__NEXT_DATA__, runParams, etc.)
+      3. Broad DOM text poll (60 s)
     """
     from camoufox.sync_api import Camoufox
 
@@ -798,21 +816,20 @@ def merchant_debug(req: MerchantDebugRequest):
     input_id = merchant_id
 
     debug: Dict[str, Any] = {
-        "url":                 url,
-        "page_loaded":         False,
-        "final_url":           None,
-        "html_size_bytes":     0,
-        "blocked":             False,
-        "networkidle":         None,
-        "poll_result":         None,
-        "raw_html_result":     None,
-        "response_hits":       [],
-        "global_hits":         [],
-        "dom_dump":            None,
-        "canonical_store_id":  None,
-        "alias_warning":       None,
-        "load_time_sec":       None,
-        "nav_error":           None,
+        "url":              url,
+        "page_loaded":      False,
+        "final_url":        None,
+        "html_size_bytes":  0,
+        "blocked":          False,
+        "networkidle":      None,
+        "poll_result":      None,
+        "response_hits":    [],
+        "global_hits":      [],
+        "dom_dump":         None,
+        "canonical_store_id": None,
+        "alias_warning":    None,
+        "load_time_sec":    None,
+        "nav_error":        None,
         "screenshot_filename": None,
         "screenshot_url":      None,
         "screenshot_b64":      None,
@@ -827,14 +844,14 @@ def merchant_debug(req: MerchantDebugRequest):
             response_hits: List[Dict] = []
             landed_id = input_id
 
-            # FIX 1: use shared validator — identical to _scrape_merchant
             def _on_response(resp):
                 try:
                     ct    = (resp.headers or {}).get("content-type", "")
                     url_r = resp.url
 
+                    # FIX D: reject junk URLs — same filter as bulk scraper
                     if not _is_valid_response_url(url_r, ct):
-                        return   # rejects login/analytics/ads/config URLs
+                        return
 
                     data = None
                     try:
@@ -843,17 +860,32 @@ def merchant_debug(req: MerchantDebugRequest):
                         pass
 
                     if data is not None:
-                        cand = _best_count_from_json(
-                            data,
-                            expected_ids={input_id, landed_id},
-                            source_url=url_r,          # FIX 5
-                        )
+                        cand = _best_count_from_json(data, expected_ids={input_id, landed_id})
                         if cand:
                             response_hits.append({
-                                "source": "response_json",
+                                "source": "response",
                                 "url":    url_r,
                                 **cand
                             })
+                    else:
+                        # Text / JSONP fallback
+                        try:
+                            raw_text = resp.text()
+                            for pattern in RAW_HTML_COUNT_PATTERNS:
+                                m = _re.search(pattern, raw_text, _re.I)
+                                if m:
+                                    val = int(m.group(1))
+                                    if 1 <= val <= 500_000:
+                                        response_hits.append({
+                                            "source": "response_text_regex",
+                                            "url":    url_r,
+                                            "count":  val,
+                                            "path":   "raw_text_regex",
+                                            "score":  15,
+                                        })
+                                        break
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
@@ -873,14 +905,14 @@ def merchant_debug(req: MerchantDebugRequest):
                     debug["page_loaded"] = True
                     debug["nav_error"]   = "Nav aborted/redirected — continuing"
                 elif any(x in es for x in ["ERR_NAME_NOT_RESOLVED", "NS_ERROR_UNKNOWN_HOST"]):
-                    ss = _save_screenshot(page, merchant_id, "dns_error")
-                    _attach_screenshot(debug, ss)
+                    screenshot_path = _save_screenshot(page, merchant_id, "dns_error")
+                    _attach_screenshot(debug, screenshot_path, merchant_id)
                     page.close(); ctx.close()
                     return {"success": False, "merchant_id": merchant_id,
                             "total_items": None, "error": "Page Not Found", "debug": debug}
                 else:
-                    ss = _save_screenshot(page, merchant_id, "nav_error")
-                    _attach_screenshot(debug, ss)
+                    screenshot_path = _save_screenshot(page, merchant_id, "nav_error")
+                    _attach_screenshot(debug, screenshot_path, merchant_id)
                     page.close(); ctx.close()
                     return {"success": False, "merchant_id": merchant_id,
                             "total_items": None, "error": f"Nav: {es[:150]}", "debug": debug}
@@ -899,20 +931,11 @@ def merchant_debug(req: MerchantDebugRequest):
             except Exception:
                 debug["networkidle"] = "timeout"
 
-            # ── Scroll to trigger lazy-load ───────────────────────────────────
-            try:
-                last_h = page.evaluate("document.body.scrollHeight")
-                for _ in range(5):
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.wait_for_timeout(random.randint(600, 1_200))
-                    new_h = page.evaluate("document.body.scrollHeight")
-                    if new_h == last_h:
-                        break
-                    last_h = new_h
-            except Exception:
-                pass
-
-            page.wait_for_timeout(2_000)
+            # ── Scroll ────────────────────────────────────────────────────────
+            for _ in range(3):
+                page.mouse.wheel(0, 600)
+                page.wait_for_timeout(400)
+            page.wait_for_timeout(1_000)
 
             # Re-read alias after JS settle
             landed_id = _extract_store_id(page.url) or landed_id
@@ -927,38 +950,31 @@ def merchant_debug(req: MerchantDebugRequest):
             except Exception as e:
                 logger.debug(f"[debug] global scan failed: {e}")
 
-            # ── FIX 3: Layer 2.5 — raw HTML regex (free, no timeout) ──────────
-            html            = page.content()
-            raw_html_result = _raw_html_count_scan(html)
+            # ── Layer 3: DOM poll (60s) ───────────────────────────────────────
+            polled = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
 
-            debug["raw_html_result"] = raw_html_result
-            debug["html_size_bytes"] = len(html)
-
-            # ── Layer 3: DOM poll — skip if cheaper layers found something ────
-            polled = None
-            if raw_html_result is None and not global_hits and not response_hits:
-                polled = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
-            elif raw_html_result is None:
-                polled = _wait_for_item_count(page, poll_timeout_ms=15_000)
-
-            # ── DOM dump (diagnostic) ─────────────────────────────────────────
+            # ── DOM dump ─────────────────────────────────────────────────────
             try:
                 debug["dom_dump"] = page.evaluate(_JS_DOM_DUMP)
             except Exception as e:
                 debug["dom_dump"] = {"error": str(e)[:80]}
 
-            debug["final_url"]     = page.url
-            debug["load_time_sec"] = round(time.time() - t0, 2)
-            debug["response_hits"] = response_hits[:5]
-            debug["global_hits"]   = global_hits[:5]
-            debug["poll_result"]   = polled
+            debug["final_url"]        = page.url
+            debug["load_time_sec"]    = round(time.time() - t0, 2)
+            debug["response_hits"]    = response_hits[:5]
+            debug["global_hits"]      = global_hits[:5]
+            debug["poll_result"]      = polled
 
+            html = page.content()
+            debug["html_size_bytes"] = len(html)
             lower = html.lower()
+
+            # ── Check real block/CAPTCHA ──────────────────────────────────────
             debug["blocked"] = any(sig in lower for sig in REAL_BLOCK_SIGNALS)
 
             if debug["blocked"]:
-                ss = _save_screenshot(page, merchant_id, "captcha")
-                _attach_screenshot(debug, ss)
+                screenshot_path = _save_screenshot(page, merchant_id, "captcha")
+                _attach_screenshot(debug, screenshot_path, merchant_id)
                 page.close(); ctx.close()
                 return {"success": False, "merchant_id": merchant_id,
                         "canonical_store_id": landed_id,
@@ -967,28 +983,19 @@ def merchant_debug(req: MerchantDebugRequest):
             page.close()
             ctx.close()
 
-            # ── FIX 4: Best-count selection — same priority as _scrape_merchant ─
-            confirmed_response   = [h for h in response_hits if h.get("store_id_confirmed")]
-            unconfirmed_response = [h for h in response_hits if not h.get("store_id_confirmed")]
-
+            # ── Pick best count across all layers ─────────────────────────────
             best_count:  Optional[int] = None
             best_source: Optional[str] = None
 
-            if raw_html_result is not None:
-                best_count  = raw_html_result
-                best_source = "raw_html_regex"
-            elif global_hits:
+            if response_hits:
+                best_count  = response_hits[0]["count"]
+                best_source = "response_json"
+            if best_count is None and global_hits:
                 best_count  = global_hits[0]["count"]
                 best_source = "global_state"
-            elif confirmed_response:
-                best_count  = confirmed_response[0]["count"]
-                best_source = confirmed_response[0].get("source", "response_json")
-            elif polled is not None:
+            if best_count is None and polled is not None:
                 best_count  = polled
                 best_source = "dom_poll"
-            elif unconfirmed_response:
-                best_count  = unconfirmed_response[0]["count"]
-                best_source = unconfirmed_response[0].get("source", "response_json_unconfirmed")
 
             if best_count is not None:
                 return {
@@ -1002,20 +1009,18 @@ def merchant_debug(req: MerchantDebugRequest):
                     "debug":              debug,
                 }
 
-            # ── Nothing found — return full diagnostic ────────────────────────
-            # FIX 2: BLOCKED_SIZE_BYTES reference removed
+            # ── Nothing found ─────────────────────────────────────────────────
+            # FIX E: removed BLOCKED_SIZE_BYTES reference (was NameError).
+            # If we get here, just report the selector missing for investigation.
             debug["html_head_500"] = html[:500].replace("\n", " ")
+
             return {
                 "success":            False,
                 "merchant_id":        input_id,
                 "canonical_store_id": landed_id,
                 "total_items":        None,
-                "error":              (
-                    "No count found after all layers. "
-                    "Check debug.dom_dump, debug.global_hits, "
-                    f"debug.raw_html_result. HTML: {debug['html_size_bytes']//1024}KB"
-                ),
-                "debug": debug,
+                "error":              "Selector Missing — check debug.dom_dump and debug.global_hits",
+                "debug":              debug,
             }
 
     except Exception as exc:
@@ -1024,8 +1029,7 @@ def merchant_debug(req: MerchantDebugRequest):
                 "total_items": None, "error": str(exc)[:300], "debug": debug}
 
 
-def _attach_screenshot(debug: dict, screenshot_path: Optional[str]) -> None:
-    """Populate debug dict with screenshot filename, URL, and base64."""
+def _attach_screenshot(debug: dict, screenshot_path: Optional[str], merchant_id: str) -> None:
     if not screenshot_path:
         return
     from pathlib import Path as _Path
@@ -1156,6 +1160,6 @@ def view_processing_logs(limit: int = 500):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v4.0")
+    logger.info("🚀 Octopia Template Pipeline v3.1")
     logger.info(f"📡 Server: http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
