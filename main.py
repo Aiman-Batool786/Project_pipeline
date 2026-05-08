@@ -9,6 +9,18 @@ v3.1 changes (merchant debug fixes):
   FIX E — Removed dead BLOCKED_SIZE_BYTES reference in /merchant-debug
            (was removed from merchant_scraper.py in v7.0 but the debug
            handler still referenced it, causing a NameError on failure).
+
+v3.1.1 dedup patch:
+  DEDUP-STARTUP — _init_dedup_db() is now called explicitly inside
+                  startup_event() so the SQLite deduplication DB
+                  (dedup.db) is guaranteed to exist and have WAL mode
+                  enabled before the first HTTP request arrives or any
+                  batch thread tries to claim an ID.  Previously the
+                  table was only created at merchant_scraper module-
+                  import time; calling it again at startup is idempotent
+                  (IF NOT EXISTS guard) and removes the theoretical race
+                  where the module is imported but the file isn't flushed
+                  to disk before a thread runs.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -61,6 +73,10 @@ from merchant_scraper import (
     POLL_TIMEOUT_MS,
     REAL_BLOCK_SIGNALS,
     SCREENSHOTS_DIR,
+    # DEDUP-STARTUP: import the dedup initialiser so startup_event can
+    # call it explicitly — guarantees dedup.db is ready before any
+    # batch thread runs, even if module-level initialisation was delayed.
+    _init_dedup_db,
 )
 
 logging.basicConfig(
@@ -69,7 +85,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Octopia Template Pipeline", version="3.1.0")
+app = FastAPI(title="Octopia Template Pipeline", version="3.1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -168,7 +184,17 @@ def startup_event():
         from db import create_all_tables
         create_all_tables()
         SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-        logger.info("✅ API Ready — v3.1.0")
+
+        # DEDUP-STARTUP: explicitly initialise the deduplication DB so
+        # dedup.db exists and has WAL mode enabled before any batch thread
+        # calls _try_claim_id().  This call is idempotent — the IF NOT
+        # EXISTS guard in _init_dedup_db() makes it safe to call multiple
+        # times (module-import already ran it once; this is a belt-and-
+        # suspenders guarantee at server start).
+        _init_dedup_db()
+        logger.info("✅ Deduplication DB initialised (dedup.db)")
+
+        logger.info("✅ API Ready — v3.1.1")
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
@@ -182,7 +208,7 @@ def root():
     return {
         "status":  "running",
         "service": "Octopia Template Pipeline",
-        "version": "3.1.0",
+        "version": "3.1.1",
     }
 
 
@@ -763,7 +789,6 @@ def stop_merchant_job(job_id: str):
     return result
 
 
-
 # =============================================================================
 # SCREENSHOT ENDPOINT
 # =============================================================================
@@ -1160,6 +1185,6 @@ def view_processing_logs(limit: int = 500):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v3.1")
+    logger.info("🚀 Octopia Template Pipeline v3.1.1")
     logger.info(f"📡 Server: http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
