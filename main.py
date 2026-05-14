@@ -559,13 +559,15 @@ def translate_product(aliexpress_id: str):
     spec_text = _build_spec_text(product_id)
 
     # ── Translate into all supported languages via translation.py ─────────────
-    from db import SUPPORTED_LANGUAGES, insert_translation
+    # _TRANSLATION_LANGS is already imported at the top from translation.py;
+    # we do NOT import SUPPORTED_LANGUAGES from db to avoid version mismatch.
+    from db import insert_translation
 
     raw_translations = translate_product_fields(
         title=title,
         description=description,
         specification=spec_text,
-        languages=SUPPORTED_LANGUAGES,
+        languages=_TRANSLATION_LANGS,
     )
 
     # ── Persist each language row ─────────────────────────────────────────────
@@ -643,7 +645,7 @@ def get_all_translations(aliexpress_id: str):
             ),
         )
 
-    from db import get_translations
+    from db import get_translations  # SUPPORTED_LANGUAGES sourced from translation.py
     translations = get_translations(row["product_id"])
     return {
         "aliexpress_id": aliexpress_id,
@@ -667,15 +669,15 @@ def get_single_translation(aliexpress_id: str, language: str):
     Returns a dict with keys matching the translation table column names:
         url_id, language, title, description, specification, translated_at
     """
-    from db import SUPPORTED_LANGUAGES, get_translation
-
+    from db import get_translation
+    # _TRANSLATION_LANGS imported at module top from translation.py
     if not aliexpress_id.strip().isdigit():
         raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
 
-    if language not in SUPPORTED_LANGUAGES:
+    if language not in _TRANSLATION_LANGS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported language '{language}'. Supported: {SUPPORTED_LANGUAGES}",
+            detail=f"Unsupported language '{language}'. Supported: {_TRANSLATION_LANGS}",
         )
 
     canonical_url = f"https://www.aliexpress.com/item/{aliexpress_id.strip()}.html"
