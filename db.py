@@ -980,6 +980,78 @@ def create_table():
 
 def create_categories_table():
     pass
+  # ─────────────────────────────────────────────────────────────────────────────
+# TRANSLATION HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def insert_translation(url_id: int, language: str, title: str,
+                       description: str, specification: str) -> bool:
+    """
+    Insert or replace one translation row for (url_id, language).
+    Returns True on success, False on failure.
+    """
+    try:
+        conn = sqlite3.connect("products.db")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS translation (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                url_id        INTEGER NOT NULL,
+                language      TEXT    NOT NULL,
+                title         TEXT,
+                description   TEXT,
+                specification TEXT,
+                translated_at TEXT DEFAULT (datetime('now')),
+                UNIQUE(url_id, language),
+                FOREIGN KEY (url_id) REFERENCES scraped_products(product_id)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO translation (url_id, language, title, description, specification)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(url_id, language) DO UPDATE SET
+                title         = excluded.title,
+                description   = excluded.description,
+                specification = excluded.specification,
+                translated_at = datetime('now')
+        """, (url_id, language, title, description, specification))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[db] insert_translation error: {e}")
+        return False
+
+
+def get_translations(url_id: int) -> list:
+    """Return all translation rows for a given product_id."""
+    try:
+        conn = sqlite3.connect("products.db")
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM translation WHERE url_id = ? ORDER BY language",
+            (url_id,)
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[db] get_translations error: {e}")
+        return []
+
+
+def get_translation(url_id: int, language: str) -> dict | None:
+    """Return one translation row for (product_id, language), or None."""
+    try:
+        conn = sqlite3.connect("products.db")
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM translation WHERE url_id = ? AND language = ?",
+            (url_id, language)
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+    except Exception as e:
+        print(f"[db] get_translation error: {e}")
+        return None
 
 
 # =============================================================================
