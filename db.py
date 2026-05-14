@@ -20,6 +20,8 @@ Tables:
                             (mirrors the table in dedup.db — kept here so
                             create_all_tables() is the single authoritative
                             schema call at startup)
+  translation             — Per-language translations of title, description,
+                            and specification for each product
 """
 
 import sqlite3
@@ -27,6 +29,7 @@ import json
 import csv
 import os
 import re
+from typing import Optional
 
 DB_NAME = "products.db"
 
@@ -293,6 +296,23 @@ def create_all_tables():
         added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
+    # ── TRANSLATION TABLE ──────────────────────────────────────────────────
+    # Stores per-language translations of title, description, and
+    # specification for each product.
+    # Populated by: POST /translate-product/{aliexpress_id}
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS translation (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        url_id        INTEGER NOT NULL,
+        language      TEXT    NOT NULL,
+        title         TEXT,
+        description   TEXT,
+        specification TEXT,
+        translated_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(url_id, language),
+        FOREIGN KEY (url_id) REFERENCES scraped_products(product_id)
+    )""")
+
     # ── PROCESSED IDS TABLE (DEDUPLICATION) ───────────────────────────────
     # Global deduplication table for the merchant bulk scraper.
     #
@@ -321,7 +341,7 @@ def create_all_tables():
 
     conn.commit()
     conn.close()
-    print("All tables created (including restricted_keywords, restricted_categories, and processed_ids)")
+    print("All tables created (including restricted_keywords, restricted_categories, translation, and processed_ids)")
 
 
 # =============================================================================
@@ -441,8 +461,8 @@ def filter_restricted_keywords(text: str, keywords: list = None) -> tuple:
     if keywords is None:
         keywords = get_restricted_keywords()
 
-    found    = []
-    cleaned  = text
+    found   = []
+    cleaned = text
 
     for kw in keywords:
         # Case-insensitive whole-phrase match
@@ -450,6 +470,8 @@ def filter_restricted_keywords(text: str, keywords: list = None) -> tuple:
         if pattern.search(cleaned):
             found.append(kw)
             cleaned = pattern.sub('[REMOVED]', cleaned)
+
+    return cleaned, found  # ← FIX: was missing in original
 
 
 # =============================================================================
@@ -980,9 +1002,11 @@ def create_table():
 
 def create_categories_table():
     pass
-  # ─────────────────────────────────────────────────────────────────────────────
+
+
+# =============================================================================
 # TRANSLATION HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def insert_translation(url_id: int, language: str, title: str,
                        description: str, specification: str) -> bool:
@@ -991,20 +1015,7 @@ def insert_translation(url_id: int, language: str, title: str,
     Returns True on success, False on failure.
     """
     try:
-        conn = sqlite3.connect("products.db")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS translation (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                url_id        INTEGER NOT NULL,
-                language      TEXT    NOT NULL,
-                title         TEXT,
-                description   TEXT,
-                specification TEXT,
-                translated_at TEXT DEFAULT (datetime('now')),
-                UNIQUE(url_id, language),
-                FOREIGN KEY (url_id) REFERENCES scraped_products(product_id)
-            )
-        """)
+        conn = create_connection()
         conn.execute("""
             INSERT INTO translation (url_id, language, title, description, specification)
             VALUES (?, ?, ?, ?, ?)
@@ -1025,7 +1036,7 @@ def insert_translation(url_id: int, language: str, title: str,
 def get_translations(url_id: int) -> list:
     """Return all translation rows for a given product_id."""
     try:
-        conn = sqlite3.connect("products.db")
+        conn = create_connection()
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM translation WHERE url_id = ? ORDER BY language",
@@ -1038,10 +1049,10 @@ def get_translations(url_id: int) -> list:
         return []
 
 
-def get_translation(url_id: int, language: str) -> dict | None:
+def get_translation(url_id: int, language: str) -> Optional[dict]:
     """Return one translation row for (product_id, language), or None."""
     try:
-        conn = sqlite3.connect("products.db")
+        conn = create_connection()
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM translation WHERE url_id = ? AND language = ?",
