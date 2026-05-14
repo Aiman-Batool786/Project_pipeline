@@ -1,26 +1,36 @@
 """
-FastAPI Server - HYBRID APPROACH v3.1
-Pipeline: Scrape → Store → Enhance → Categorize → Map → Excel
+FastAPI Server - HYBRID APPROACH v3.3
+Pipeline: Scrape → Store → Enhance → Categorize → Map → Excel → Translate
+
+v3.3 changes (translation refactor):
+  REFACTOR — All inline translation helpers (_build_translation_prompt,
+             _translate_product_fields, _translate_with_anthropic) removed
+             from main.py and replaced by a single import from the new
+             self-contained translation.py module.
+
+             translation.py:
+               • No project-specific imports — works standalone
+               • Tries OpenAI first (OPENAI_API_KEY), falls back to Anthropic
+                 (ANTHROPIC_API_KEY) automatically
+               • Per-language retry with exponential back-off (2s/4s/8s)
+               • Returns empty strings per field on failure rather than
+                 crashing the whole request
+
+  FIX — filter_restricted_keywords import: main.py always uses the version
+        from product_filter (for title/keyword checks on ingested products);
+        db.filter_restricted_keywords is only called from within db.py itself.
+
+v3.2 changes (translation feature):
+  NEW — /translate-product/{aliexpress_id} endpoint.
+  NEW — GET /translations/{aliexpress_id}
+  NEW — GET /translations/{aliexpress_id}/{language}
 
 v3.1 changes (merchant debug fixes):
-  FIX D — /merchant-debug _on_response now uses _is_valid_response_url()
-           to reject junk recommendation/login/analytics APIs. Same fix
-           applied to the bulk scraper in merchant_scraper.py v8.0.
-  FIX E — Removed dead BLOCKED_SIZE_BYTES reference in /merchant-debug
-           (was removed from merchant_scraper.py in v7.0 but the debug
-           handler still referenced it, causing a NameError on failure).
+  FIX D — /merchant-debug _on_response now uses _is_valid_response_url().
+  FIX E — Removed dead BLOCKED_SIZE_BYTES reference.
 
 v3.1.1 dedup patch:
-  DEDUP-STARTUP — _init_dedup_db() is now called explicitly inside
-                  startup_event() so the SQLite deduplication DB
-                  (dedup.db) is guaranteed to exist and have WAL mode
-                  enabled before the first HTTP request arrives or any
-                  batch thread tries to claim an ID.  Previously the
-                  table was only created at merchant_scraper module-
-                  import time; calling it again at startup is idempotent
-                  (IF NOT EXISTS guard) and removes the theoretical race
-                  where the module is imported but the file isn't flushed
-                  to disk before a thread runs.
+  DEDUP-STARTUP — _init_dedup_db() called inside startup_event().
 """
 
 from fastapi import FastAPI, HTTPException
@@ -29,6 +39,7 @@ from pydantic import BaseModel
 import os
 import sqlite3
 import logging
+import json
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
@@ -36,10 +47,13 @@ from scraper import scrape_search_results, MAX_SEARCH_PAGES
 from product_filter import (
     filter_product,
     filter_products,
-    filter_restricted_keywords,
+    filter_restricted_keywords,   # ← always product_filter's version for keyword checks
     validate_category_confidence,
     reload_filter_data,
 )
+
+# Self-contained translation module (no project-specific deps)
+from translation import translate_product_fields, SUPPORTED_LANGUAGES as _TRANSLATION_LANGS
 
 import uuid
 import random
@@ -53,7 +67,7 @@ from merchant_scraper import (
     get_job_status,
     get_output_path,
     list_all_jobs,
-    stop_job,                        # graceful stop endpoint
+    stop_job,
     _make_context,
     _extract_store_id,
     _JS_DOM_DUMP,
@@ -73,9 +87,6 @@ from merchant_scraper import (
     POLL_TIMEOUT_MS,
     REAL_BLOCK_SIGNALS,
     SCREENSHOTS_DIR,
-    # DEDUP-STARTUP: import the dedup initialiser so startup_event can
-    # call it explicitly — guarantees dedup.db is ready before any
-    # batch thread runs, even if module-level initialisation was delayed.
     _init_dedup_db,
 )
 
@@ -85,7 +96,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Octopia Template Pipeline", version="3.1.1")
+app = FastAPI(title="Octopia Template Pipeline", version="3.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -184,17 +195,9 @@ def startup_event():
         from db import create_all_tables
         create_all_tables()
         SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-
-        # DEDUP-STARTUP: explicitly initialise the deduplication DB so
-        # dedup.db exists and has WAL mode enabled before any batch thread
-        # calls _try_claim_id().  This call is idempotent — the IF NOT
-        # EXISTS guard in _init_dedup_db() makes it safe to call multiple
-        # times (module-import already ran it once; this is a belt-and-
-        # suspenders guarantee at server start).
         _init_dedup_db()
         logger.info("✅ Deduplication DB initialised (dedup.db)")
-
-        logger.info("✅ API Ready — v3.1.1")
+        logger.info("✅ API Ready — v3.3")
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
@@ -208,7 +211,7 @@ def root():
     return {
         "status":  "running",
         "service": "Octopia Template Pipeline",
-        "version": "3.1.1",
+        "version": "3.3",
     }
 
 
@@ -424,6 +427,284 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
         logger.error(f"❌ Error: {e}", exc_info=True)
         return {"success": False, "url": url, "product_id": product_id,
                 "error": str(e), "timestamp": datetime.now().isoformat()}
+
+
+# =============================================================================
+# TRANSLATION ENDPOINTS
+# =============================================================================
+
+def _build_spec_text(product_id: int) -> str:
+    """
+    Build a plain-text specification string for *product_id*.
+
+    Tries enhanced_specifications first; falls back to the raw columns in
+    scraped_products.  Returns an empty string if nothing is found.
+    """
+    spec_columns = [
+        "brand", "color", "dimensions", "weight", "material",
+        "certifications", "country_of_origin", "warranty",
+        "product_type", "age_from", "age_to", "gender",
+    ]
+    scraped_columns = [c for c in spec_columns if c != "gender"]  # scraped_products has no gender
+
+    conn = get_db_connection()
+    try:
+        # 1. Try enhanced_specifications
+        row = conn.execute(
+            f"SELECT {', '.join(spec_columns)} "
+            "FROM enhanced_specifications WHERE product_id = ?",
+            (product_id,),
+        ).fetchone()
+
+        if not row:
+            # 2. Fall back to scraped_products
+            row = conn.execute(
+                f"SELECT {', '.join(scraped_columns)} "
+                "FROM scraped_products WHERE product_id = ?",
+                (product_id,),
+            ).fetchone()
+
+        if not row:
+            return ""
+
+        parts = []
+        for key in row.keys():
+            val = row[key]
+            if val and str(val).strip():
+                parts.append(f"{key.replace('_', ' ').title()}: {val}")
+        return "\n".join(parts)
+
+    except Exception as exc:
+        logger.warning("[translate] Could not build spec text for product %d: %s", product_id, exc)
+        return ""
+    finally:
+        conn.close()
+
+
+@app.post("/translate-product/{aliexpress_id}", tags=["Translation"])
+def translate_product(aliexpress_id: str):
+    """
+    Scrape (or reuse) a product by its AliExpress numeric ID, then translate
+    title, description, and specification into all 5 supported languages:
+    Romanian, German, Portuguese, Spanish, French.
+
+    Each translation is stored as one row in the `translation` table keyed by
+    (url_id, language):
+
+        {
+            "url_id":        <product_id in scraped_products>,
+            "language":      "<language>",
+            "title":         "<translated title>",
+            "description":   "<translated description>",
+            "specification": "<translated specification>"
+        }
+
+    Path parameter
+    --------------
+    aliexpress_id — numeric AliExpress item ID, e.g. 1005006395261235
+
+    Returns
+    -------
+    {
+        "aliexpress_id":        "1005006395261235",
+        "product_id":           42,
+        "url":                  "https://www.aliexpress.com/item/1005006395261235.html",
+        "original_title":       "...",
+        "languages_translated": ["Romanian", "German", ...],
+        "translations": {
+            "Romanian": {"url_id": 42, "language": "Romanian",
+                         "title": "...", "description": "...", "specification": "..."},
+            ...
+        },
+        "timestamp": "2026-..."
+    }
+    """
+    # ── Validate the ID ───────────────────────────────────────────────────────
+    aliexpress_id = aliexpress_id.strip()
+    if not aliexpress_id.isdigit():
+        raise HTTPException(
+            status_code=400,
+            detail="aliexpress_id must be a numeric string, e.g. 1005006395261235",
+        )
+
+    canonical_url = f"https://www.aliexpress.com/item/{aliexpress_id}.html"
+    logger.info("[translate] Requested: %s → %s", aliexpress_id, canonical_url)
+
+    # ── Check if this product is already in the DB ────────────────────────────
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT product_id, title, description FROM scraped_products WHERE url = ?",
+        (canonical_url,),
+    ).fetchone()
+    conn.close()
+
+    if row:
+        product_id  = row["product_id"]
+        title       = row["title"] or ""
+        description = row["description"] or ""
+        logger.info("[translate] Reusing stored product_id=%d", product_id)
+    else:
+        logger.info("[translate] Scraping fresh: %s", canonical_url)
+        result = process_product_complete(canonical_url, extract_compliance=False)
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Scraping failed: {result.get('error', 'unknown error')}",
+            )
+        product_id  = result["product_id"]
+        title       = result.get("enhanced_title") or result.get("original_title", "")
+        description = result.get("enhanced", {}).get("description", "")
+
+    # ── Build specification string ────────────────────────────────────────────
+    spec_text = _build_spec_text(product_id)
+
+    # ── Translate into all supported languages via translation.py ─────────────
+    from db import SUPPORTED_LANGUAGES, insert_translation
+
+    raw_translations = translate_product_fields(
+        title=title,
+        description=description,
+        specification=spec_text,
+        languages=SUPPORTED_LANGUAGES,
+    )
+
+    # ── Persist each language row ─────────────────────────────────────────────
+    saved_translations: Dict[str, Dict] = {}
+    languages_translated: List[str] = []
+
+    for lang, fields in raw_translations.items():
+        data = {
+            "url_id":        product_id,
+            "language":      lang,
+            "title":         fields["title"],
+            "description":   fields["description"],
+            "specification": fields["specification"],
+        }
+        ok = insert_translation(
+            url_id        = data["url_id"],
+            language      = data["language"],
+            title         = data["title"],
+            description   = data["description"],
+            specification = data["specification"],
+        )
+        if ok:
+            languages_translated.append(lang)
+            saved_translations[lang] = data
+        else:
+            logger.warning("[translate] Failed to save %s row for product_id=%d", lang, product_id)
+
+    if not languages_translated:
+        raise HTTPException(
+            status_code=500,
+            detail="All translation attempts failed — check OPENAI_API_KEY or ANTHROPIC_API_KEY",
+        )
+
+    return {
+        "aliexpress_id":        aliexpress_id,
+        "product_id":           product_id,
+        "url":                  canonical_url,
+        "original_title":       title,
+        "languages_translated": languages_translated,
+        "translations":         saved_translations,
+        "timestamp":            datetime.now().isoformat(),
+    }
+
+
+@app.get("/translations/{aliexpress_id}", tags=["Translation"])
+def get_all_translations(aliexpress_id: str):
+    """
+    Return all stored translations for a product.
+
+    Path parameter
+    --------------
+    aliexpress_id — numeric AliExpress item ID (e.g. 1005006395261235)
+
+    Returns a list of translation rows, one per language, each with keys
+    matching the translation table column names:
+        url_id, language, title, description, specification, translated_at
+    """
+    if not aliexpress_id.strip().isdigit():
+        raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
+
+    canonical_url = f"https://www.aliexpress.com/item/{aliexpress_id.strip()}.html"
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT product_id FROM scraped_products WHERE url = ?",
+        (canonical_url,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Product {aliexpress_id} not found. "
+                f"Call POST /translate-product/{aliexpress_id} first."
+            ),
+        )
+
+    from db import get_translations
+    translations = get_translations(row["product_id"])
+    return {
+        "aliexpress_id": aliexpress_id,
+        "product_id":    row["product_id"],
+        "count":         len(translations),
+        "translations":  translations,
+    }
+
+
+@app.get("/translations/{aliexpress_id}/{language}", tags=["Translation"])
+def get_single_translation(aliexpress_id: str, language: str):
+    """
+    Return one translation row for a specific product + language.
+
+    Path parameters
+    ---------------
+    aliexpress_id — numeric AliExpress item ID
+    language      — one of: Romanian, German, Portuguese, Spanish, French
+                    (case-sensitive)
+
+    Returns a dict with keys matching the translation table column names:
+        url_id, language, title, description, specification, translated_at
+    """
+    from db import SUPPORTED_LANGUAGES, get_translation
+
+    if not aliexpress_id.strip().isdigit():
+        raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
+
+    if language not in SUPPORTED_LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language '{language}'. Supported: {SUPPORTED_LANGUAGES}",
+        )
+
+    canonical_url = f"https://www.aliexpress.com/item/{aliexpress_id.strip()}.html"
+    conn = get_db_connection()
+    row = conn.execute(
+        "SELECT product_id FROM scraped_products WHERE url = ?",
+        (canonical_url,),
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Product {aliexpress_id} not found. "
+                f"Call POST /translate-product/{aliexpress_id} first."
+            ),
+        )
+
+    translation = get_translation(row["product_id"], language)
+    if not translation:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No {language} translation found for product {aliexpress_id}. "
+                f"Call POST /translate-product/{aliexpress_id} first."
+            ),
+        )
+    return translation
 
 
 # =============================================================================
@@ -765,27 +1046,12 @@ def list_merchant_jobs():
 
 @app.post("/merchant-stop/{job_id}", tags=["Merchant Bulk"])
 def stop_merchant_job(job_id: str):
-    """
-    Gracefully stop a running or queued bulk merchant job.
-
-    The currently-scraping merchant will finish before the job halts —
-    it is NOT killed mid-request. All batches completed so far are saved
-    and immediately downloadable via /merchant-download/{job_id}.
-
-    Status transitions:
-      running  → stopping  (stop signal sent, waiting for current merchant)
-      stopping → stopped   (job thread exits after current merchant)
-      queued   → stopped   (job cancelled before it started)
-      done     → 409 error (already finished)
-      stopped  → 409 error (already stopped)
-
-    Example:
-      POST /merchant-stop/52e3f877-3c97-4738-bc10-0e4291979166
-    """
+    """Gracefully stop a running or queued bulk merchant job."""
     result = stop_job(job_id)
     if not result.get("success"):
         status_code = 404 if "not found" in result.get("error", "").lower() else 409
-        raise HTTPException(status_code=status_code, detail=result.get("error", "Could not stop job"))
+        raise HTTPException(status_code=status_code,
+                            detail=result.get("error", "Could not stop job"))
     return result
 
 
@@ -808,27 +1074,11 @@ def serve_merchant_screenshot(filename: str):
 
 # =============================================================================
 # MERCHANT DEBUG  v6.0
-# FIX D: _on_response now uses _is_valid_response_url() to reject junk APIs
-# FIX E: removed dead BLOCKED_SIZE_BYTES reference
 # =============================================================================
 
 @app.post("/merchant-debug", tags=["Merchant Bulk"])
 def merchant_debug(req: MerchantDebugRequest):
-    """
-    DEBUG v6.0 — scrape ONE merchant with full diagnostics.
-
-    FIX D: Response interception now rejects recommendation, login, analytics,
-    and ad APIs. Previously, recom-acs.aliexpress.com responses containing
-    expandMaxNumOfRow=8 were winning over the correct store count.
-
-    FIX E: Removed BLOCKED_SIZE_BYTES (deleted in scraper v7.0, was still
-    referenced here causing a NameError on the failure path).
-
-    Three extraction layers tried in order:
-      1. JSON API response bodies (validated URLs only)
-      2. Hydrated window globals (__NEXT_DATA__, runParams, etc.)
-      3. Broad DOM text poll (60 s)
-    """
+    """DEBUG v6.0 — scrape ONE merchant with full diagnostics."""
     from camoufox.sync_api import Camoufox
 
     merchant_id = str(req.merchant_id).strip()
@@ -865,7 +1115,6 @@ def merchant_debug(req: MerchantDebugRequest):
             ctx  = _make_context(browser, ua, merchant_id)
             page = ctx.new_page()
 
-            # ── Layer 1: capture JSON response bodies ─────────────────────────
             response_hits: List[Dict] = []
             landed_id = input_id
 
@@ -873,27 +1122,18 @@ def merchant_debug(req: MerchantDebugRequest):
                 try:
                     ct    = (resp.headers or {}).get("content-type", "")
                     url_r = resp.url
-
-                    # FIX D: reject junk URLs — same filter as bulk scraper
                     if not _is_valid_response_url(url_r, ct):
                         return
-
                     data = None
                     try:
                         data = resp.json()
                     except Exception:
                         pass
-
                     if data is not None:
                         cand = _best_count_from_json(data, expected_ids={input_id, landed_id})
                         if cand:
-                            response_hits.append({
-                                "source": "response",
-                                "url":    url_r,
-                                **cand
-                            })
+                            response_hits.append({"source": "response", "url": url_r, **cand})
                     else:
-                        # Text / JSONP fallback
                         try:
                             raw_text = resp.text()
                             for pattern in RAW_HTML_COUNT_PATTERNS:
@@ -903,10 +1143,8 @@ def merchant_debug(req: MerchantDebugRequest):
                                     if 1 <= val <= 500_000:
                                         response_hits.append({
                                             "source": "response_text_regex",
-                                            "url":    url_r,
-                                            "count":  val,
-                                            "path":   "raw_text_regex",
-                                            "score":  15,
+                                            "url": url_r, "count": val,
+                                            "path": "raw_text_regex", "score": 15,
                                         })
                                         break
                         except Exception:
@@ -916,7 +1154,6 @@ def merchant_debug(req: MerchantDebugRequest):
 
             page.on("response", _on_response)
 
-            # ── Navigate ──────────────────────────────────────────────────────
             try:
                 page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
                 debug["page_loaded"] = True
@@ -942,43 +1179,35 @@ def merchant_debug(req: MerchantDebugRequest):
                     return {"success": False, "merchant_id": merchant_id,
                             "total_items": None, "error": f"Nav: {es[:150]}", "debug": debug}
 
-            # ── Detect alias ──────────────────────────────────────────────────
             landed_id = _extract_store_id(page.url) or input_id
             if landed_id != input_id:
                 debug["alias_warning"]      = f"AliExpress canonicalised {input_id} → {landed_id}"
                 debug["canonical_store_id"] = landed_id
-                logger.info(f"[debug] {merchant_id} alias: {debug['alias_warning']}")
 
-            # ── networkidle ───────────────────────────────────────────────────
             try:
                 page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
                 debug["networkidle"] = "reached"
             except Exception:
                 debug["networkidle"] = "timeout"
 
-            # ── Scroll ────────────────────────────────────────────────────────
             for _ in range(3):
                 page.mouse.wheel(0, 600)
                 page.wait_for_timeout(400)
             page.wait_for_timeout(1_000)
 
-            # Re-read alias after JS settle
             landed_id = _extract_store_id(page.url) or landed_id
             debug["canonical_store_id"] = landed_id
             if landed_id != input_id and not debug.get("alias_warning"):
                 debug["alias_warning"] = f"AliExpress canonicalised {input_id} → {landed_id}"
 
-            # ── Layer 2: hydrated globals ─────────────────────────────────────
             global_hits: List[Dict] = []
             try:
                 global_hits = page.evaluate(_JS_GLOBAL_CANDIDATES, [input_id, landed_id])
             except Exception as e:
                 logger.debug(f"[debug] global scan failed: {e}")
 
-            # ── Layer 3: DOM poll (60s) ───────────────────────────────────────
             polled = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
 
-            # ── DOM dump ─────────────────────────────────────────────────────
             try:
                 debug["dom_dump"] = page.evaluate(_JS_DOM_DUMP)
             except Exception as e:
@@ -993,8 +1222,6 @@ def merchant_debug(req: MerchantDebugRequest):
             html = page.content()
             debug["html_size_bytes"] = len(html)
             lower = html.lower()
-
-            # ── Check real block/CAPTCHA ──────────────────────────────────────
             debug["blocked"] = any(sig in lower for sig in REAL_BLOCK_SIGNALS)
 
             if debug["blocked"]:
@@ -1008,7 +1235,6 @@ def merchant_debug(req: MerchantDebugRequest):
             page.close()
             ctx.close()
 
-            # ── Pick best count across all layers ─────────────────────────────
             best_count:  Optional[int] = None
             best_source: Optional[str] = None
 
@@ -1034,11 +1260,7 @@ def merchant_debug(req: MerchantDebugRequest):
                     "debug":              debug,
                 }
 
-            # ── Nothing found ─────────────────────────────────────────────────
-            # FIX E: removed BLOCKED_SIZE_BYTES reference (was NameError).
-            # If we get here, just report the selector missing for investigation.
             debug["html_head_500"] = html[:500].replace("\n", " ")
-
             return {
                 "success":            False,
                 "merchant_id":        input_id,
@@ -1151,7 +1373,8 @@ def get_stats():
             "scraped_products", "mapped_products", "template_outputs",
             "processing_logs", "category_assignments", "enhanced_content",
             "original_specifications", "enhanced_specifications",
-            "specification_audit_log", "seller_info", "compliance_info"
+            "specification_audit_log", "seller_info", "compliance_info",
+            "translation",
         ]
         stats = {}
         for table in tables:
@@ -1185,6 +1408,6 @@ def view_processing_logs(limit: int = 500):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v3.1.1")
+    logger.info("🚀 Octopia Template Pipeline v3.3")
     logger.info(f"📡 Server: http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
