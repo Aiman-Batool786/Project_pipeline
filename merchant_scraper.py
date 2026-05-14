@@ -1044,7 +1044,34 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
 
     logger.info(f"[job:{job_id}] {'⛔ Stopped' if was_stopped else '✓ Complete'} — {meta['batches_done']} ok | {meta['batches_failed']} failed")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DEDUP DB INIT
+# ─────────────────────────────────────────────────────────────────────────────
 
+DEDUP_DB_PATH = Path("./dedup.db")
+
+def _init_dedup_db() -> None:
+    """
+    Initialise the deduplication SQLite database (dedup.db).
+    Creates the processed_ids table if it doesn't exist and enables
+    WAL mode for safe concurrent access from multiple threads.
+    Safe to call multiple times — CREATE TABLE IF NOT EXISTS guard.
+    """
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(str(DEDUP_DB_PATH), check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS processed_ids (
+                id           TEXT PRIMARY KEY,
+                job_id       TEXT,
+                processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        logger.info(f"[dedup] DB initialised at {DEDUP_DB_PATH}")
+    finally:
+        conn.close()
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────────────────────
