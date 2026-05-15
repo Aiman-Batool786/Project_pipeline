@@ -1,5 +1,5 @@
 """
-db.py — Complete schema with all tables including restricted_keywords.
+db.py — Complete schema with all tables.
 
 Tables:
   categories              — Octopia category tree with embeddings
@@ -15,13 +15,12 @@ Tables:
   enhanced_specifications — Specs after OpenAI enhancement
   specification_audit_log — Diff: original vs enhanced vs template
   restricted_keywords     — Keywords forbidden in descriptions / specs
-                            (loaded from desc_and_spec_restricted_keywords CSV)
+  restricted_categories   — Product categories that are forbidden/restricted
   processed_ids           — Global deduplication table for merchant scraper
-                            (mirrors the table in dedup.db — kept here so
-                            create_all_tables() is the single authoritative
-                            schema call at startup)
   translation             — Per-language translations of title, description,
-                            and specification for each product
+                            and specification for each product.
+                            Supported: Romanian, German, Portuguese, Spanish, French.
+                            One row per (url_id, language) pair.
 """
 
 import sqlite3
@@ -42,6 +41,7 @@ def create_all_tables():
     conn   = create_connection()
     cursor = conn.cursor()
 
+    # ── CATEGORIES ─────────────────────────────────────────────────────────
     try:
         cursor.execute("ALTER TABLE categories RENAME TO categories_old")
     except sqlite3.OperationalError:
@@ -54,6 +54,7 @@ def create_all_tables():
         embedding     BLOB
     )""")
 
+    # ── SCRAPED PRODUCTS ────────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS scraped_products (
         product_id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,6 +86,7 @@ def create_all_tables():
         scraped_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
+    # ── SELLER INFO ─────────────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS seller_info (
         id                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,6 +109,7 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
+    # ── COMPLIANCE INFO ─────────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS compliance_info (
         id                       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,6 +128,7 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
+    # ── ENHANCED CONTENT ────────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS enhanced_content (
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,6 +150,20 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
+    # Migration: add spec columns if this table was created before they were added
+    _add_columns_if_missing(cursor, "enhanced_content", [
+        ("brand",             "TEXT"),
+        ("color",             "TEXT"),
+        ("dimensions",        "TEXT"),
+        ("weight",            "TEXT"),
+        ("material",          "TEXT"),
+        ("certifications",    "TEXT"),
+        ("country_of_origin", "TEXT"),
+        ("warranty",          "TEXT"),
+        ("product_type",      "TEXT"),
+    ])
+
+    # ── CATEGORY ASSIGNMENTS ────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS category_assignments (
         id                     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +176,7 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
+    # ── MAPPED PRODUCTS ─────────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS mapped_products (
         id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,6 +203,7 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
+    # ── TEMPLATE OUTPUTS ────────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS template_outputs (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -198,6 +218,7 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
+    # ── PROCESSING LOGS ─────────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS processing_logs (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,6 +231,7 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
+    # ── ORIGINAL SPECIFICATIONS ─────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS original_specifications (
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -231,6 +253,7 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
+    # ── ENHANCED SPECIFICATIONS ─────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS enhanced_specifications (
         id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -252,6 +275,7 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
+    # ── SPECIFICATION AUDIT LOG ─────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS specification_audit_log (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -266,10 +290,7 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # ── RESTRICTED KEYWORDS TABLE ──────────────────────────────────────────
-    # Stores keywords that must NOT appear in descriptions or specifications.
-    # Source: desc_and_spec_restricted_keywords CSV column.
-    # Usage: filter_restricted_keywords() in openai_client.py or data_mapper.py
+    # ── RESTRICTED KEYWORDS ─────────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS restricted_keywords (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -277,17 +298,9 @@ def create_all_tables():
         embedding  BLOB,
         added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
+    _add_columns_if_missing(cursor, "restricted_keywords", [("embedding", "BLOB")])
 
-    # Migration: add embedding column if this table already exists without it
-    try:
-        cursor.execute("ALTER TABLE restricted_keywords ADD COLUMN embedding BLOB")
-    except Exception:
-        pass  # Column already exists — safe to ignore
-
-    # ── RESTRICTED CATEGORIES TABLE ────────────────────────────────────────
-    # Stores product categories that are forbidden/restricted.
-    # Embeddings stored as BLOB (pickle) for cosine similarity matching.
-    # Populated by: python restricted_category_embeddings.py
+    # ── RESTRICTED CATEGORIES ───────────────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS restricted_categories (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -296,9 +309,9 @@ def create_all_tables():
         added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    # ── TRANSLATION TABLE ──────────────────────────────────────────────────
-    # Stores per-language translations of title, description, and
-    # specification for each product.
+    # ── TRANSLATION ─────────────────────────────────────────────────────────
+    # One row per (url_id, language) pair.
+    # Supported languages: Romanian, German, Portuguese, Spanish, French.
     # Populated by: POST /translate-product/{aliexpress_id}
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS translation (
@@ -313,25 +326,7 @@ def create_all_tables():
         FOREIGN KEY (url_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # ── PROCESSED IDS TABLE (DEDUPLICATION) ───────────────────────────────
-    # Global deduplication table for the merchant bulk scraper.
-    #
-    # The merchant_scraper module keeps its own copy of this table in a
-    # separate file (dedup.db) so it survives independently of this DB.
-    # We also create it here so that create_all_tables() — called at
-    # FastAPI startup — guarantees the table exists in products.db as a
-    # fallback reference and for any tooling that queries products.db
-    # directly.
-    #
-    # The PRIMARY KEY on `id` enforces uniqueness at the DB level.
-    # _try_claim_id() in merchant_scraper.py uses INSERT OR IGNORE inside
-    # an EXCLUSIVE transaction to atomically claim an ID — exactly one
-    # thread/process wins the race; all others see rowcount == 0 and skip.
-    #
-    # Schema mirrors dedup.db so the two files stay in sync:
-    #   id           — merchant store ID (numeric string)
-    #   job_id       — UUID of the bulk job that first processed this ID
-    #   processed_at — wall-clock time of first claim (auto-set by SQLite)
+    # ── PROCESSED IDS (DEDUPLICATION) ──────────────────────────────────────
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS processed_ids (
         id           TEXT PRIMARY KEY,
@@ -341,7 +336,139 @@ def create_all_tables():
 
     conn.commit()
     conn.close()
-    print("All tables created (including restricted_keywords, restricted_categories, translation, and processed_ids)")
+    print("All tables created (including restricted_keywords, restricted_categories, "
+          "translation, and processed_ids)")
+
+
+# ---------------------------------------------------------------------------
+# Internal migration helper
+# ---------------------------------------------------------------------------
+
+def _add_columns_if_missing(cursor, table: str, columns: list) -> None:
+    """
+    Add each (column_name, column_type) pair to *table* if it does not
+    already exist.  Silently skips columns that are already present.
+    Safe to call on every startup — it is idempotent.
+    """
+    for col_name, col_type in columns:
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+
+# =============================================================================
+# TRANSLATION HELPERS
+# =============================================================================
+
+def insert_translation(
+    url_id: int,
+    language: str,
+    title: str = "",
+    description: str = "",
+    specification: str = "",
+) -> bool:
+    """
+    Insert or update one translation row for (url_id, language).
+
+    Column-name dict convention (matches table schema exactly):
+        {
+            "url_id":        url_id,
+            "language":      language,
+            "title":         title,
+            "description":   description,
+            "specification": specification,
+        }
+
+    Returns True on success, False on any error.
+    """
+    conn = create_connection()
+    try:
+        conn.execute("""
+            INSERT INTO translation (url_id, language, title, description, specification)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(url_id, language) DO UPDATE SET
+                title         = excluded.title,
+                description   = excluded.description,
+                specification = excluded.specification,
+                translated_at = datetime('now')
+        """, (url_id, language, title or "", description or "", specification or ""))
+        conn.commit()
+        print(f"[db] Translation saved (url_id={url_id}, language={language})")
+        return True
+    except Exception as exc:
+        print(f"[db] insert_translation error: {exc}")
+        return False
+    finally:
+        conn.close()
+
+
+def get_translations(url_id: int) -> list:
+    """
+    Return all translation rows for *url_id* as a list of dicts.
+    Each dict key matches the translation table column name exactly.
+    Returns [] if no rows exist or on error.
+    """
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT url_id, language, title, description, specification, translated_at "
+            "FROM translation WHERE url_id = ? ORDER BY language",
+            (url_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        print(f"[db] get_translations error: {exc}")
+        return []
+    finally:
+        conn.close()
+
+
+def get_translation(url_id: int, language: str) -> Optional[dict]:
+    """
+    Return one translation row for (url_id, language) as a dict, or None.
+    Dict keys match the translation table column names exactly.
+    """
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT url_id, language, title, description, specification, translated_at "
+            "FROM translation WHERE url_id = ? AND language = ?",
+            (url_id, language),
+        ).fetchone()
+        return dict(row) if row else None
+    except Exception as exc:
+        print(f"[db] get_translation error: {exc}")
+        return None
+    finally:
+        conn.close()
+
+
+def delete_translations(url_id: int, language: str = None) -> int:
+    """
+    Delete translation rows for *url_id*.
+    If *language* is given, delete only that language row.
+    If *language* is None, delete all rows for this product.
+    Returns the number of rows deleted.
+    """
+    conn = create_connection()
+    try:
+        if language:
+            conn.execute(
+                "DELETE FROM translation WHERE url_id = ? AND language = ?",
+                (url_id, language),
+            )
+        else:
+            conn.execute("DELETE FROM translation WHERE url_id = ?", (url_id,))
+        conn.commit()
+        return conn.execute("SELECT changes()").fetchone()[0]
+    except Exception as exc:
+        print(f"[db] delete_translations error: {exc}")
+        return 0
+    finally:
+        conn.close()
 
 
 # =============================================================================
@@ -350,19 +477,13 @@ def create_all_tables():
 
 def load_restricted_keywords_from_csv(csv_path: str) -> int:
     """
-    Load restricted keywords from the CSV file into the restricted_keywords table.
+    Load restricted keywords from a CSV file into the restricted_keywords table.
 
-    CSV format (column name: desc_and_spec_restricted_keywords):
-        "desc_and_spec_restricted_keywords"
-        "shipping"
-        "free shipping"
-        ...
+    CSV must have a column named 'desc_and_spec_restricted_keywords'.
+    Returns the number of new keywords inserted.
 
-    Returns number of keywords inserted.
-
-    HOW TO RUN:
-        python -c "from db import load_restricted_keywords_from_csv; \
-                   load_restricted_keywords_from_csv('restricted_keywords.csv')"
+    CLI usage:
+        python db.py load-keywords restricted_keywords.csv
     """
     if not os.path.exists(csv_path):
         print(f"[db] CSV not found: {csv_path}")
@@ -377,7 +498,6 @@ def load_restricted_keywords_from_csv(csv_path: str) -> int:
         with open(csv_path, newline='', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                # Accept the column with or without quotes in header
                 keyword = (
                     row.get('desc_and_spec_restricted_keywords') or
                     row.get('"desc_and_spec_restricted_keywords"') or
@@ -393,38 +513,31 @@ def load_restricted_keywords_from_csv(csv_path: str) -> int:
                         "INSERT OR IGNORE INTO restricted_keywords (keyword) VALUES (?)",
                         (keyword,)
                     )
-                    if cursor.rowcount > 0:
-                        count += 1
-                    else:
-                        skipped += 1
+                    count   += cursor.rowcount
+                    skipped += 1 - cursor.rowcount
                 except Exception:
                     skipped += 1
 
         conn.commit()
-        print(f"[db] Restricted keywords loaded: {count} inserted, {skipped} skipped (duplicates)")
+        print(f"[db] Keywords loaded: {count} inserted, {skipped} skipped (duplicates)")
         return count
 
-    except Exception as e:
-        print(f"[db] Error loading restricted keywords: {e}")
+    except Exception as exc:
+        print(f"[db] Error loading restricted keywords: {exc}")
         return 0
     finally:
         conn.close()
 
 
 def get_restricted_keywords() -> list:
-    """
-    Return all restricted keywords as a lowercase list.
-    Used by filter_restricted_keywords() for fast in-memory filtering.
-    Cached at module level after first call.
-    """
+    """Return all restricted keywords as a lowercase list."""
     conn = create_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("SELECT keyword FROM restricted_keywords")
-        rows = cursor.fetchall()
-        return [row[0].lower().strip() for row in rows if row[0]]
-    except Exception as e:
-        print(f"[db] Error reading restricted keywords: {e}")
+        return [row[0].lower().strip() for row in cursor.fetchall() if row[0]]
+    except Exception as exc:
+        print(f"[db] Error reading restricted keywords: {exc}")
         return []
     finally:
         conn.close()
@@ -432,28 +545,14 @@ def get_restricted_keywords() -> list:
 
 def filter_restricted_keywords(text: str, keywords: list = None) -> tuple:
     """
-    Scan text for restricted keywords.
+    Scan *text* for restricted keywords and replace matches with '[REMOVED]'.
 
     Args:
-        text:     The text to scan (description, spec value, bullet point, etc.)
-        keywords: Pre-loaded keyword list (pass in to avoid repeated DB calls).
-                  If None, loads from DB.
+        text:     Text to scan (description, spec, bullet point, …).
+        keywords: Pre-loaded keyword list; fetched from DB if None.
 
     Returns:
         (cleaned_text, found_keywords_list)
-        - cleaned_text: text with restricted phrases replaced by '[REMOVED]'
-        - found_keywords_list: list of matched keywords (empty if none)
-
-    Usage in openai_client.py / data_mapper.py:
-        from db import get_restricted_keywords, filter_restricted_keywords
-
-        # Load once at startup
-        RESTRICTED = get_restricted_keywords()
-
-        # Use per field
-        clean_desc, flagged = filter_restricted_keywords(description, RESTRICTED)
-        if flagged:
-            logger.warning(f"Restricted keywords found: {flagged}")
     """
     if not text:
         return text, []
@@ -465,13 +564,12 @@ def filter_restricted_keywords(text: str, keywords: list = None) -> tuple:
     cleaned = text
 
     for kw in keywords:
-        # Case-insensitive whole-phrase match
         pattern = re.compile(re.escape(kw), re.IGNORECASE)
         if pattern.search(cleaned):
             found.append(kw)
             cleaned = pattern.sub('[REMOVED]', cleaned)
 
-    return cleaned, found  # ← FIX: was missing in original
+    return cleaned, found
 
 
 # =============================================================================
@@ -479,59 +577,40 @@ def filter_restricted_keywords(text: str, keywords: list = None) -> tuple:
 # =============================================================================
 
 def get_processed_ids(job_id: str = None) -> list:
-    """
-    Return processed merchant IDs from products.db.
-
-    Args:
-        job_id: If provided, filter to only that job's IDs.
-                If None, return all processed IDs across all jobs.
-
-    Returns:
-        List of merchant ID strings.
-
-    Useful for reporting / auditing from the main products DB without
-    having to open the separate dedup.db file.
-    """
+    """Return processed merchant IDs, optionally filtered by job_id."""
     conn = create_connection()
     try:
         cursor = conn.cursor()
         if job_id:
             cursor.execute(
                 "SELECT id FROM processed_ids WHERE job_id = ? ORDER BY processed_at",
-                (job_id,)
+                (job_id,),
             )
         else:
             cursor.execute("SELECT id FROM processed_ids ORDER BY processed_at")
         return [row[0] for row in cursor.fetchall()]
-    except Exception as e:
-        print(f"[db] Error reading processed_ids: {e}")
+    except Exception as exc:
+        print(f"[db] Error reading processed_ids: {exc}")
         return []
     finally:
         conn.close()
 
 
 def get_processed_id_count(job_id: str = None) -> int:
-    """
-    Return the count of processed merchant IDs.
-
-    Args:
-        job_id: If provided, count only IDs for that job.
-                If None, count all IDs across all jobs.
-    """
+    """Return count of processed merchant IDs, optionally filtered by job_id."""
     conn = create_connection()
     try:
         cursor = conn.cursor()
         if job_id:
             cursor.execute(
-                "SELECT COUNT(*) FROM processed_ids WHERE job_id = ?",
-                (job_id,)
+                "SELECT COUNT(*) FROM processed_ids WHERE job_id = ?", (job_id,)
             )
         else:
             cursor.execute("SELECT COUNT(*) FROM processed_ids")
         row = cursor.fetchone()
         return row[0] if row else 0
-    except Exception as e:
-        print(f"[db] Error counting processed_ids: {e}")
+    except Exception as exc:
+        print(f"[db] Error counting processed_ids: {exc}")
         return 0
     finally:
         conn.close()
@@ -581,7 +660,6 @@ def insert_seller_info(product_id: int, seller_data: dict) -> bool:
         print(f"Seller info saved (product_id={product_id})")
         return True
     except sqlite3.IntegrityError:
-        # Update existing record
         cursor.execute("""
             UPDATE seller_info SET
                 store_name=?, store_id=?, store_url=?, seller_id=?,
@@ -610,8 +688,8 @@ def insert_seller_info(product_id: int, seller_data: dict) -> bool:
         conn.commit()
         print(f"Seller info updated (product_id={product_id})")
         return True
-    except Exception as e:
-        print(f"Seller info error: {e}")
+    except Exception as exc:
+        print(f"Seller info error: {exc}")
         return False
     finally:
         conn.close()
@@ -665,8 +743,8 @@ def insert_compliance_info(product_id: int, compliance_data: dict) -> bool:
         if cursor.rowcount > 0:
             print(f"Compliance info saved (product_id={product_id})")
         return True
-    except Exception as e:
-        print(f"Compliance info error: {e}")
+    except Exception as exc:
+        print(f"Compliance info error: {exc}")
         return False
     finally:
         conn.close()
@@ -689,7 +767,7 @@ def get_compliance_info(product_id: int) -> list:
 # SCRAPED PRODUCTS
 # =============================================================================
 
-def insert_scraped_product(url, attributes):
+def insert_scraped_product(url: str, attributes: dict):
     conn   = create_connection()
     cursor = conn.cursor()
     try:
@@ -727,7 +805,7 @@ def insert_scraped_product(url, attributes):
             attributes.get("warranty", ""),
             attributes.get("product_type", ""),
             attributes.get("store_name", ""),
-            json.dumps(attributes)
+            json.dumps(attributes),
         ))
         conn.commit()
         product_id = cursor.lastrowid
@@ -739,15 +817,15 @@ def insert_scraped_product(url, attributes):
         product_id = row[0] if row else None
         print(f"Product already exists (product_id={product_id})")
         return product_id
-    except Exception as e:
-        print(f"Error inserting scraped product: {e}")
+    except Exception as exc:
+        print(f"Error inserting scraped product: {exc}")
         return None
     finally:
         conn.close()
 
 
 # =============================================================================
-# REMAINING FUNCTIONS (unchanged)
+# CATEGORY ASSIGNMENT
 # =============================================================================
 
 def insert_category_assignment(product_id, orig_cat_id, orig_cat_name,
@@ -768,6 +846,10 @@ def insert_category_assignment(product_id, orig_cat_id, orig_cat_name,
     finally:
         conn.close()
 
+
+# =============================================================================
+# MAPPED PRODUCTS
+# =============================================================================
 
 def insert_mapped_product(product_id, category_id, mapped_data):
     conn   = create_connection()
@@ -797,17 +879,21 @@ def insert_mapped_product(product_id, category_id, mapped_data):
             mapped_data.get("47456", ""),
             mapped_data.get("37937", ""),
             mapped_data.get("6587", ""),
-            json.dumps({k: v for k, v in mapped_data.items()})
+            json.dumps({k: v for k, v in mapped_data.items()}),
         ))
         conn.commit()
         print(f"Mapped product saved (product_id={product_id})")
         return True
-    except Exception as e:
-        print(f"Mapped product error: {e}")
+    except Exception as exc:
+        print(f"Mapped product error: {exc}")
         return False
     finally:
         conn.close()
 
+
+# =============================================================================
+# TEMPLATE OUTPUT
+# =============================================================================
 
 def insert_template_output(product_id, category_id, output_type,
                             file_path, file_name, status="success"):
@@ -821,12 +907,16 @@ def insert_template_output(product_id, category_id, output_type,
         """, (product_id, category_id, output_type, file_path, file_name, status))
         conn.commit()
         return True
-    except Exception as e:
-        print(f"Template output error: {e}")
+    except Exception as exc:
+        print(f"Template output error: {exc}")
         return False
     finally:
         conn.close()
 
+
+# =============================================================================
+# PROCESSING LOGS
+# =============================================================================
 
 def log_processing(product_id, url, step, status, message=""):
     conn   = create_connection()
@@ -837,11 +927,15 @@ def log_processing(product_id, url, step, status, message=""):
             VALUES (?, ?, ?, ?, ?)
         """, (product_id, url, step, status, message))
         conn.commit()
-    except Exception as e:
-        print(f"Log error: {e}")
+    except Exception as exc:
+        print(f"Log error: {exc}")
     finally:
         conn.close()
 
+
+# =============================================================================
+# SPECIFICATIONS
+# =============================================================================
 
 SPEC_FIELDS = [
     'brand', 'color', 'dimensions', 'weight', 'material',
@@ -874,15 +968,15 @@ def insert_enhanced_content(product_id, enhanced_data):
             enhanced_data.get('certifications', ''),
             enhanced_data.get('country_of_origin', ''),
             enhanced_data.get('warranty', ''),
-            enhanced_data.get('product_type', '')
+            enhanced_data.get('product_type', ''),
         ))
         conn.commit()
         print(f"Enhanced content saved (product_id={product_id})")
         return True
     except sqlite3.IntegrityError:
         return False
-    except Exception as e:
-        print(f"Enhanced content error: {e}")
+    except Exception as exc:
+        print(f"Enhanced content error: {exc}")
         return False
     finally:
         conn.close()
@@ -911,15 +1005,15 @@ def insert_original_specifications(product_id, original_specs):
             original_specs.get("product_type", ""),
             original_specs.get("age_from", ""),
             original_specs.get("age_to", ""),
-            original_specs.get("gender", "")
+            original_specs.get("gender", ""),
         ))
         conn.commit()
         print(f"Original specs saved (product_id={product_id})")
         return True
     except sqlite3.IntegrityError:
         return False
-    except Exception as e:
-        print(f"Original specs error: {e}")
+    except Exception as exc:
+        print(f"Original specs error: {exc}")
         return False
     finally:
         conn.close()
@@ -948,15 +1042,15 @@ def insert_enhanced_specifications(product_id, enhanced_specs):
             enhanced_specs.get("product_type", ""),
             enhanced_specs.get("age_from", ""),
             enhanced_specs.get("age_to", ""),
-            enhanced_specs.get("gender", "")
+            enhanced_specs.get("gender", ""),
         ))
         conn.commit()
         print(f"Enhanced specs saved (product_id={product_id})")
         return True
     except sqlite3.IntegrityError:
         return False
-    except Exception as e:
-        print(f"Enhanced specs error: {e}")
+    except Exception as exc:
+        print(f"Enhanced specs error: {exc}")
         return False
     finally:
         conn.close()
@@ -975,8 +1069,8 @@ def log_specification_audit(product_id, spec_field, original_value,
         """, (product_id, spec_field, original_value or "",
               enhanced_value or "", template_value or "", source_used, notes))
         conn.commit()
-    except Exception as e:
-        print(f"Audit log error: {e}")
+    except Exception as exc:
+        print(f"Audit log error: {exc}")
     finally:
         conn.close()
 
@@ -996,78 +1090,22 @@ def log_all_spec_audits(product_id, scraped_data, specs_enhanced, enriched_data_
     print(f"Audit log written (product_id={product_id})")
 
 
-# Backward compat
+# =============================================================================
+# BACKWARD COMPAT
+# =============================================================================
+
 def create_table():
     create_all_tables()
+
 
 def create_categories_table():
     pass
 
 
 # =============================================================================
-# TRANSLATION HELPERS
+# CLI
 # =============================================================================
 
-def insert_translation(url_id: int, language: str, title: str,
-                       description: str, specification: str) -> bool:
-    """
-    Insert or replace one translation row for (url_id, language).
-    Returns True on success, False on failure.
-    """
-    try:
-        conn = create_connection()
-        conn.execute("""
-            INSERT INTO translation (url_id, language, title, description, specification)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(url_id, language) DO UPDATE SET
-                title         = excluded.title,
-                description   = excluded.description,
-                specification = excluded.specification,
-                translated_at = datetime('now')
-        """, (url_id, language, title, description, specification))
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        print(f"[db] insert_translation error: {e}")
-        return False
-
-
-def get_translations(url_id: int) -> list:
-    """Return all translation rows for a given product_id."""
-    try:
-        conn = create_connection()
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM translation WHERE url_id = ? ORDER BY language",
-            (url_id,)
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        print(f"[db] get_translations error: {e}")
-        return []
-
-
-def get_translation(url_id: int, language: str) -> Optional[dict]:
-    """Return one translation row for (product_id, language), or None."""
-    try:
-        conn = create_connection()
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM translation WHERE url_id = ? AND language = ?",
-            (url_id, language)
-        ).fetchone()
-        conn.close()
-        return dict(row) if row else None
-    except Exception as e:
-        print(f"[db] get_translation error: {e}")
-        return None
-
-
-# =============================================================================
-# CLI — load restricted keywords directly
-# =============================================================================
 if __name__ == '__main__':
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == 'load-keywords':
