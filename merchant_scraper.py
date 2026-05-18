@@ -1,41 +1,7 @@
 """
-merchant_scraper.py  v9.0  — Tor Proxy + Anti-Detection Hardening
-═══════════════════════════════════════════════════════════════════
-CHANGES FROM v8.0:
-
-  TOR-1  — Tor SOCKS5 proxy support added. Each merchant attempt uses
-            the proxy if TOR_ENABLED=True. On CAPTCHA or block, a new
-            Tor circuit is requested via the control port before retry.
-            Config: TOR_SOCKS_HOST, TOR_SOCKS_PORT, TOR_CONTROL_PORT,
-                    TOR_CONTROL_PASSWORD, TOR_ENABLED.
-
-  TOR-2  — _new_tor_circuit() sends SIGNAL NEWNYM to the Tor control
-            port to get a fresh exit node before each retry after block.
-
-  TOR-3  — Browser context now passes proxy settings when Tor is enabled.
-            Camoufox os rotated randomly per attempt (windows/macos/linux)
-            for better fingerprint diversity.
-
-  TOR-4  — CAPTCHA/block retry wait reduced to 5-10s (was 30-60s) because
-            with a new Tor circuit the IP changes immediately.
-
-  TOR-5  — NS_BINDING_ABORTED now triggers circuit rotation + retry instead
-            of propagating as an error. This was causing ~10% failures.
-
-  TOR-6  — Inter-merchant delay reduced: DELAY_MIN=5s, DELAY_MAX=12s when
-            Tor enabled (was 10-25s). Circuit rotation provides IP diversity
-            so tight timing is less of a signal.
-
-  RETRY-1 — MAX_RETRIES raised to 4 (was 3) to account for one circuit
-             rotation attempt.
-
-  RETRY-2 — "Selector Missing" errors now retry with a longer post-scroll
-             wait (8s instead of 3s) on subsequent attempts — these are
-             often timing issues where the item count loads late.
-
-  FIX-A  — All fixes from v8.0 retained:
-            _is_valid_response_url, raw_html before dom_poll,
-            spm-anchor text-node patterns, dom_poll skip logic.
+merchant_scraper.py  v10.0  — Full Fix: Baxia + Hydration + Cookies + Proxy
+═══════════════════════════════════════════════════════════════════════════════
+FIXES FROM v9.0 (merged from working Scraper 1):
 """
 
 import re
@@ -57,14 +23,14 @@ from camoufox.sync_api import Camoufox
 logger = logging.getLogger("merchant_scraper")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOR CONFIG  — set TOR_ENABLED=True when your Tor instance is running
+# TOR CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-TOR_ENABLED          = True          # flip to False to disable proxy
+TOR_ENABLED          = True
 TOR_SOCKS_HOST       = "127.0.0.1"
-TOR_SOCKS_PORT       = 9050          # default Tor SOCKS5 port
-TOR_CONTROL_PORT     = 9051          # default Tor control port
-TOR_CONTROL_PASSWORD = ""            # set if you configured HashedControlPassword
+TOR_SOCKS_PORT       = 9050
+TOR_CONTROL_PORT     = 9051
+TOR_CONTROL_PASSWORD = ""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -72,21 +38,21 @@ TOR_CONTROL_PASSWORD = ""            # set if you configured HashedControlPasswo
 
 STORE_URL_TEMPLATE = (
     "https://www.aliexpress.com/store/{merchant_id}/pages/all-items.html"
-    "?shop_sortType=bestmatch_sort&language=en"
+    "?shop_sortType=bestmatch_sort&gatewayAdapt=glo2swe"
 )
 
 BATCH_SIZE           = 20
 CONCURRENCY          = 1
-MAX_RETRIES          = 4             # TOR-1: +1 for circuit rotation attempt
+MAX_RETRIES          = 4
+MAX_BAXIA_CYCLES     = 2          # FIX-2: max Baxia dismiss attempts per navigation
 PAGE_TIMEOUT         = 120_000
 NETWORKIDLE_TIMEOUT  = 30_000
 POLL_TIMEOUT_MS      = 90_000
-DELAY_MIN            = 5.0 if TOR_ENABLED else 10.0   # TOR-6
-DELAY_MAX            = 12.0 if TOR_ENABLED else 25.0  # TOR-6
+DELAY_MIN            = 5.0  if TOR_ENABLED else 10.0
+DELAY_MAX            = 12.0 if TOR_ENABLED else 25.0
 JOBS_DIR             = Path("./merchant_jobs")
 SCREENSHOTS_DIR      = Path("./merchant_screenshots")
 
-# OS pool for fingerprint rotation — TOR-3
 OS_POOL = ["windows", "macos", "linux"]
 
 USER_AGENTS = [
@@ -111,6 +77,23 @@ BASE_HEADERS = {
     "sec-fetch-site":  "none",
 }
 
+# FIX-2: Baxia modal selectors (ported from Scraper 1)
+BAXIA_SELECTORS = [
+    "[class*='baxia-dialog']",
+    "[class*='baxia_dialog']",
+    "[id*='baxia']",
+]
+
+BAXIA_CLOSE_SELECTORS = [
+    "[class*='baxia-dialog-close']",
+    "[class*='dialog-close']",
+    "button.baxia-dialog-close",
+    "[aria-label='Close']",
+    "[aria-label='close']",
+    "button[class*='close']",
+    "[class*='modal-close']",
+]
+
 REAL_BLOCK_SIGNALS = [
     'id="baxia-punish"',
     'class="baxia-dialog"',
@@ -122,9 +105,33 @@ REAL_BLOCK_SIGNALS = [
     'cf-challenge-running',
 ]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# URL FILTER LISTS (v8.0 FIX-A)
-# ─────────────────────────────────────────────────────────────────────────────
+# FIX-4: AliExpress session cookies (ported from Scraper 1)
+ALIEXPRESS_COOKIES = [
+    {
+        "name":   "aep_usuc_f",
+        "value":  "site=glo&c_tp=SEK&region=SE&b_locale=en_US",
+        "domain": ".aliexpress.com",
+        "path":   "/",
+    },
+    {
+        "name":   "xman_us_f",
+        "value":  "x_locale=en_US&x_site=SWE",
+        "domain": ".aliexpress.com",
+        "path":   "/",
+    },
+    {
+        "name":   "aep_common_f",
+        "value":  "F=F&reg=SE",
+        "domain": ".aliexpress.com",
+        "path":   "/",
+    },
+    {
+        "name":   "_aep_modified_region",
+        "value":  "SE",
+        "domain": ".aliexpress.com",
+        "path":   "/",
+    },
+]
 
 JUNK_URL_FRAGMENTS = [
     "recom-acs", "recommend", "login", "signin", "passport",
@@ -140,10 +147,6 @@ VALID_URL_FRAGMENTS = [
     "search.mtop", "itemcount", "storefront", "store_pc",
     "sellerprofile", "totalitem", "productlist",
 ]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RAW HTML PATTERNS (v8.0 FIX-C expanded)
-# ─────────────────────────────────────────────────────────────────────────────
 
 RAW_HTML_COUNT_PATTERNS = [
     r'store_pc_allItems[^"]*"[^>]*>\s*(\d+)\s*items?',
@@ -168,10 +171,23 @@ RAW_HTML_COUNT_PATTERNS = [
 
 _jobs: Dict[str, Dict] = {}
 _jobs_lock = threading.Lock()
-
-# stop_events: job_id → threading.Event
-# Set the event to request graceful stop between batches/merchants.
 _stop_events: Dict[str, threading.Event] = {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-8: Helper to build empty result dicts without repetition
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _empty_result(merchant_id: str, error: str, landed_id: str = "", warning: str = "", screenshot: str = None) -> Dict:
+    return {
+        "merchant_id":        merchant_id,
+        "canonical_store_id": landed_id or merchant_id,
+        "total_items":        None,
+        "error":              error,
+        "warning":            warning or None,
+        "extraction_source":  None,
+        "screenshot_path":    screenshot,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -179,36 +195,27 @@ _stop_events: Dict[str, threading.Event] = {}
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _new_tor_circuit() -> bool:
-    """
-    TOR-2: Send SIGNAL NEWNYM to the Tor control port to request a new
-    circuit (fresh exit node). Returns True on success, False on failure.
-    Call this before retrying after a CAPTCHA or block signal.
-    """
     if not TOR_ENABLED:
         return False
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(5)
         s.connect((TOR_SOCKS_HOST, TOR_CONTROL_PORT))
-
         if TOR_CONTROL_PASSWORD:
             s.sendall(f'AUTHENTICATE "{TOR_CONTROL_PASSWORD}"\r\n'.encode())
         else:
             s.sendall(b'AUTHENTICATE ""\r\n')
-
         resp = s.recv(1024).decode()
         if "250" not in resp:
             logger.warning(f"[tor] auth failed: {resp.strip()}")
             s.close()
             return False
-
         s.sendall(b"SIGNAL NEWNYM\r\n")
         resp = s.recv(1024).decode()
         s.close()
-
         if "250" in resp:
             logger.info("[tor] new circuit requested ✓")
-            time.sleep(2)   # give Tor time to build the new circuit
+            time.sleep(2)
             return True
         logger.warning(f"[tor] NEWNYM failed: {resp.strip()}")
         return False
@@ -218,15 +225,113 @@ def _new_tor_circuit() -> bool:
 
 
 def _tor_proxy_settings() -> Optional[Dict]:
-    """
-    TOR-3: Return Camoufox-compatible proxy dict when Tor is enabled.
-    Returns None when Tor is disabled so callers can handle both cases.
-    """
     if not TOR_ENABLED:
         return None
-    return {
-        "server": f"socks5://{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}",
-    }
+    return {"server": f"socks5://{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-2: BAXIA MODAL HANDLING (ported from Scraper 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def has_baxia_modal(page) -> bool:
+    """Check whether the Baxia anti-bot overlay is currently visible."""
+    try:
+        for sel in BAXIA_SELECTORS:
+            if page.locator(sel).count() > 0:
+                return True
+        if page.locator("text=check if you are a robot").count() > 0:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def force_close_modal(page) -> bool:
+    """Attempt to close the Baxia modal via close buttons or Escape key."""
+    for sel in BAXIA_CLOSE_SELECTORS:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0 and btn.is_visible():
+                btn.click()
+                time.sleep(1)
+                if not has_baxia_modal(page):
+                    logger.debug(f"[baxia] closed via selector: {sel}")
+                    return True
+        except Exception:
+            continue
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(1)
+        if not has_baxia_modal(page):
+            logger.debug("[baxia] closed via Escape key")
+            return True
+    except Exception:
+        pass
+    logger.debug("[baxia] could not close modal")
+    return False
+
+
+def handle_baxia_once(page, url: str) -> bool:
+    """
+    One full Baxia dismissal cycle:
+      1. Wait 25s for JS challenge to self-complete
+      2. Force-close if it didn't
+      3. Reload page (MANDATORY — content won't render after forced close)
+      4. Wait 15s more for post-reload modal
+    Returns True if modal is gone.
+    """
+    # Step 1: wait for self-dismiss
+    logger.info("[baxia] waiting 25s for self-dismiss...")
+    for _ in range(25):
+        if not has_baxia_modal(page):
+            logger.info("[baxia] self-dismissed ✓")
+            time.sleep(1)
+            return True
+        time.sleep(1)
+
+    # Step 2: force close
+    logger.info("[baxia] timed out — force closing...")
+    force_close_modal(page)
+    time.sleep(1)
+
+    # Step 3: reload (content won't render without this after forced close)
+    logger.info("[baxia] reloading page after forced close...")
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        time.sleep(4)
+    except Exception as e:
+        logger.warning(f"[baxia] reload failed: {e}")
+        return False
+
+    if not has_baxia_modal(page):
+        return True
+
+    # Step 4: short wait after reload
+    logger.info("[baxia] waiting 15s post-reload...")
+    for _ in range(15):
+        if not has_baxia_modal(page):
+            return True
+        time.sleep(1)
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-6: GENTLE SCROLL (ported from Scraper 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scroll_gently(page) -> None:
+    """
+    Scroll down in small human-like mouse.wheel() increments then return
+    to top so the item count element (in the page header area) is visible.
+    This is far less detectable than scrollTo(0, scrollHeight).
+    """
+    for _ in range(4):
+        page.mouse.wheel(0, random.randint(250, 450))
+        page.wait_for_timeout(random.randint(400, 800))
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_timeout(500)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -423,7 +528,6 @@ def _extract_store_id(url: str) -> Optional[str]:
 
 
 def _raw_html_count_scan(html: str) -> Optional[int]:
-    """Layer 2.5 — scan raw HTML. Free, no timeout. Run before dom_poll."""
     for pattern in RAW_HTML_COUNT_PATTERNS:
         for m in re.finditer(pattern, html, re.I | re.S):
             try:
@@ -437,12 +541,11 @@ def _raw_html_count_scan(html: str) -> Optional[int]:
 
 
 def _is_valid_response_url(url: str, content_type: str) -> bool:
-    """Reject junk URLs (recommendation, login, analytics, ads)."""
     url_l = url.lower()
     ct_l  = content_type.lower()
     if any(frag in url_l for frag in JUNK_URL_FRAGMENTS):
         return False
-    is_json      = "json" in ct_l
+    is_json       = "json" in ct_l
     is_valid_path = any(frag in url_l for frag in VALID_URL_FRAGMENTS)
     if is_json and is_valid_path:
         return True
@@ -620,22 +723,25 @@ def _wait_for_item_count(page, poll_timeout_ms: int = POLL_TIMEOUT_MS) -> Option
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BROWSER CONTEXT
+# BROWSER CONTEXT — FIX-1 + FIX-4
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_context(browser, ua: str, merchant_id: str = ""):
-    proxy = _tor_proxy_settings()   # TOR-3: inject proxy when enabled
-
-    ctx_kwargs = dict(
+    """
+    FIX-1: Proxy is now set at Camoufox LAUNCH level (in _scrape_merchant),
+    so we do NOT pass proxy here. Context gets locale, UA, headers, cookies.
+    FIX-4: AliExpress session cookies injected here so they're present on
+    the very first request.
+    """
+    ctx = browser.new_context(
         viewport={"width": 1440, "height": 900},
         locale="en-US",
         user_agent=ua,
         extra_http_headers=BASE_HEADERS,
     )
-    if proxy:
-        ctx_kwargs["proxy"] = proxy
 
-    ctx = browser.new_context(**ctx_kwargs)
+    # FIX-4: inject session cookies before any navigation
+    ctx.add_cookies(ALIEXPRESS_COOKIES)
 
     def _route_handler(route):
         url = route.request.url
@@ -650,30 +756,35 @@ def _make_context(browser, ua: str, merchant_id: str = ""):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SINGLE MERCHANT SCRAPER
+# SINGLE MERCHANT SCRAPER — main fixes applied here
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_merchant(merchant_id: str) -> Dict:
     url      = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
     input_id = merchant_id
 
-    # Track whether the previous attempt was blocked — used to decide
-    # whether to rotate the Tor circuit before the next attempt.
     prev_was_blocked = False
 
     for attempt in range(1, MAX_RETRIES + 1):
-        # TOR-1/TOR-2: rotate circuit if last attempt was blocked
         if prev_was_blocked and TOR_ENABLED:
             logger.info(f"[merchant] {merchant_id} rotating Tor circuit before attempt {attempt}")
             _new_tor_circuit()
             prev_was_blocked = False
 
-        # TOR-3: rotate OS fingerprint each attempt
         os_choice = random.choice(OS_POOL)
+        proxy     = _tor_proxy_settings()
 
         try:
             ua = random.choice(USER_AGENTS)
-            with Camoufox(headless=True, os=os_choice) as browser:
+
+            # ── FIX-1: proxy + geoip + humanize at LAUNCH level ───────────
+            camoufox_kwargs = dict(headless=True, os=os_choice)
+            if proxy:
+                camoufox_kwargs["proxy"]    = proxy
+                camoufox_kwargs["geoip"]    = True   # geo-match fingerprint to exit node
+                camoufox_kwargs["humanize"] = True   # human-like timing/mouse
+
+            with Camoufox(**camoufox_kwargs) as browser:
                 ctx  = _make_context(browser, ua, merchant_id)
                 page = ctx.new_page()
 
@@ -693,7 +804,11 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                         except Exception:
                             pass
                         if data is not None:
-                            cand = _best_count_from_json(data, expected_ids={input_id, landed_id}, source_url=url_r)
+                            cand = _best_count_from_json(
+                                data,
+                                expected_ids={input_id, landed_id},
+                                source_url=url_r,
+                            )
                             if cand:
                                 response_hits.append({"source": "response_json", "url": url_r, **cand})
                         else:
@@ -704,7 +819,13 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                                     if m:
                                         val = int(m.group(1))
                                         if 1 <= val <= 500_000:
-                                            response_hits.append({"source": "response_text_regex", "url": url_r, "count": val, "path": "raw_text_regex", "score": 15})
+                                            response_hits.append({
+                                                "source": "response_text_regex",
+                                                "url":    url_r,
+                                                "count":  val,
+                                                "path":   "raw_text_regex",
+                                                "score":  15,
+                                            })
                                             break
                             except Exception:
                                 pass
@@ -714,23 +835,21 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 page.on("response", _on_response)
 
                 # ── Navigate ──────────────────────────────────────────────
-                nav_aborted = False
                 try:
                     page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
                 except Exception as nav_err:
                     err_str = str(nav_err)
-                    # TOR-5: NS_BINDING_ABORTED now triggers circuit rotation + retry
                     if any(x in err_str for x in ["NS_BINDING_ABORTED", "ERR_ABORTED", "blockedbyclient", "ERR_BLOCKED"]):
-                        logger.info(f"[merchant] {merchant_id} nav aborted (attempt {attempt}) — will retry with new circuit")
+                        logger.info(f"[merchant] {merchant_id} nav aborted (attempt {attempt})")
                         page.close(); ctx.close()
                         prev_was_blocked = True
                         if attempt < MAX_RETRIES:
                             time.sleep(random.uniform(3, 7))
                             continue
-                        return {"merchant_id": input_id, "canonical_store_id": input_id, "total_items": None, "error": "NS_BINDING_ABORTED after all retries", "warning": None, "extraction_source": None, "screenshot_path": None}
+                        return _empty_result(input_id, "NS_BINDING_ABORTED after all retries")
                     elif any(x in err_str for x in ["ERR_NAME_NOT_RESOLVED", "NS_ERROR_UNKNOWN_HOST"]):
                         page.close(); ctx.close()
-                        return {"merchant_id": input_id, "canonical_store_id": input_id, "total_items": None, "error": "DNS failed / page not found", "warning": None, "extraction_source": None, "screenshot_path": None}
+                        return _empty_result(input_id, "DNS failed / page not found")
                     else:
                         raise
 
@@ -746,43 +865,49 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 except Exception:
                     pass
 
-                # ── Wait for product grid ─────────────────────────────────
+                # ── FIX-5: Network error modal handler ────────────────────
                 try:
-                    page.wait_for_selector('img, [class*="product"], [class*="item"], [class*="card"]', timeout=20_000)
+                    btn = page.locator("text=Network error, click to reload").locator("..")
+                    btn.wait_for(timeout=3_000)
+                    logger.info(f"[merchant] {merchant_id} network error modal — clicking reload")
+                    btn.click()
+                    page.wait_for_timeout(3_000)
                 except Exception:
                     pass
 
-                # ── Scroll-to-bottom ──────────────────────────────────────
+                # ── FIX-2: Baxia modal handling BEFORE extraction ─────────
+                baxia_cycles = 0
+                while has_baxia_modal(page) and baxia_cycles < MAX_BAXIA_CYCLES:
+                    logger.warning(f"[merchant] {merchant_id} Baxia cycle {baxia_cycles + 1}/{MAX_BAXIA_CYCLES}")
+                    cleared = handle_baxia_once(page, url)
+                    baxia_cycles += 1
+                    if not cleared:
+                        break
+
+                if has_baxia_modal(page):
+                    logger.warning(f"[merchant] {merchant_id} Baxia stuck — rotating circuit")
+                    page.close(); ctx.close()
+                    prev_was_blocked = True
+                    if attempt < MAX_RETRIES:
+                        time.sleep(random.uniform(5, 10))
+                        continue
+                    return _empty_result(input_id, f"Baxia modal stuck after {MAX_BAXIA_CYCLES} cycles", landed_id, alias_warning)
+
+                # ── FIX-3: Hydration wait (CRITICAL for React SPA) ────────
                 try:
-                    last_height = page.evaluate("document.body.scrollHeight")
-                    for _ in range(8):
-                        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        page.wait_for_timeout(random.randint(800, 1_500))
-                        new_height = page.evaluate("document.body.scrollHeight")
-                        if new_height == last_height:
-                            break
-                        last_height = new_height
+                    page.wait_for_function(
+                        r"""() => {
+                            const t = document.body.innerText;
+                            return /\d[\d,]*\s*(items|products)/i.test(t)
+                                   && !/\b0\s*(items|products)\b/i.test(t);
+                        }""",
+                        timeout=20_000,
+                    )
+                    logger.info(f"[merchant] {merchant_id} DOM hydrated with item count ✓")
                 except Exception:
-                    pass
+                    logger.debug(f"[merchant] {merchant_id} hydration wait timed out — proceeding anyway")
 
-                # ── Mouse-wheel behavioral signals ────────────────────────
-                for _ in range(5):
-                    page.mouse.move(random.randint(100, 1200), random.randint(100, 800))
-                    page.mouse.wheel(0, random.randint(600, 1_200))
-                    page.wait_for_timeout(random.randint(400, 800))
-
-                # RETRY-2: longer post-scroll wait on 2nd+ attempt
-                # "Selector Missing" errors are often timing — the item count
-                # element loads late; waiting longer helps significantly.
-                post_wait_ms = random.randint(6_000, 9_000) if attempt > 1 else random.randint(3_000, 5_000)
-                page.wait_for_timeout(post_wait_ms)
-
-                # Re-read alias after JS settle
-                landed_id = _extract_store_id(page.url) or landed_id
-                if landed_id != input_id and not alias_warning:
-                    alias_warning = f"AliExpress canonicalised {input_id} → {landed_id}"
-
-                # ── HTML snapshot ─────────────────────────────────────────
+                # ── Hard block check ──────────────────────────────────────
                 html      = page.content()
                 html_size = len(html)
                 lower     = html.lower()
@@ -794,10 +919,21 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                     logger.warning(f"[merchant] {merchant_id} CAPTCHA/block (attempt {attempt})")
                     prev_was_blocked = True
                     if attempt < MAX_RETRIES:
-                        # TOR-4: short wait — circuit rotation handles the IP change
                         time.sleep(random.uniform(5, 10))
                         continue
-                    return {"merchant_id": input_id, "canonical_store_id": landed_id, "total_items": None, "error": "Blocked/CAPTCHA", "warning": alias_warning, "extraction_source": None, "screenshot_path": screenshot_path}
+                    return _empty_result(input_id, "Blocked/CAPTCHA", landed_id, alias_warning, screenshot_path)
+
+                # ── FIX-6: Gentle scroll (replaces aggressive scrollTo) ───
+                _scroll_gently(page)
+
+                # Wait after scroll — longer on retries (RETRY-2 logic kept)
+                post_wait_ms = random.randint(6_000, 9_000) if attempt > 1 else random.randint(3_000, 5_000)
+                page.wait_for_timeout(post_wait_ms)
+
+                # Re-read alias after JS settle
+                landed_id = _extract_store_id(page.url) or landed_id
+                if landed_id != input_id and not alias_warning:
+                    alias_warning = f"AliExpress canonicalised {input_id} → {landed_id}"
 
                 # ── Layer 2: hydrated globals ─────────────────────────────
                 global_hits: List[Dict] = []
@@ -806,22 +942,48 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 except Exception as e:
                     logger.debug(f"[merchant] {merchant_id} global scan failed: {e}")
 
-                # ── Layer 2.5: raw HTML regex (free, no timeout) ──────────
+                # ── Layer 2.5: raw HTML regex ─────────────────────────────
                 raw_html_hit = _raw_html_count_scan(html)
 
                 # ── Layer 3: DOM poll — skip if cheaper layers found it ───
+                # FIX-7: also check for Baxia reappearance during polling
                 dom_hit = None
                 if raw_html_hit is None and not global_hits and not response_hits:
-                    dom_hit = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
+                    # Full poll; check Baxia periodically
+                    deadline   = time.time() + (POLL_TIMEOUT_MS / 1000)
+                    check_at   = time.time() + 10
+                    while time.time() < deadline:
+                        # FIX-7: in-poll Baxia recheck
+                        if time.time() >= check_at:
+                            if has_baxia_modal(page):
+                                logger.warning(f"[merchant] {merchant_id} Baxia reappeared during poll — one cycle")
+                                cleared = handle_baxia_once(page, url)
+                                if not cleared:
+                                    logger.warning(f"[merchant] {merchant_id} Baxia stuck in poll — aborting")
+                                    break
+                                _scroll_gently(page)
+                            check_at = time.time() + 10
+
+                        # Try DOM poll once
+                        try:
+                            result = page.wait_for_function(
+                                _JS_POLL_FOR_COUNT, timeout=2_000, polling=150
+                            )
+                            count = result.json_value()
+                            if isinstance(count, (int, float)) and count > 0:
+                                dom_hit = int(count)
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(1)
+
                 elif raw_html_hit is None:
                     dom_hit = _wait_for_item_count(page, poll_timeout_ms=15_000)
 
                 page.close()
                 ctx.close()
 
-                # ── Pick best count — priority order ──────────────────────
-                # Priority: response_json (validated) → global_state →
-                #           raw_html_regex → dom_poll
+                # ── Pick best count ───────────────────────────────────────
                 best_count:  Optional[int] = None
                 best_source: Optional[str] = None
 
@@ -847,20 +1009,40 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 if best_count is not None:
                     canonical_note = f" (canonical={landed_id})" if alias_warning else ""
                     logger.info(f"[merchant] {merchant_id} ✓ {best_count} items [{best_source}]{canonical_note}")
-                    return {"merchant_id": input_id, "canonical_store_id": landed_id, "total_items": best_count, "error": "", "warning": alias_warning, "extraction_source": best_source, "screenshot_path": None}
+                    return {
+                        "merchant_id":        input_id,
+                        "canonical_store_id": landed_id,
+                        "total_items":        best_count,
+                        "error":              "",
+                        "warning":            alias_warning,
+                        "extraction_source":  best_source,
+                        "screenshot_path":    None,
+                    }
 
-                # ── Nothing found ─────────────────────────────────────────
-                logger.warning(f"[merchant] {merchant_id} no count found ({html_size//1024}KB, attempt {attempt})")
+                # ── FIX-9: Debug dump on failure ──────────────────────────
+                logger.warning(
+                    f"[merchant] {merchant_id} no count found "
+                    f"({html_size // 1024}KB, attempt {attempt}, url={page.url if not page.is_closed() else url})"
+                )
+                try:
+                    body_text = re.findall(r'\d[\d,]*\s*(?:items?|products?)', html[:5000], re.I)
+                    logger.debug(f"[merchant] {merchant_id} HTML item patterns: {body_text[:10]}")
+                except Exception:
+                    pass
 
-                # RETRY-2: "Selector Missing" — retry with longer wait
                 if attempt < MAX_RETRIES:
                     time.sleep(random.uniform(5, 15))
                     continue
 
-                # Last attempt — screenshot for diagnosis
+                # Last attempt — take diagnostic screenshot
                 screenshot_path = None
                 try:
-                    with Camoufox(headless=True, os=os_choice) as browser2:
+                    camoufox_kwargs2 = dict(headless=True, os=os_choice)
+                    if proxy:
+                        camoufox_kwargs2["proxy"]    = proxy
+                        camoufox_kwargs2["geoip"]    = True
+                        camoufox_kwargs2["humanize"] = True
+                    with Camoufox(**camoufox_kwargs2) as browser2:
                         ctx2  = _make_context(browser2, ua, merchant_id)
                         page2 = ctx2.new_page()
                         try:
@@ -872,19 +1054,25 @@ def _scrape_merchant(merchant_id: str) -> Dict:
                 except Exception:
                     pass
 
-                return {"merchant_id": input_id, "canonical_store_id": landed_id, "total_items": None, "error": f"Selector Missing — no count found after {MAX_RETRIES} attempts ({html_size//1024}KB)", "warning": alias_warning, "extraction_source": None, "screenshot_path": screenshot_path}
+                return _empty_result(
+                    input_id,
+                    f"Selector Missing — no count found after {MAX_RETRIES} attempts ({html_size // 1024}KB)",
+                    landed_id,
+                    alias_warning,
+                    screenshot_path,
+                )
 
         except Exception as exc:
             err_str = str(exc)
             label   = "Timeout" if "timeout" in err_str.lower() else f"Error: {err_str[:80]}"
             logger.error(f"[merchant] {merchant_id} attempt {attempt} — {label}")
-            prev_was_blocked = "timeout" not in err_str.lower()  # timeouts don't need circuit rotation
+            prev_was_blocked = "timeout" not in err_str.lower()
             if attempt < MAX_RETRIES:
                 time.sleep(random.uniform(5, 15))
                 continue
-            return {"merchant_id": input_id, "canonical_store_id": input_id, "total_items": None, "error": label, "warning": None, "extraction_source": None, "screenshot_path": None}
+            return _empty_result(input_id, label)
 
-    return {"merchant_id": input_id, "canonical_store_id": input_id, "total_items": None, "error": "Max retries exceeded", "warning": None, "extraction_source": None, "screenshot_path": None}
+    return _empty_result(input_id, "Max retries exceeded")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -937,22 +1125,24 @@ def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
     stop_ev = _stop_events.get(job_id)
     rows = []
     for i, mid in enumerate(merchant_ids):
-        # Check stop signal before each merchant
         if stop_ev and stop_ev.is_set():
-            logger.info(f"[job:{job_id}] Stop requested — skipping remaining merchants in batch {batch_idx:04d}")
+            logger.info(f"[job:{job_id}] Stop requested — skipping remaining in batch {batch_idx:04d}")
             break
 
         try:
             row = _scrape_merchant(mid)
         except Exception as e:
-            row = {"merchant_id": mid, "canonical_store_id": mid, "total_items": None, "error": str(e)[:120], "warning": None, "extraction_source": None}
+            row = _empty_result(mid, str(e)[:120])
         rows.append(row)
 
-        status = f"✓ {row['total_items']} [{row.get('extraction_source','')}]" if row.get("total_items") is not None else f"✗ {row.get('error','')[:50]}"
-        logger.info(f"[job:{job_id}] [{i+1}/{len(merchant_ids)}] {mid} → {status}")
+        status = (
+            f"✓ {row['total_items']} [{row.get('extraction_source', '')}]"
+            if row.get("total_items") is not None
+            else f"✗ {row.get('error', '')[:50]}"
+        )
+        logger.info(f"[job:{job_id}] [{i + 1}/{len(merchant_ids)}] {mid} → {status}")
 
         if i < len(merchant_ids) - 1:
-            # Also check stop during the inter-merchant sleep
             if stop_ev and stop_ev.is_set():
                 break
             time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
@@ -965,29 +1155,38 @@ def _run_batch(job_id: str, batch_idx: int, merchant_ids: List[str]) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
-    batches       = [merchant_ids[i:i+BATCH_SIZE] for i in range(0, len(merchant_ids), BATCH_SIZE)]
+    batches       = [merchant_ids[i:i + BATCH_SIZE] for i in range(0, len(merchant_ids), BATCH_SIZE)]
     batches_total = len(batches)
     total         = len(merchant_ids)
 
     meta = {
-        "job_id": job_id, "status": "running", "total": total,
-        "batches_total": batches_total, "batches_done": 0, "batches_failed": 0,
-        "started_at": datetime.utcnow().isoformat(), "finished_at": None,
-        "batches": [{"idx": i, "size": len(b), "status": "queued"} for i, b in enumerate(batches)],
+        "job_id":         job_id,
+        "status":         "running",
+        "total":          total,
+        "batches_total":  batches_total,
+        "batches_done":   0,
+        "batches_failed": 0,
+        "started_at":     datetime.utcnow().isoformat(),
+        "finished_at":    None,
+        "batches":        [{"idx": i, "size": len(b), "status": "queued"} for i, b in enumerate(batches)],
     }
     _save_metadata(job_id, meta)
     with _jobs_lock:
-        _jobs[job_id].update({"status": "running", "total": total, "batches_total": batches_total, "batches_done": 0, "batches_failed": 0})
+        _jobs[job_id].update({
+            "status": "running", "total": total,
+            "batches_total": batches_total, "batches_done": 0, "batches_failed": 0,
+        })
 
-    logger.info(f"[job:{job_id}] Start — {total} merchants | {batches_total} batches | Tor={'on' if TOR_ENABLED else 'off'}")
+    logger.info(
+        f"[job:{job_id}] Start — {total} merchants | {batches_total} batches "
+        f"| Tor={'on' if TOR_ENABLED else 'off'}"
+    )
 
     stop_ev = _stop_events.get(job_id)
 
     for idx, batch in enumerate(batches):
-        # Check stop signal before starting each batch
         if stop_ev and stop_ev.is_set():
             logger.info(f"[job:{job_id}] Stop requested — halting before batch {idx:04d}")
-            # Mark remaining queued batches as stopped
             for rem in range(idx, batches_total):
                 if meta["batches"][rem]["status"] == "queued":
                     meta["batches"][rem]["status"] = "stopped"
@@ -1018,11 +1217,10 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
 
         if idx < batches_total - 1:
             if stop_ev and stop_ev.is_set():
-                logger.info(f"[job:{job_id}] Stop requested during inter-batch sleep — halting")
+                logger.info(f"[job:{job_id}] Stop requested during inter-batch sleep")
                 break
             time.sleep(random.uniform(15, 30))
 
-    # Determine final status
     was_stopped = stop_ev is not None and stop_ev.is_set()
 
     try:
@@ -1030,33 +1228,30 @@ def _run_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
     except Exception as e:
         logger.error(f"[job:{job_id}] Merge failed: {e}")
 
-    final_status            = "stopped" if was_stopped else "done"
-    meta["status"]          = final_status
-    meta["finished_at"]     = datetime.utcnow().isoformat()
+    final_status        = "stopped" if was_stopped else "done"
+    meta["status"]      = final_status
+    meta["finished_at"] = datetime.utcnow().isoformat()
     _save_metadata(job_id, meta)
     with _jobs_lock:
         if job_id in _jobs:
             _jobs[job_id]["status"] = final_status
 
-    # Clean up stop event
     with _jobs_lock:
         _stop_events.pop(job_id, None)
 
-    logger.info(f"[job:{job_id}] {'⛔ Stopped' if was_stopped else '✓ Complete'} — {meta['batches_done']} ok | {meta['batches_failed']} failed")
+    logger.info(
+        f"[job:{job_id}] {'⛔ Stopped' if was_stopped else '✓ Complete'} "
+        f"— {meta['batches_done']} ok | {meta['batches_failed']} failed"
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DEDUP DB INIT
+# DEDUP DB
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEDUP_DB_PATH = Path("./dedup.db")
 
 def _init_dedup_db() -> None:
-    """
-    Initialise the deduplication SQLite database (dedup.db).
-    Creates the processed_ids table if it doesn't exist and enables
-    WAL mode for safe concurrent access from multiple threads.
-    Safe to call multiple times — CREATE TABLE IF NOT EXISTS guard.
-    """
     import sqlite3 as _sqlite3
     conn = _sqlite3.connect(str(DEDUP_DB_PATH), check_same_thread=False)
     try:
@@ -1072,27 +1267,29 @@ def _init_dedup_db() -> None:
         logger.info(f"[dedup] DB initialised at {DEDUP_DB_PATH}")
     finally:
         conn.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────────────────────
 
 def start_bulk_job(job_id: str, merchant_ids: List[str]) -> None:
     with _jobs_lock:
-        _jobs[job_id] = {"status": "queued", "total": len(merchant_ids), "batches_total": 0, "batches_done": 0, "batches_failed": 0}
-        _stop_events[job_id] = threading.Event()   # cleared = running
-    t = threading.Thread(target=_run_bulk_job, args=(job_id, merchant_ids), daemon=True, name=f"merchant-{job_id[:8]}")
+        _jobs[job_id] = {
+            "status": "queued", "total": len(merchant_ids),
+            "batches_total": 0, "batches_done": 0, "batches_failed": 0,
+        }
+        _stop_events[job_id] = threading.Event()
+    t = threading.Thread(
+        target=_run_bulk_job,
+        args=(job_id, merchant_ids),
+        daemon=True,
+        name=f"merchant-{job_id[:8]}",
+    )
     t.start()
 
 
 def stop_job(job_id: str) -> Dict:
-    """
-    Request graceful stop for a running or queued job.
-    Sets the stop event so the job thread exits after the current merchant
-    finishes (does NOT kill mid-scrape — the running merchant completes,
-    then the loop breaks cleanly).
-
-    Returns a status dict indicating whether the stop was accepted.
-    """
     with _jobs_lock:
         mem    = dict(_jobs.get(job_id, {}))
         ev     = _stop_events.get(job_id)
@@ -1105,7 +1302,6 @@ def stop_job(job_id: str) -> Dict:
         return {"success": False, "job_id": job_id, "error": f"Job already {status}", "status": status}
 
     if ev is None:
-        # Job exists on disk (server restarted) but no live thread — mark stopped directly
         meta = _load_metadata(job_id)
         if meta:
             meta["status"]      = "stopped"
@@ -1113,9 +1309,8 @@ def stop_job(job_id: str) -> Dict:
             _save_metadata(job_id, meta)
         return {"success": True, "job_id": job_id, "message": "Job marked stopped (no live thread found)", "status": "stopped"}
 
-    ev.set()   # signal the thread to stop after current merchant
+    ev.set()
 
-    # Update in-memory status immediately so status endpoint reflects it
     with _jobs_lock:
         if job_id in _jobs:
             _jobs[job_id]["status"] = "stopping"
@@ -1124,7 +1319,7 @@ def stop_job(job_id: str) -> Dict:
     return {
         "success": True,
         "job_id":  job_id,
-        "message": "Stop signal sent. The current merchant will finish, then the job halts. Already-completed batches are saved and downloadable.",
+        "message": "Stop signal sent. Current merchant will finish, then job halts. Completed batches are saved.",
         "status":  "stopping",
     }
 
@@ -1137,8 +1332,12 @@ def get_job_status(job_id: str) -> Optional[Dict]:
         return None
     if disk:
         total_merchants = disk.get("total", 0)
-        merchants_done  = sum(b.get("size", BATCH_SIZE) for b in disk.get("batches", []) if b.get("status") in ("done", "failed"))
-        merchants_done  = min(merchants_done, total_merchants)
+        merchants_done  = sum(
+            b.get("size", BATCH_SIZE)
+            for b in disk.get("batches", [])
+            if b.get("status") in ("done", "failed")
+        )
+        merchants_done = min(merchants_done, total_merchants)
         return {
             "status":              disk.get("status", mem.get("status", "unknown")),
             "total_merchants":     total_merchants,
@@ -1178,7 +1377,11 @@ def list_all_jobs() -> List[Dict]:
         if not meta:
             continue
         total          = meta.get("total", 0)
-        merchants_done = sum(b.get("size", BATCH_SIZE) for b in meta.get("batches", []) if b.get("status") in ("done", "failed"))
+        merchants_done = sum(
+            b.get("size", BATCH_SIZE)
+            for b in meta.get("batches", [])
+            if b.get("status") in ("done", "failed")
+        )
         merchants_done = min(merchants_done, total)
         result.append({
             "job_id":              job_dir.name,
@@ -1195,3 +1398,28 @@ def list_all_jobs() -> List[Dict]:
             "download_url":        f"/merchant-download/{job_dir.name}" if meta.get("status") == "done" else None,
         })
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STANDALONE CLI  (python merchant_scraper.py 1764075)
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-7s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    if len(sys.argv) < 2:
+        print("Usage: python merchant_scraper.py <merchant_id> [merchant_id2 ...]")
+        sys.exit(1)
+
+    ids = sys.argv[1:]
+    print(f"\n🚀  merchant_scraper v10.0 — {len(ids)} store(s)\n{'━'*52}")
+
+    for mid in ids:
+        result = _scrape_merchant(mid)
+        print(json.dumps(result, indent=2))
