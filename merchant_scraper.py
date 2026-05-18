@@ -17,7 +17,12 @@ import io
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from datetime import datetime
-
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
 from camoufox.sync_api import Camoufox
 
 logger = logging.getLogger("merchant_scraper")
