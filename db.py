@@ -83,8 +83,14 @@ def create_all_tables():
         product_type       TEXT,
         store_name         TEXT,
         raw_json           TEXT,
-        scraped_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        scraped_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        exported_at        DATETIME
     )""")
+
+    # Live-database migration: add exported_at if this DB was created before v3.4
+    _add_columns_if_missing(cursor, "scraped_products", [
+        ("exported_at", "DATETIME"),
+    ])
 
     # ── SELLER INFO ─────────────────────────────────────────────────────────
     cursor.execute("""
@@ -337,7 +343,7 @@ def create_all_tables():
     conn.commit()
     conn.close()
     print("All tables created (including restricted_keywords, restricted_categories, "
-          "translation, and processed_ids)")
+          "translation, processed_ids, and exported_at on scraped_products)")
 
 
 # ---------------------------------------------------------------------------
