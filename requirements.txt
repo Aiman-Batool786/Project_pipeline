@@ -8,4 +8,7 @@ scikit-learn
 python-dotenv
 stem
 requests
-pysocks   
+pysocks
+camoufox[geoip]
+openpyxl
+python-multipart
