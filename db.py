@@ -1094,6 +1094,23 @@ def log_all_spec_audits(product_id, scraped_data, specs_enhanced, enriched_data_
         log_specification_audit(product_id, field, original_val,
                                 enhanced_val, template_val, source)
     print(f"Audit log written (product_id={product_id})")
+# =============================================================================
+# =============================================================================
+
+def get_all_manufacturer_info(limit: int = 10) -> list:
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM compliance_info ORDER BY extracted_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        print(f"[db] get_all_manufacturer_info error: {exc}")
+        return []
+    finally:
+        conn.close()
 
 
 # =============================================================================
