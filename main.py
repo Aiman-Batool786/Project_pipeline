@@ -1296,7 +1296,24 @@ def _attach_screenshot(debug: dict, screenshot_path: Optional[str], merchant_id:
 def reload_filters():
     reload_filter_data()
     return {"status": "ok", "message": "Filter data reloaded from DB"}
+  
+# ── EXPORT TEMPLATES ──────────────────────────────────────────────────────────
+@app.post("/export-templates", tags=["Export"])
+def export_templates(only_new: bool = False):
+    """
+    Batch-export all categorized products to per-category .xlsm files.
+    Pass ?only_new=true to export only products not yet exported (incremental).
+    """
+    from batch_export import run_export
+    return run_export(only_new=only_new)
 
+
+# ── MANUFACTURER INFO ─────────────────────────────────────────────────────────
+@app.get("/manufacturer", tags=["Database"])
+def get_manufacturers(limit: int = 10):
+    """Return manufacturer/compliance info collected during scraping."""
+    from db import get_all_manufacturer_info
+    return get_all_manufacturer_info(limit=limit)
 
 # =============================================================================
 # DATABASE VIEW ENDPOINTS
