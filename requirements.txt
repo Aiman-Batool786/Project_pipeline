@@ -12,3 +12,5 @@ pysocks
 camoufox[geoip]
 openpyxl
 python-multipart
+beautifulsoup4
+lxml
