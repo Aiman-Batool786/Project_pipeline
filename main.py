@@ -1289,6 +1289,154 @@ def _attach_screenshot(debug: dict, screenshot_path: Optional[str], merchant_id:
 
 
 # =============================================================================
+# PRODUCT VARIANT ENDPOINTS
+# =============================================================================
+
+class VariantScrapeRequest(BaseModel):
+    product_id: str
+    force_rescrape: bool = False
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "product_id": "1005012117886583",
+                "force_rescrape": False
+            }
+        }
+
+
+@app.post("/scrape-variants", tags=["Variants"])
+def scrape_variants(req: VariantScrapeRequest):
+    """
+    Scrape product variants (color swatches + sizes) for an AliExpress product ID.
+
+    - Checks the DB first; returns cached data unless force_rescrape=true.
+    - Variant data is linked to the scraped_products row if it exists, or stored
+      with product_id=0 as a standalone extract.
+
+    Returns the full variant structure:
+    {
+      "product_id": "1005012117886583",
+      "variants": {
+        "color": [{"name": "Navy Blue", "image_url": "...", "sku_col_id": "14-173", "selected": false}],
+        "size": {
+          "type": "plain" | "country_mapped",
+          "systems": [{"country": "US", "options": ["M (US 38)", ...]}],
+          "plain_options": ["S", "M", "L", "XL"]
+        }
+      }
+    }
+    """
+    from variant_scraper import scrape_product_variants, save_variants_to_db, get_variants_from_db
+
+    pid = req.product_id.strip()
+    if not pid.isdigit():
+        raise HTTPException(status_code=400, detail="product_id must be a numeric string")
+
+    # ── Look up the DB product_id (FK) from scraped_products ─────────────────
+    canonical_url = f"https://www.aliexpress.com/item/{pid}.html"
+    conn          = get_db_connection()
+    row           = conn.execute(
+        "SELECT product_id FROM scraped_products WHERE url LIKE ?",
+        (f"%/item/{pid}.html%",)
+    ).fetchone()
+    conn.close()
+
+    db_product_id = row["product_id"] if row else 0
+
+    # ── Return cached unless force_rescrape ───────────────────────────────────
+    if not req.force_rescrape and db_product_id:
+        cached = get_variants_from_db(db_product_id)
+        if cached:
+            logger.info(f"[variants] Returning cached variants for product_id={db_product_id}")
+            return {**cached, "source": "cache", "db_product_id": db_product_id}
+
+    # ── Scrape ────────────────────────────────────────────────────────────────
+    logger.info(f"[variants] Scraping variants for aliexpress_id={pid}")
+    result = scrape_product_variants(pid)
+
+    if result.get("error"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Variant scraping failed: {result['error']}"
+        )
+
+    # ── Persist ───────────────────────────────────────────────────────────────
+    save_ok = save_variants_to_db(db_product_id or 0, result)
+    logger.info(f"[variants] Saved={save_ok} for db_product_id={db_product_id}")
+
+    return {
+        **result,
+        "source":         "scraped",
+        "db_product_id":  db_product_id,
+        "timestamp":      datetime.now().isoformat(),
+    }
+
+
+@app.get("/variants/{aliexpress_id}", tags=["Variants"])
+def get_variants(aliexpress_id: str):
+    """
+    Return stored variant data for an AliExpress product ID (no scraping).
+    Returns 404 if no variants are stored yet — call POST /scrape-variants first.
+    """
+    from variant_scraper import get_variants_from_db
+
+    pid = aliexpress_id.strip()
+    if not pid.isdigit():
+        raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
+
+    conn = get_db_connection()
+    row  = conn.execute(
+        "SELECT product_id FROM scraped_products WHERE url LIKE ?",
+        (f"%/item/{pid}.html%",)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Product {pid} not found in DB. "
+                   f"Call POST /scrape-variants with product_id={pid} first."
+        )
+
+    data = get_variants_from_db(row["product_id"])
+    if not data:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No variants stored for product {pid}. "
+                   f"Call POST /scrape-variants with product_id={pid} first."
+        )
+
+    return {**data, "db_product_id": row["product_id"]}
+
+
+@app.post("/extract-variants-from-html", tags=["Variants"])
+def extract_variants_from_html_endpoint(payload: dict):
+    """
+    Extract variants from raw HTML you provide (no browser needed).
+    Useful for testing or when you already have the rendered page HTML.
+
+    Body:
+    {
+      "product_id": "1005012117886583",
+      "html": "<html>...</html>"
+    }
+    """
+    from variant_scraper import extract_variants_from_html
+
+    pid  = str(payload.get("product_id", "")).strip()
+    html = payload.get("html", "")
+
+    if not html:
+        raise HTTPException(status_code=400, detail="html field is required")
+    if not pid:
+        raise HTTPException(status_code=400, detail="product_id field is required")
+
+    result = extract_variants_from_html(html, pid)
+    return result
+
+
+# =============================================================================
 # RELOAD FILTERS
 # =============================================================================
 
