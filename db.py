@@ -1,104 +1,896 @@
 """
-FastAPI Server - HYBRID APPROACH v3.4
-Pipeline: Scrape → Store → Enhance → Categorize → Map → Excel → Translate
+db.py — Complete schema with all tables.
 
-v3.4 changes (variant table migration):
-  CHANGED — /scrape-variants now uses db.save_variants() and db.get_variants()
-             (the new `varient` table) instead of the legacy product_variants
-             helpers in variant_scraper.py.
-  REMOVED — GET /variants/{aliexpress_id}  (replaced by DB endpoint below)
-  REMOVED — POST /extract-variants-from-html  (dev-only, not needed in prod)
-  NEW     — GET  /db/variants/{aliexpress_id}   returns stored variant JSON
-  NEW     — GET  /db/variants/{aliexpress_id}/summary   color/size/country counts
-  NEW     — DELETE /db/variants/{aliexpress_id}  wipe variant rows for a product
-
-v3.3 changes (translation refactor):
-  REFACTOR — All inline translation helpers removed from main.py and replaced
-             by a single import from translation.py.
-
-v3.2 changes (translation feature):
-  NEW — /translate-product/{aliexpress_id} endpoint.
-  NEW — GET /translations/{aliexpress_id}
-  NEW — GET /translations/{aliexpress_id}/{language}
+Tables:
+  categories              — Octopia category tree with embeddings
+  scraped_products        — Raw scraped product data
+  seller_info             — Seller / store information (1:1 with product)
+  compliance_info         — EU DSA compliance modal data (1:many)
+  enhanced_content        — OpenAI-enhanced titles, descriptions, bullet points
+  category_assignments    — Category assigned to each product
+  mapped_products         — Template-column-mapped product data
+  template_outputs        — Generated Excel file paths
+  processing_logs         — Step-by-step pipeline log
+  original_specifications — Specs as scraped (before enhancement)
+  enhanced_specifications — Specs after OpenAI enhancement
+  specification_audit_log — Diff: original vs enhanced vs template
+  restricted_keywords     — Keywords forbidden in descriptions / specs
+  restricted_categories   — Product categories that are forbidden/restricted
+  processed_ids           — Global deduplication table for merchant scraper
+  translation             — Per-language translations of title, description,
+                            and specification for each product.
+                            Supported: Romanian, German, Portuguese, Spanish, French.
+                            One row per (url_id, language) pair.
+  varient                 — Product variant data (colors + country-mapped sizes)
+                            One row per individual variant option.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import os
 import sqlite3
-import logging
 import json
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-
-from scraper import scrape_search_results, MAX_SEARCH_PAGES
-from product_filter import (
-    filter_product,
-    filter_products,
-    filter_restricted_keywords,
-    validate_category_confidence,
-    reload_filter_data,
-)
-
-from translation import translate_product_fields, SUPPORTED_LANGUAGES as _TRANSLATION_LANGS
-
-import uuid
-import random
-import time
-import re as _re
-from fastapi import UploadFile, File, BackgroundTasks
-from fastapi.responses import Response as FastAPIResponse, FileResponse
-from merchant_scraper import (
-    parse_merchant_csv,
-    start_bulk_job,
-    get_job_status,
-    get_output_path,
-    list_all_jobs,
-    stop_job,
-    _make_context,
-    _extract_store_id,
-    _JS_DOM_DUMP,
-    _JS_POLL_FOR_COUNT,
-    _JS_GLOBAL_CANDIDATES,
-    _best_count_from_json,
-    _wait_for_item_count,
-    _save_screenshot,
-    _screenshot_to_b64,
-    _is_valid_response_url,
-    _raw_html_count_scan,
-    RAW_HTML_COUNT_PATTERNS,
-    STORE_URL_TEMPLATE,
-    USER_AGENTS,
-    PAGE_TIMEOUT,
-    NETWORKIDLE_TIMEOUT,
-    POLL_TIMEOUT_MS,
-    REAL_BLOCK_SIGNALS,
-    SCREENSHOTS_DIR,
-    _init_dedup_db,
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-app = FastAPI(title="Octopia Template Pipeline", version="3.4")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+import csv
+import os
+import re
+from typing import Optional
 
 DB_NAME = "products.db"
-SPEC_FIELDS = [
-    'brand', 'color', 'dimensions', 'weight', 'material',
-    'certifications', 'country_of_origin', 'warranty', 'product_type'
-]
+
+
+def create_connection():
+    return sqlite3.connect(DB_NAME, check_same_thread=False)
+
+
+def create_all_tables():
+    conn   = create_connection()
+    cursor = conn.cursor()
+
+    # ── CATEGORIES ─────────────────────────────────────────────────────────
+    try:
+        cursor.execute("ALTER TABLE categories RENAME TO categories_old")
+    except sqlite3.OperationalError:
+        pass
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS categories (
+        category_id   INTEGER PRIMARY KEY,
+        category_name TEXT,
+        embedding     BLOB
+    )""")
+
+    # ── SCRAPED PRODUCTS ────────────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS scraped_products (
+        product_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        url                TEXT UNIQUE,
+        title              TEXT,
+        description        TEXT,
+        brand              TEXT,
+        image_1            TEXT,
+        image_2            TEXT,
+        image_3            TEXT,
+        image_4            TEXT,
+        image_5            TEXT,
+        image_6            TEXT,
+        color              TEXT,
+        dimensions         TEXT,
+        weight             TEXT,
+        material           TEXT,
+        age_from           TEXT,
+        age_to             TEXT,
+        certifications     TEXT,
+        country_of_origin  TEXT,
+        bullet_points      TEXT,
+        price              TEXT,
+        shipping           TEXT,
+        warranty           TEXT,
+        product_type       TEXT,
+        store_name         TEXT,
+        raw_json           TEXT,
+        scraped_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        exported_at        DATETIME
+    )""")
+
+    _add_columns_if_missing(cursor, "scraped_products", [
+        ("exported_at", "DATETIME"),
+    ])
+
+    # ── SELLER INFO ─────────────────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS seller_info (
+        id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id            INTEGER UNIQUE,
+        store_name            TEXT,
+        store_id              TEXT,
+        store_url             TEXT,
+        seller_id             TEXT,
+        seller_positive_rate  TEXT,
+        seller_rating         TEXT,
+        seller_communication  TEXT,
+        seller_shipping_speed TEXT,
+        seller_country        TEXT,
+        store_open_date       TEXT,
+        seller_level          TEXT,
+        seller_total_reviews  TEXT,
+        seller_positive_num   TEXT,
+        is_top_rated          TEXT,
+        scraped_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    # ── COMPLIANCE INFO ─────────────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS compliance_info (
+        id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id               INTEGER NOT NULL,
+        compliance_product_id    TEXT,
+        manufacturer_name        TEXT,
+        manufacturer_address     TEXT,
+        manufacturer_email       TEXT,
+        manufacturer_phone       TEXT,
+        eu_responsible_name      TEXT,
+        eu_responsible_address   TEXT,
+        eu_responsible_email     TEXT,
+        eu_responsible_phone     TEXT,
+        extracted_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(product_id, compliance_product_id),
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    # ── ENHANCED CONTENT ────────────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS enhanced_content (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id        INTEGER UNIQUE,
+        title             TEXT,
+        description       TEXT,
+        bullet_points     TEXT,
+        html_description  TEXT,
+        brand             TEXT,
+        color             TEXT,
+        dimensions        TEXT,
+        weight            TEXT,
+        material          TEXT,
+        certifications    TEXT,
+        country_of_origin TEXT,
+        warranty          TEXT,
+        product_type      TEXT,
+        enhanced_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    _add_columns_if_missing(cursor, "enhanced_content", [
+        ("brand",             "TEXT"),
+        ("color",             "TEXT"),
+        ("dimensions",        "TEXT"),
+        ("weight",            "TEXT"),
+        ("material",          "TEXT"),
+        ("certifications",    "TEXT"),
+        ("country_of_origin", "TEXT"),
+        ("warranty",          "TEXT"),
+        ("product_type",      "TEXT"),
+    ])
+
+    # ── CATEGORY ASSIGNMENTS ────────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS category_assignments (
+        id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id             INTEGER UNIQUE,
+        original_category_id   TEXT,
+        original_category_name TEXT,
+        enhanced_category_id   TEXT,
+        enhanced_category_name TEXT,
+        confidence             REAL,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    # ── MAPPED PRODUCTS ─────────────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS mapped_products (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id         INTEGER UNIQUE,
+        gtin               TEXT,
+        seller_reference   TEXT,
+        titre              TEXT,
+        description        TEXT,
+        url_image_1        TEXT,
+        marque             TEXT,
+        couleur_principale TEXT,
+        dimensions         TEXT,
+        poids              TEXT,
+        matiere            TEXT,
+        age_from           TEXT,
+        age_to             TEXT,
+        certifications     TEXT,
+        pays_origine       TEXT,
+        fabricant_nom      TEXT,
+        garantie           TEXT,
+        notes              TEXT,
+        additional_fields  TEXT,
+        mapped_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    # ── TEMPLATE OUTPUTS ────────────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS template_outputs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id  INTEGER,
+        category_id TEXT,
+        output_type TEXT,
+        file_path   TEXT,
+        file_name   TEXT,
+        status      TEXT,
+        notes       TEXT,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    # ── PROCESSING LOGS ─────────────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS processing_logs (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id  INTEGER,
+        url         TEXT,
+        step        TEXT,
+        status      TEXT,
+        message     TEXT,
+        log_time    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    # ── ORIGINAL SPECIFICATIONS ─────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS original_specifications (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id        INTEGER UNIQUE,
+        brand             TEXT,
+        color             TEXT,
+        dimensions        TEXT,
+        weight            TEXT,
+        material          TEXT,
+        certifications    TEXT,
+        country_of_origin TEXT,
+        warranty          TEXT,
+        product_type      TEXT,
+        age_from          TEXT,
+        age_to            TEXT,
+        gender            TEXT,
+        source            TEXT DEFAULT 'scraper',
+        extracted_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    # ── ENHANCED SPECIFICATIONS ─────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS enhanced_specifications (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id        INTEGER UNIQUE,
+        brand             TEXT,
+        color             TEXT,
+        dimensions        TEXT,
+        weight            TEXT,
+        material          TEXT,
+        certifications    TEXT,
+        country_of_origin TEXT,
+        warranty          TEXT,
+        product_type      TEXT,
+        age_from          TEXT,
+        age_to            TEXT,
+        gender            TEXT,
+        source            TEXT DEFAULT 'openai',
+        enhanced_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    # ── SPECIFICATION AUDIT LOG ─────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS specification_audit_log (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id      INTEGER,
+        spec_field      TEXT,
+        original_value  TEXT,
+        enhanced_value  TEXT,
+        template_value  TEXT,
+        source_used     TEXT,
+        notes           TEXT,
+        recorded_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    # ── RESTRICTED KEYWORDS ─────────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS restricted_keywords (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        keyword    TEXT UNIQUE NOT NULL COLLATE NOCASE,
+        embedding  BLOB,
+        added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    _add_columns_if_missing(cursor, "restricted_keywords", [("embedding", "BLOB")])
+
+    # ── RESTRICTED CATEGORIES ───────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS restricted_categories (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        category   TEXT UNIQUE NOT NULL,
+        embedding  BLOB,
+        added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # ── TRANSLATION ─────────────────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS translation (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        url_id        INTEGER NOT NULL,
+        language      TEXT    NOT NULL,
+        title         TEXT,
+        description   TEXT,
+        specification TEXT,
+        translated_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(url_id, language),
+        FOREIGN KEY (url_id) REFERENCES scraped_products(product_id)
+    )""")
+
+    # ── PROCESSED IDS (DEDUPLICATION) ──────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS processed_ids (
+        id           TEXT PRIMARY KEY,
+        job_id       TEXT,
+        processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # ── VARIENT ─────────────────────────────────────────────────────────────
+    # Stores all product variants: colors and country-mapped sizes.
+    # One row per individual variant option.
+    #
+    # Color row:
+    #   variant_type = 'color'
+    #   name         = color name (e.g. "White", "Black")
+    #   image_url    = full CDN image URL (not downloaded)
+    #   sku_col_id   = raw data-sku-col value (e.g. "14-29")
+    #   country      = NULL
+    #   is_selected  = 1 if this swatch was selected at scrape time
+    #
+    # Size row:
+    #   variant_type = 'size'
+    #   name         = size label (e.g. "S(US 36)", "M(EU 38)")
+    #   country      = country code (e.g. "US", "EU", "FR")
+    #                  NULL when type is plain (no dropdown)
+    #   image_url    = NULL
+    #   sku_col_id   = NULL
+    #   is_selected  = 0
+    #
+    # Duplicate guard: UNIQUE(product_id, variant_type, name, country)
+    # ensures re-scraping the same product does not create duplicate rows.
+    # country is coalesced to '' in the unique index because SQLite treats
+    # NULL != NULL, which would allow infinite duplicate NULL-country rows.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS varient (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id   TEXT    NOT NULL,
+        variant_type TEXT    NOT NULL CHECK(variant_type IN ('color', 'size')),
+        name         TEXT    NOT NULL,
+        country      TEXT,
+        image_url    TEXT,
+        sku_col_id   TEXT,
+        is_selected  INTEGER NOT NULL DEFAULT 0 CHECK(is_selected IN (0, 1)),
+        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # Unique index: (product_id, variant_type, name, coalesce(country,''))
+    # Prevents duplicates on re-scrape while correctly handling NULL country.
+    cursor.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS uix_varient_dedup
+    ON varient (product_id, variant_type, name, COALESCE(country, ''))
+    """)
+
+    conn.commit()
+    conn.close()
+    print("All tables created (including varient)")
+
+
+# ---------------------------------------------------------------------------
+# Internal migration helper
+# ---------------------------------------------------------------------------
+
+def _add_columns_if_missing(cursor, table: str, columns: list) -> None:
+    for col_name, col_type in columns:
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
+        except sqlite3.OperationalError:
+            pass
+
+
+# =============================================================================
+# VARIENT — save / read helpers
+# =============================================================================
+
+def save_variants(data: dict) -> dict:
+    """
+    Persist all variant data from the scraper JSON into the varient table.
+
+    Args:
+        data: The full variant dict returned by scrape_product_variants().
+              Must contain at minimum:
+                {
+                  "product_id": "1005010435033239",
+                  "variants": {
+                    "color": [ {"name": ..., "image_url": ...,
+                                "sku_col_id": ..., "selected": bool} ],
+                    "size": {
+                      "type": "country_mapped" | "plain",
+                      "systems": [ {"country": "US", "options": ["S(US 36)", ...]} ],
+                      "plain_options": ["S", "M", "L"]
+                    }
+                  }
+                }
+
+    Returns:
+        {"inserted": N, "skipped": N, "errors": N}
+        inserted — new rows added
+        skipped  — duplicates silently ignored (ON CONFLICT DO NOTHING)
+        errors   — rows that raised an unexpected exception
+    """
+    product_id = str(data.get("product_id", "")).strip()
+    if not product_id:
+        print("[db.save_variants] No product_id in data — skipping")
+        return {"inserted": 0, "skipped": 0, "errors": 0}
+
+    variants   = data.get("variants", {})
+    color_list = variants.get("color", [])
+    size_data  = variants.get("size", {})
+
+    rows = []
+
+    # ── Build color rows ────────────────────────────────────────────────────
+    for c in color_list:
+        name = (c.get("name") or "").strip()
+        if not name:
+            continue
+        rows.append({
+            "product_id":   product_id,
+            "variant_type": "color",
+            "name":         name,
+            "country":      None,
+            "image_url":    (c.get("image_url") or "").strip() or None,
+            "sku_col_id":   (c.get("sku_col_id") or "").strip() or None,
+            "is_selected":  1 if c.get("selected") else 0,
+        })
+
+    # ── Build size rows ─────────────────────────────────────────────────────
+    size_type = size_data.get("type", "plain")
+
+    if size_type == "country_mapped":
+        # Each system is one country; each option is one size label
+        for system in size_data.get("systems", []):
+            country = (system.get("country") or "").strip() or None
+            for opt in system.get("options", []):
+                opt = (opt or "").strip()
+                if not opt:
+                    continue
+                rows.append({
+                    "product_id":   product_id,
+                    "variant_type": "size",
+                    "name":         opt,
+                    "country":      country,
+                    "image_url":    None,
+                    "sku_col_id":   None,
+                    "is_selected":  0,
+                })
+    else:
+        # Plain sizes — no country
+        for opt in size_data.get("plain_options", []):
+            opt = (opt or "").strip()
+            if not opt:
+                continue
+            rows.append({
+                "product_id":   product_id,
+                "variant_type": "size",
+                "name":         opt,
+                "country":      None,
+                "image_url":    None,
+                "sku_col_id":   None,
+                "is_selected":  0,
+            })
+
+    if not rows:
+        print(f"[db.save_variants] No rows to insert for product_id={product_id}")
+        return {"inserted": 0, "skipped": 0, "errors": 0}
+
+    # ── Insert with duplicate guard ─────────────────────────────────────────
+    inserted = skipped = errors = 0
+    conn = create_connection()
+
+    try:
+        cursor = conn.cursor()
+        for row in rows:
+            try:
+                cursor.execute("""
+                    INSERT INTO varient
+                        (product_id, variant_type, name, country,
+                         image_url, sku_col_id, is_selected)
+                    VALUES
+                        (:product_id, :variant_type, :name, :country,
+                         :image_url, :sku_col_id, :is_selected)
+                    ON CONFLICT(product_id, variant_type, name, COALESCE(country, ''))
+                    DO NOTHING
+                """, row)
+
+                if cursor.rowcount == 1:
+                    inserted += 1
+                else:
+                    skipped += 1
+
+            except Exception as exc:
+                errors += 1
+                print(f"[db.save_variants] Row error — {row}: {exc}")
+
+        conn.commit()
+
+    except Exception as exc:
+        print(f"[db.save_variants] Connection error: {exc}")
+        errors += len(rows)
+    finally:
+        conn.close()
+
+    print(
+        f"[db.save_variants] product_id={product_id} | "
+        f"inserted={inserted} skipped={skipped} errors={errors}"
+    )
+    return {"inserted": inserted, "skipped": skipped, "errors": errors}
+
+
+def get_variants(product_id: str) -> dict:
+    """
+    Re-assemble the full variant structure from the varient table.
+
+    Args:
+        product_id: AliExpress product ID string.
+
+    Returns:
+        {
+          "product_id": "...",
+          "variants": {
+            "color": [ {"name": ..., "image_url": ...,
+                        "sku_col_id": ..., "selected": bool} ],
+            "size": {
+              "type": "country_mapped" | "plain",
+              "systems": [ {"country": "US", "options": [...]} ],
+              "plain_options": [...]
+            }
+          }
+        }
+        Returns None if no rows exist for this product_id.
+    """
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("""
+            SELECT variant_type, name, country, image_url, sku_col_id, is_selected
+            FROM varient
+            WHERE product_id = ?
+            ORDER BY variant_type, id
+        """, (str(product_id),)).fetchall()
+    except Exception as exc:
+        print(f"[db.get_variants] Error: {exc}")
+        return None
+    finally:
+        conn.close()
+
+    if not rows:
+        return None
+
+    colors        = []
+    sizes_plain   = []
+    sizes_mapped  = {}   # country -> [label, ...]
+
+    for row in rows:
+        if row["variant_type"] == "color":
+            colors.append({
+                "name":       row["name"],
+                "image_url":  row["image_url"] or "",
+                "sku_col_id": row["sku_col_id"] or "",
+                "selected":   bool(row["is_selected"]),
+            })
+        elif row["variant_type"] == "size":
+            country = row["country"]
+            if country:
+                sizes_mapped.setdefault(country, []).append(row["name"])
+            else:
+                sizes_plain.append(row["name"])
+
+    if sizes_mapped:
+        size_block = {
+            "type":          "country_mapped",
+            "systems":       [{"country": c, "options": o} for c, o in sizes_mapped.items()],
+            "plain_options": [],
+        }
+    else:
+        size_block = {
+            "type":          "plain",
+            "systems":       [],
+            "plain_options": sizes_plain,
+        }
+
+    return {
+        "product_id": str(product_id),
+        "variants":   {"color": colors, "size": size_block},
+    }
+
+
+def delete_variants(product_id: str) -> int:
+    """
+    Delete all variant rows for a product.
+    Returns the number of rows deleted.
+    """
+    conn = create_connection()
+    try:
+        conn.execute("DELETE FROM varient WHERE product_id = ?", (str(product_id),))
+        conn.commit()
+        n = conn.execute("SELECT changes()").fetchone()[0]
+        print(f"[db.delete_variants] Deleted {n} rows for product_id={product_id}")
+        return n
+    except Exception as exc:
+        print(f"[db.delete_variants] Error: {exc}")
+        return 0
+    finally:
+        conn.close()
+
+
+def get_variant_summary(product_id: str) -> dict:
+    """
+    Return a quick summary: how many color and size rows exist per country.
+    Useful for a dashboard or API status check.
+
+    Returns e.g.:
+        {
+          "product_id": "...",
+          "color_count": 2,
+          "size_count": 84,
+          "countries": ["EU", "US", "FR", "DE", "IT", "ES", "UK",
+                        "MX", "BR", "AU", "SG", "JP", "KR"]
+        }
+    """
+    conn = create_connection()
+    try:
+        color_count = conn.execute(
+            "SELECT COUNT(*) FROM varient WHERE product_id = ? AND variant_type = 'color'",
+            (str(product_id),)
+        ).fetchone()[0]
+
+        size_count = conn.execute(
+            "SELECT COUNT(*) FROM varient WHERE product_id = ? AND variant_type = 'size'",
+            (str(product_id),)
+        ).fetchone()[0]
+
+        country_rows = conn.execute(
+            "SELECT DISTINCT country FROM varient "
+            "WHERE product_id = ? AND variant_type = 'size' AND country IS NOT NULL "
+            "ORDER BY country",
+            (str(product_id),)
+        ).fetchall()
+
+        countries = [r[0] for r in country_rows]
+
+        return {
+            "product_id":  str(product_id),
+            "color_count": color_count,
+            "size_count":  size_count,
+            "countries":   countries,
+        }
+    except Exception as exc:
+        print(f"[db.get_variant_summary] Error: {exc}")
+        return {}
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# TRANSLATION HELPERS
+# =============================================================================
+
+def insert_translation(
+    url_id: int,
+    language: str,
+    title: str = "",
+    description: str = "",
+    specification: str = "",
+) -> bool:
+    conn = create_connection()
+    try:
+        conn.execute("""
+            INSERT INTO translation (url_id, language, title, description, specification)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(url_id, language) DO UPDATE SET
+                title         = excluded.title,
+                description   = excluded.description,
+                specification = excluded.specification,
+                translated_at = datetime('now')
+        """, (url_id, language, title or "", description or "", specification or ""))
+        conn.commit()
+        print(f"[db] Translation saved (url_id={url_id}, language={language})")
+        return True
+    except Exception as exc:
+        print(f"[db] insert_translation error: {exc}")
+        return False
+    finally:
+        conn.close()
+
+
+def get_translations(url_id: int) -> list:
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT url_id, language, title, description, specification, translated_at "
+            "FROM translation WHERE url_id = ? ORDER BY language",
+            (url_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        print(f"[db] get_translations error: {exc}")
+        return []
+    finally:
+        conn.close()
+
+
+def get_translation(url_id: int, language: str) -> Optional[dict]:
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT url_id, language, title, description, specification, translated_at "
+            "FROM translation WHERE url_id = ? AND language = ?",
+            (url_id, language),
+        ).fetchone()
+        return dict(row) if row else None
+    except Exception as exc:
+        print(f"[db] get_translation error: {exc}")
+        return None
+    finally:
+        conn.close()
+
+
+def delete_translations(url_id: int, language: str = None) -> int:
+    conn = create_connection()
+    try:
+        if language:
+            conn.execute(
+                "DELETE FROM translation WHERE url_id = ? AND language = ?",
+                (url_id, language),
+            )
+        else:
+            conn.execute("DELETE FROM translation WHERE url_id = ?", (url_id,))
+        conn.commit()
+        return conn.execute("SELECT changes()").fetchone()[0]
+    except Exception as exc:
+        print(f"[db] delete_translations error: {exc}")
+        return 0
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# RESTRICTED KEYWORDS
+# =============================================================================
+
+def load_restricted_keywords_from_csv(csv_path: str) -> int:
+    if not os.path.exists(csv_path):
+        print(f"[db] CSV not found: {csv_path}")
+        return 0
+
+    conn    = create_connection()
+    cursor  = conn.cursor()
+    count   = 0
+    skipped = 0
+
+    try:
+        with open(csv_path, newline='', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                keyword = (
+                    row.get('desc_and_spec_restricted_keywords') or
+                    row.get('"desc_and_spec_restricted_keywords"') or
+                    list(row.values())[0]
+                )
+                if not keyword:
+                    continue
+                keyword = keyword.strip().strip('"')
+                if not keyword:
+                    continue
+                try:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO restricted_keywords (keyword) VALUES (?)",
+                        (keyword,)
+                    )
+                    count   += cursor.rowcount
+                    skipped += 1 - cursor.rowcount
+                except Exception:
+                    skipped += 1
+
+        conn.commit()
+        print(f"[db] Keywords loaded: {count} inserted, {skipped} skipped")
+        return count
+
+    except Exception as exc:
+        print(f"[db] Error loading restricted keywords: {exc}")
+        return 0
+    finally:
+        conn.close()
+
+
+def get_restricted_keywords() -> list:
+    conn = create_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT keyword FROM restricted_keywords")
+        return [row[0].lower().strip() for row in cursor.fetchall() if row[0]]
+    except Exception as exc:
+        print(f"[db] Error reading restricted keywords: {exc}")
+        return []
+    finally:
+        conn.close()
+
+
+def filter_restricted_keywords(text: str, keywords: list = None) -> tuple:
+    if not text:
+        return text, []
+    if keywords is None:
+        keywords = get_restricted_keywords()
+    found   = []
+    cleaned = text
+    for kw in keywords:
+        pattern = re.compile(re.escape(kw), re.IGNORECASE)
+        if pattern.search(cleaned):
+            found.append(kw)
+            cleaned = pattern.sub('[REMOVED]', cleaned)
+    return cleaned, found
+
+
+# =============================================================================
+# DEDUPLICATION HELPERS
+# =============================================================================
+
+def get_processed_ids(job_id: str = None) -> list:
+    conn = create_connection()
+    try:
+        cursor = conn.cursor()
+        if job_id:
+            cursor.execute(
+                "SELECT id FROM processed_ids WHERE job_id = ? ORDER BY processed_at",
+                (job_id,),
+            )
+        else:
+            cursor.execute("SELECT id FROM processed_ids ORDER BY processed_at")
+        return [row[0] for row in cursor.fetchall()]
+    except Exception as exc:
+        print(f"[db] Error reading processed_ids: {exc}")
+        return []
+    finally:
+        conn.close()
+
+
+def get_processed_id_count(job_id: str = None) -> int:
+    conn = create_connection()
+    try:
+        cursor = conn.cursor()
+        if job_id:
+            cursor.execute(
+                "SELECT COUNT(*) FROM processed_ids WHERE job_id = ?", (job_id,)
+            )
+        else:
+            cursor.execute("SELECT COUNT(*) FROM processed_ids")
+        row = cursor.fetchone()
+        return row[0] if row else 0
+    except Exception as exc:
+        print(f"[db] Error counting processed_ids: {exc}")
+        return 0
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# SELLER INFO
+# =============================================================================
+
 SELLER_FIELDS = [
     'store_name', 'store_id', 'store_url', 'seller_id',
     'seller_positive_rate', 'seller_rating', 'seller_communication',
@@ -107,1471 +899,536 @@ SELLER_FIELDS = [
 ]
 
 
-# =============================================================================
-# PYDANTIC MODELS
-# =============================================================================
-
-class ProductURLRequest(BaseModel):
-    url: str
-    extract_compliance: bool = True
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "url": "https://www.aliexpress.com/item/1005010388288135.html",
-                "extract_compliance": True
-            }
-        }
-
-
-class BulkProductRequest(BaseModel):
-    urls: List[str]
-    extract_compliance: bool = False
-
-
-class SearchScrapeRequest(BaseModel):
-    search_url: str
-    max_pages: Optional[int] = None
-    delay_between_requests: float = 1.0
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "search_url": (
-                    "https://www.aliexpress.com/w/wholesale-bags.html"
-                    "?SearchText=bags&page=1&catId=0&g=y&shipFromCountry=AE"
-                ),
-                "max_pages": 5,
-                "delay_between_requests": 1.0
-            }
-        }
-
-
-class MerchantIDsRequest(BaseModel):
-    merchant_ids: List[str]
-
-    class Config:
-        json_schema_extra = {
-            "example": {"merchant_ids": ["1103833861", "912519001", "567839201"]}
-        }
-
-
-class MerchantDebugRequest(BaseModel):
-    merchant_id: str
-
-    class Config:
-        json_schema_extra = {"example": {"merchant_id": "1104990029"}}
-
-
-class VariantScrapeRequest(BaseModel):
-    product_id: str
-    force_rescrape: bool = False
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "product_id": "1005012117886583",
-                "force_rescrape": False
-            }
-        }
-
-
-# =============================================================================
-# DB HELPERS
-# =============================================================================
-
-def get_db_connection():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def _lookup_db_product_id(aliexpress_id: str) -> Optional[int]:
-    """
-    Return the scraped_products.product_id for a given AliExpress numeric ID,
-    or None if the product has never been scraped.
-    """
-    conn = get_db_connection()
+def insert_seller_info(product_id: int, seller_data: dict) -> bool:
+    conn   = create_connection()
+    cursor = conn.cursor()
     try:
-        row = conn.execute(
-            "SELECT product_id FROM scraped_products WHERE url LIKE ?",
-            (f"%/item/{aliexpress_id}.html%",)
-        ).fetchone()
-        return row["product_id"] if row else None
-    finally:
-        conn.close()
-
-
-# =============================================================================
-# STARTUP
-# =============================================================================
-
-@app.on_event("startup")
-def startup_event():
-    try:
-        from db import create_all_tables
-        create_all_tables()
-        SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-        _init_dedup_db()
-        logger.info("✅ Deduplication DB initialised (dedup.db)")
-        logger.info("✅ API Ready — v3.4")
-    except Exception as e:
-        logger.error(f"Startup error: {e}")
-
-
-# =============================================================================
-# INFO
-# =============================================================================
-
-@app.get("/", tags=["Info"])
-def root():
-    return {
-        "status":  "running",
-        "service": "Octopia Template Pipeline",
-        "version": "3.4",
-    }
-
-
-@app.get("/health", tags=["Info"])
-def health_check():
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        conn.close()
-        return {"status": "healthy", "database": "connected"}
-    except Exception as e:
-        return {"status": "error", "database": str(e)}
-
-
-# =============================================================================
-# MAIN PROCESSING FUNCTION
-# =============================================================================
-
-def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[str, Any]:
-    product_id = None
-
-    try:
-        logger.info(f"\n🚀 Processing: {url}")
-
-        from scraper import get_product_info, resolve_category
-        from category_utils import assign_category
-        from data_mapper import map_scraped_data_to_template, validate_mapped_data
-        from template_filler import fill_template_for_product
-        from openai_client import improve_product_content
-        from db import (
-            create_all_tables, insert_scraped_product, insert_seller_info,
-            insert_compliance_info, insert_category_assignment, insert_mapped_product,
-            insert_template_output, insert_enhanced_content, insert_original_specifications,
-            insert_enhanced_specifications, log_all_spec_audits, log_processing,
-        )
-
-        create_all_tables()
-
-        TEMPLATE_PATH        = None
-        FILLED_TEMPLATES_DIR = "./filled_templates"
-        os.makedirs(FILLED_TEMPLATES_DIR, exist_ok=True)
-
-        for candidate in [
-            "pdt_template_fr-FR_20260305_090255.xlsm",
-            "./pdt_template_fr-FR_20260305_090255.xlsm",
-            os.path.join(os.path.dirname(__file__), "pdt_template_fr-FR_20260305_090255.xlsm"),
-        ]:
-            if os.path.exists(candidate):
-                TEMPLATE_PATH = candidate
-                break
-
-        scraped_data = get_product_info(url, extract_compliance=extract_compliance)
-        if not scraped_data:
-            return {"success": False, "url": url, "error": "Scraping failed",
-                    "timestamp": datetime.now().isoformat()}
-
-        original_title = scraped_data.get("title", "")
-        description    = scraped_data.get("description", "")
-        if not original_title:
-            return {"success": False, "url": url, "error": "No title extracted",
-                    "timestamp": datetime.now().isoformat()}
-
-        product_id = insert_scraped_product(url, scraped_data)
-        if not product_id:
-            return {"success": False, "url": url, "error": "Failed to store scraped data",
-                    "timestamp": datetime.now().isoformat()}
-
-        log_processing(product_id, url, "scraping", "success")
-        insert_seller_info(product_id, {k: scraped_data.get(k, '') for k in SELLER_FIELDS})
-        log_processing(product_id, url, "seller_info", "success")
-
-        compliance_data = scraped_data.get('compliance', {})
-        if compliance_data:
-            insert_compliance_info(product_id, compliance_data)
-            log_processing(product_id, url, "compliance_info", "success")
-
-        insert_original_specifications(product_id, scraped_data)
-
-        product_data_for_llm = {
-            k: v for k, v in scraped_data.items()
-            if k not in SELLER_FIELDS and k != 'compliance'
-        }
-
-        try:
-            enhanced = improve_product_content(
-                title=original_title, description=description,
-                specifications=product_data_for_llm, category=None
-            )
-            if not enhanced:
-                raise ValueError("OpenAI returned None")
-        except Exception as e:
-            logger.warning(f"Enhancement skipped: {e}")
-            enhanced = {
-                "title": original_title, "description": description,
-                "bullet_points": scraped_data.get("bullet_points", []),
-                "html_description": "", "specifications_enhanced": {}
-            }
-
-        enhanced_title = enhanced.get("title", original_title)
-        specs_enhanced = enhanced.get("specifications_enhanced", {})
-        insert_enhanced_specifications(product_id, specs_enhanced)
-
-        enriched_data                     = scraped_data.copy()
-        enriched_data['title']            = enhanced_title
-        enriched_data['description']      = enhanced.get('description', description)
-        enriched_data['bullet_points']    = enhanced.get('bullet_points', [])
-        enriched_data['html_description'] = enhanced.get('html_description', '')
-
-        for field in SPEC_FIELDS:
-            enh_val = specs_enhanced.get(field, '')
-            enriched_data[field] = enh_val if (enh_val and enh_val.strip()) else ""
-        for field in SELLER_FIELDS:
-            enriched_data[field] = scraped_data.get(field, '')
-
-        insert_enhanced_content(product_id, enriched_data)
-        log_all_spec_audits(product_id, scraped_data, specs_enhanced, enriched_data)
-
-        scraper_category = resolve_category(scraped_data)
-        try:
-            category = assign_category(enhanced_title, enhanced.get("description", description))
-            if scraper_category['confidence'] >= 0.9 and scraper_category['category_id'] != '0':
-                category = scraper_category
-        except Exception as e:
-            logger.warning(f"Categorization fallback: {e}")
-            category = scraper_category if scraper_category['category_id'] != '0' else {
-                "category_id": "0", "category_name": "Unknown",
-                "category_leaf": "Unknown", "confidence": 0.0
-            }
-
-        confidence = float(category.get("confidence", 0.0))
-        conf_accepted, conf_reason = validate_category_confidence(confidence)
-        if not conf_accepted:
-            category = {
-                "category_id": "0", "category_name": "Uncategorized",
-                "category_leaf": "Uncategorized", "category_path": "",
-                "confidence": confidence,
-            }
-
-        insert_category_assignment(
+        cursor.execute("""
+            INSERT INTO seller_info (
+                product_id, store_name, store_id, store_url, seller_id,
+                seller_positive_rate, seller_rating, seller_communication,
+                seller_shipping_speed, seller_country, store_open_date,
+                seller_level, seller_total_reviews, seller_positive_num, is_top_rated
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
             product_id,
-            category.get("category_id", "0"), category.get("category_name", "Uncategorized"),
-            category.get("category_id", "0"), category.get("category_name", "Uncategorized"),
-            confidence
-        )
-        log_processing(product_id, url, "categorization", "success")
-
-        mapped_data = {}
-        is_valid    = False
-        try:
-            mapped_data = map_scraped_data_to_template(enriched_data)
-            is_valid, _ = validate_mapped_data(mapped_data)
-            insert_mapped_product(product_id, category.get("category_id", "0"), mapped_data)
-            log_processing(product_id, url, "mapping", "success" if is_valid else "warning")
-        except Exception as e:
-            logger.warning(f"Mapping error: {e}")
-            log_processing(product_id, url, "mapping", "error", str(e))
-
-        template_file = None
-        if TEMPLATE_PATH:
-            try:
-                template_file = fill_template_for_product(
-                    TEMPLATE_PATH, mapped_data, product_id, FILLED_TEMPLATES_DIR,
-                    category_id=category.get("category_id", "0"),
-                    category_name=category.get("category_leaf", "Uncategorized")
-                )
-                if template_file and os.path.exists(template_file):
-                    insert_template_output(
-                        product_id, category.get("category_id", "0"),
-                        "xlsm", template_file, os.path.basename(template_file)
-                    )
-                    log_processing(product_id, url, "template_fill", "success")
-            except Exception as e:
-                logger.error(f"❌ Template error: {e}", exc_info=True)
-                log_processing(product_id, url, "template_fill", "error", str(e))
-
-        return {
-            "success": True, "product_id": product_id, "url": url,
-            "original_title": original_title, "enhanced_title": enhanced_title,
-            "original": {
-                "title": original_title,
-                "description": (description[:200] + "..." if len(description) > 200 else description),
-                **{f: scraped_data.get(f, "") for f in SPEC_FIELDS},
-                "images": sum(1 for i in range(1, 21) if scraped_data.get(f"image_{i}"))
-            },
-            "seller": {f: scraped_data.get(f, "") for f in SELLER_FIELDS},
-            "compliance": compliance_data,
-            "shipment_country": scraped_data.get("shipment_country"),
-            "delivery_start":   scraped_data.get("delivery_start"),
-            "delivery_end":     scraped_data.get("delivery_end"),
-            "delivery_days":    scraped_data.get("delivery_days"),
-            "remaining_stock":  scraped_data.get("remaining_stock"),
-            "rating":           scraped_data.get("rating", ""),
-            "category": {
-                "id": category.get("category_id", ""), "name": category.get("category_name", ""),
-                "leaf": category.get("category_leaf", ""), "path": category.get("category_path", ""),
-                "confidence": round(confidence, 2)
-            },
-            "enhanced": {
-                "title": enhanced_title,
-                "description": (enhanced.get("description", "")[:200] + "..."
-                                if enhanced.get("description") else ""),
-                "bullet_points": enhanced.get("bullet_points", [])[:3],
-                "has_html_description": bool(enhanced.get("html_description", "")),
-                "specifications_enhanced": specs_enhanced
-            },
-            "template": {
-                "file": os.path.basename(template_file) if template_file else None,
-                "columns_mapped": len(mapped_data), "fields_valid": is_valid,
-            },
-            "timestamp": datetime.now().isoformat()
-        }
-
-    except Exception as e:
-        logger.error(f"❌ Error: {e}", exc_info=True)
-        return {"success": False, "url": url, "product_id": product_id,
-                "error": str(e), "timestamp": datetime.now().isoformat()}
-
-
-# =============================================================================
-# TRANSLATION ENDPOINTS
-# =============================================================================
-
-def _build_spec_text(product_id: int) -> str:
-    spec_columns = [
-        "brand", "color", "dimensions", "weight", "material",
-        "certifications", "country_of_origin", "warranty",
-        "product_type", "age_from", "age_to", "gender",
-    ]
-    scraped_columns = [c for c in spec_columns if c != "gender"]
-
-    conn = get_db_connection()
-    try:
-        row = conn.execute(
-            f"SELECT {', '.join(spec_columns)} "
-            "FROM enhanced_specifications WHERE product_id = ?",
-            (product_id,),
-        ).fetchone()
-
-        if not row:
-            row = conn.execute(
-                f"SELECT {', '.join(scraped_columns)} "
-                "FROM scraped_products WHERE product_id = ?",
-                (product_id,),
-            ).fetchone()
-
-        if not row:
-            return ""
-
-        parts = []
-        for key in row.keys():
-            val = row[key]
-            if val and str(val).strip():
-                parts.append(f"{key.replace('_', ' ').title()}: {val}")
-        return "\n".join(parts)
-
+            seller_data.get('store_name', ''),
+            seller_data.get('store_id', ''),
+            seller_data.get('store_url', ''),
+            seller_data.get('seller_id', ''),
+            seller_data.get('seller_positive_rate', ''),
+            seller_data.get('seller_rating', ''),
+            seller_data.get('seller_communication', ''),
+            seller_data.get('seller_shipping_speed', ''),
+            seller_data.get('seller_country', ''),
+            seller_data.get('store_open_date', ''),
+            seller_data.get('seller_level', ''),
+            seller_data.get('seller_total_reviews', ''),
+            seller_data.get('seller_positive_num', ''),
+            seller_data.get('is_top_rated', ''),
+        ))
+        conn.commit()
+        print(f"Seller info saved (product_id={product_id})")
+        return True
+    except sqlite3.IntegrityError:
+        cursor.execute("""
+            UPDATE seller_info SET
+                store_name=?, store_id=?, store_url=?, seller_id=?,
+                seller_positive_rate=?, seller_rating=?, seller_communication=?,
+                seller_shipping_speed=?, seller_country=?, store_open_date=?,
+                seller_level=?, seller_total_reviews=?, seller_positive_num=?,
+                is_top_rated=?
+            WHERE product_id=?
+        """, (
+            seller_data.get('store_name', ''),
+            seller_data.get('store_id', ''),
+            seller_data.get('store_url', ''),
+            seller_data.get('seller_id', ''),
+            seller_data.get('seller_positive_rate', ''),
+            seller_data.get('seller_rating', ''),
+            seller_data.get('seller_communication', ''),
+            seller_data.get('seller_shipping_speed', ''),
+            seller_data.get('seller_country', ''),
+            seller_data.get('store_open_date', ''),
+            seller_data.get('seller_level', ''),
+            seller_data.get('seller_total_reviews', ''),
+            seller_data.get('seller_positive_num', ''),
+            seller_data.get('is_top_rated', ''),
+            product_id,
+        ))
+        conn.commit()
+        print(f"Seller info updated (product_id={product_id})")
+        return True
     except Exception as exc:
-        logger.warning("[translate] Could not build spec text for product %d: %s", product_id, exc)
-        return ""
+        print(f"Seller info error: {exc}")
+        return False
     finally:
         conn.close()
 
 
-@app.post("/translate-product/{aliexpress_id}", tags=["Translation"])
-def translate_product(aliexpress_id: str):
-    """
-    Scrape (or reuse) a product by its AliExpress numeric ID, then translate
-    title, description, and specification into all 5 supported languages:
-    Romanian, German, Portuguese, Spanish, French.
-    """
-    aliexpress_id = aliexpress_id.strip()
-    if not aliexpress_id.isdigit():
-        raise HTTPException(
-            status_code=400,
-            detail="aliexpress_id must be a numeric string, e.g. 1005006395261235",
-        )
-
-    canonical_url = f"https://www.aliexpress.com/item/{aliexpress_id}.html"
-    logger.info("[translate] Requested: %s → %s", aliexpress_id, canonical_url)
-
-    conn = get_db_connection()
-    row = conn.execute(
-        "SELECT product_id, title, description FROM scraped_products WHERE url = ?",
-        (canonical_url,),
-    ).fetchone()
-    conn.close()
-
-    if row:
-        product_id  = row["product_id"]
-        title       = row["title"] or ""
-        description = row["description"] or ""
-        logger.info("[translate] Reusing stored product_id=%d", product_id)
-    else:
-        logger.info("[translate] Scraping fresh: %s", canonical_url)
-        result = process_product_complete(canonical_url, extract_compliance=False)
-        if not result.get("success"):
-            raise HTTPException(
-                status_code=502,
-                detail=f"Scraping failed: {result.get('error', 'unknown error')}",
-            )
-        product_id  = result["product_id"]
-        title       = result.get("enhanced_title") or result.get("original_title", "")
-        description = result.get("enhanced", {}).get("description", "")
-
-    spec_text = _build_spec_text(product_id)
-
-    from db import insert_translation
-
-    raw_translations = translate_product_fields(
-        title=title,
-        description=description,
-        specification=spec_text,
-        languages=_TRANSLATION_LANGS,
-    )
-
-    saved_translations: Dict[str, Dict] = {}
-    languages_translated: List[str] = []
-
-    for lang, fields in raw_translations.items():
-        data = {
-            "url_id":        product_id,
-            "language":      lang,
-            "title":         fields["title"],
-            "description":   fields["description"],
-            "specification": fields["specification"],
-        }
-        ok = insert_translation(
-            url_id        = data["url_id"],
-            language      = data["language"],
-            title         = data["title"],
-            description   = data["description"],
-            specification = data["specification"],
-        )
-        if ok:
-            languages_translated.append(lang)
-            saved_translations[lang] = data
-        else:
-            logger.warning("[translate] Failed to save %s row for product_id=%d", lang, product_id)
-
-    if not languages_translated:
-        raise HTTPException(
-            status_code=500,
-            detail="All translation attempts failed — check OPENAI_API_KEY or ANTHROPIC_API_KEY",
-        )
-
-    return {
-        "aliexpress_id":        aliexpress_id,
-        "product_id":           product_id,
-        "url":                  canonical_url,
-        "original_title":       title,
-        "languages_translated": languages_translated,
-        "translations":         saved_translations,
-        "timestamp":            datetime.now().isoformat(),
-    }
-
-
-@app.get("/translations/{aliexpress_id}", tags=["Translation"])
-def get_all_translations(aliexpress_id: str):
-    """Return all stored translations for a product."""
-    if not aliexpress_id.strip().isdigit():
-        raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
-
-    canonical_url = f"https://www.aliexpress.com/item/{aliexpress_id.strip()}.html"
-    conn = get_db_connection()
-    row = conn.execute(
-        "SELECT product_id FROM scraped_products WHERE url = ?",
-        (canonical_url,),
-    ).fetchone()
-    conn.close()
-
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"Product {aliexpress_id} not found. "
-                f"Call POST /translate-product/{aliexpress_id} first."
-            ),
-        )
-
-    from db import get_translations
-    translations = get_translations(row["product_id"])
-    return {
-        "aliexpress_id": aliexpress_id,
-        "product_id":    row["product_id"],
-        "count":         len(translations),
-        "translations":  translations,
-    }
-
-
-@app.get("/translations/{aliexpress_id}/{language}", tags=["Translation"])
-def get_single_translation(aliexpress_id: str, language: str):
-    """Return one translation row for a specific product + language."""
-    from db import get_translation
-    if not aliexpress_id.strip().isdigit():
-        raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
-
-    if language not in _TRANSLATION_LANGS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported language '{language}'. Supported: {_TRANSLATION_LANGS}",
-        )
-
-    canonical_url = f"https://www.aliexpress.com/item/{aliexpress_id.strip()}.html"
-    conn = get_db_connection()
-    row = conn.execute(
-        "SELECT product_id FROM scraped_products WHERE url = ?",
-        (canonical_url,),
-    ).fetchone()
-    conn.close()
-
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"Product {aliexpress_id} not found. "
-                f"Call POST /translate-product/{aliexpress_id} first."
-            ),
-        )
-
-    translation = get_translation(row["product_id"], language)
-    if not translation:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No {language} translation found for product {aliexpress_id}. "
-                f"Call POST /translate-product/{aliexpress_id} first."
-            ),
-        )
-    return translation
-
-
-# =============================================================================
-# SEARCH SCRAPING ENDPOINT
-# =============================================================================
-
-@app.post("/scrape-products", tags=["Product Processing"])
-def scrape_search_products(request: SearchScrapeRequest):
-    if not request.search_url:
-        raise HTTPException(status_code=400, detail="search_url is required")
-    if 'aliexpress.com' not in request.search_url.lower():
-        raise HTTPException(status_code=400, detail="Invalid AliExpress URL")
-
-    max_pages = request.max_pages if request.max_pages is not None else 5
-    max_pages = min(max_pages, MAX_SEARCH_PAGES)
-
+def get_seller_info(product_id: int) -> dict:
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
     try:
-        raw      = scrape_search_results(search_url=request.search_url,
-                                         max_pages=max_pages,
-                                         delay=request.delay_between_requests)
-        products = raw.get("products", []) if isinstance(raw, dict) else (raw or [])
-
-        result         = []
-        accepted_count = 0
-        rejected_count = 0
-
-        for p in products:
-            if not p.get("product_id"):
-                continue
-
-            original_title = p.get("title", "")
-            is_restricted  = filter_restricted_keywords(original_title)
-
-            product_rating     = p.get("rating", "")
-            rating_float       = 0.0
-            rating_filter_fail = False
-            if product_rating:
-                try:
-                    rating_float = float(str(product_rating).strip())
-                    if rating_float < 4.0:
-                        rating_filter_fail = True
-                except (ValueError, TypeError):
-                    pass
-
-            if is_restricted:
-                result.append({
-                    "product_id": str(p["product_id"]), "product_url": p["product_url"],
-                    "title": original_title, "rating": product_rating,
-                    "sold_count": p.get("sold_count", ""), "status": "rejected",
-                    "message": "Title not fetched due to restricted keyword",
-                })
-                rejected_count += 1
-            elif rating_filter_fail:
-                result.append({
-                    "product_id": str(p["product_id"]), "product_url": p["product_url"],
-                    "title": original_title, "rating": product_rating,
-                    "sold_count": p.get("sold_count", ""), "status": "rejected",
-                    "message": f"Rating {rating_float:.1f} is below minimum 4.0",
-                })
-                rejected_count += 1
-            else:
-                result.append({
-                    "product_id": str(p["product_id"]), "product_url": p["product_url"],
-                    "title": original_title, "rating": product_rating,
-                    "sold_count": p.get("sold_count", ""), "status": "accepted",
-                })
-                accepted_count += 1
-
-        return result
-
-    except Exception as e:
-        logger.error(f"❌ Search scrape failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Scraping failed: {str(e)}")
+        cursor.execute("SELECT * FROM seller_info WHERE product_id = ?", (product_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
+    finally:
+        conn.close()
 
 
 # =============================================================================
-# GENERATE-PRODUCT ENDPOINT
+# COMPLIANCE INFO
 # =============================================================================
 
-@app.post("/generate-product", tags=["Product Processing"])
-def generate_product(req: ProductURLRequest):
-    if not req.url:
-        raise HTTPException(status_code=400, detail="URL cannot be empty")
-
-    result = process_product_complete(req.url, extract_compliance=req.extract_compliance)
-    if not result.get("success"):
-        return result
-
-    original_title = result.get("original_title", "")
-    raw_category   = result.get("category")
-
-    if filter_restricted_keywords(original_title):
-        return {
-            "status": "rejected", "reason": "Title has restricted keyword",
-            "product_id": result.get("product_id"), "original_title": original_title,
-            "url": req.url, "timestamp": datetime.now().isoformat(),
-        }
-
-    from product_filter import is_category_restricted
-    cat_blocked, cat_reason = is_category_restricted(raw_category)
-    if cat_blocked:
-        return {
-            "status": "rejected", "reason": cat_reason,
-            "product_id": result.get("product_id"), "original_title": original_title,
-            "url": req.url, "timestamp": datetime.now().isoformat(),
-        }
-
-    return {
-        "status": "accepted", "product_id": result.get("product_id"),
-        "url": req.url, "original_title": original_title,
-        "enhanced_title": result.get("enhanced_title", ""),
-        "category": result.get("category", {}).get("name", ""),
-        "confidence": result.get("category", {}).get("confidence", 0.0),
-        "rating": result.get("rating", ""),
-        "shipment_country": result.get("shipment_country"),
-        "delivery_start":   result.get("delivery_start"),
-        "delivery_end":     result.get("delivery_end"),
-        "delivery_days":    result.get("delivery_days"),
-        "remaining_stock":  result.get("remaining_stock"),
-        "enhanced":   result.get("enhanced", {}),
-        "seller":     result.get("seller", {}),
-        "compliance": result.get("compliance", {}),
-        "template":   result.get("template", {}),
-        "timestamp":  result.get("timestamp"),
-    }
-
-
-# =============================================================================
-# GENERATE-PRODUCTS ENDPOINT
-# =============================================================================
-
-@app.post("/generate-products", tags=["Product Processing"])
-def generate_products(req: BulkProductRequest):
-    if not req.urls:
-        raise HTTPException(status_code=400, detail="URLs list cannot be empty")
-    if len(req.urls) > 20:
-        raise HTTPException(status_code=400, detail="Maximum 20 URLs per request")
-
-    from product_filter import is_category_restricted
-
-    results    = []
-    successful = 0
-    rejected   = 0
-    failed     = 0
-
-    for url in req.urls:
-        result = process_product_complete(url, extract_compliance=req.extract_compliance)
-
-        if not result.get("success"):
-            failed += 1
-            results.append({"status": "error", "url": url,
-                             "reason": result.get("error", "Unknown error"),
-                             "timestamp": datetime.now().isoformat()})
-            continue
-
-        original_title = result.get("original_title", "")
-        raw_category   = result.get("category")
-
-        if filter_restricted_keywords(original_title):
-            rejected += 1
-            results.append({"status": "rejected", "reason": "Title has restricted keyword",
-                             "original_title": original_title, "url": url,
-                             "timestamp": datetime.now().isoformat()})
-            continue
-
-        cat_blocked, cat_reason = is_category_restricted(raw_category)
-        if cat_blocked:
-            rejected += 1
-            results.append({"status": "rejected", "reason": cat_reason,
-                             "original_title": original_title, "url": url,
-                             "timestamp": datetime.now().isoformat()})
-            continue
-
-        successful += 1
-        results.append({
-            "status": "accepted", "product_id": result.get("product_id"),
-            "url": url, "original_title": original_title,
-            "enhanced_title": result.get("enhanced_title", ""),
-            "category": result.get("category", {}).get("name", ""),
-            "confidence": result.get("category", {}).get("confidence", 0.0),
-            "enhanced": result.get("enhanced", {}), "seller": result.get("seller", {}),
-            "compliance": result.get("compliance", {}), "template": result.get("template", {}),
-            "timestamp": result.get("timestamp"),
-        })
-
-    return {
-        "total": len(req.urls), "successful": successful,
-        "rejected": rejected, "failed": failed,
-        "results": results, "timestamp": datetime.now().isoformat(),
-    }
-
-
-# =============================================================================
-# PRODUCT INFO BY ID ENDPOINT
-# =============================================================================
-
-@app.get("/product-info/{product_id}", tags=["Product Processing"])
-def get_product_info_by_id(product_id: str, extract_compliance: bool = False):
-    if not product_id or not product_id.isdigit():
-        raise HTTPException(status_code=400, detail="product_id must be numeric")
-
-    eur_url = (
-        f"https://www.aliexpress.com/item/{product_id}.html"
-        f"?language=en&currency=EUR&gatewayAdapt=pol2glo"
-    )
-    result = process_product_complete(eur_url, extract_compliance=extract_compliance)
-    if not result.get("success"):
-        return result
-
-    original_title = result.get("original_title", "")
-
-    if filter_restricted_keywords(original_title):
-        return {
-            "status": "rejected", "reason": "Title has restricted keyword",
-            "product_id": result.get("product_id"), "original_title": original_title,
-            "url": eur_url, "timestamp": datetime.now().isoformat(),
-        }
-
-    from product_filter import is_category_restricted
-    cat_blocked, cat_reason = is_category_restricted(result.get("category"))
-    if cat_blocked:
-        return {
-            "status": "rejected", "reason": cat_reason,
-            "product_id": result.get("product_id"), "original_title": original_title,
-            "url": eur_url, "timestamp": datetime.now().isoformat(),
-        }
-
-    return {
-        "status": "accepted", "product_id": result.get("product_id"),
-        "aliexpress_id": product_id, "url": eur_url,
-        "original_title": original_title, "enhanced_title": result.get("enhanced_title", ""),
-        "category": result.get("category", {}).get("name", ""),
-        "confidence": result.get("category", {}).get("confidence", 0.0),
-        "rating": result.get("rating", ""),
-        "shipment_country": result.get("shipment_country"),
-        "delivery_start":   result.get("delivery_start"),
-        "delivery_end":     result.get("delivery_end"),
-        "delivery_days":    result.get("delivery_days"),
-        "remaining_stock":  result.get("remaining_stock"),
-        "enhanced":   result.get("enhanced", {}),
-        "seller":     result.get("seller", {}),
-        "compliance": result.get("compliance", {}),
-        "template":   result.get("template", {}),
-        "timestamp":  result.get("timestamp"),
-    }
-
-
-# =============================================================================
-# MERCHANT BULK ENDPOINTS
-# =============================================================================
-
-@app.post("/upload-csv", tags=["Merchant Bulk"])
-async def upload_merchant_csv(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Only .csv files are accepted")
+def insert_compliance_info(product_id: int, compliance_data: dict) -> bool:
+    if not compliance_data:
+        return False
+    conn   = create_connection()
+    cursor = conn.cursor()
     try:
-        content      = await file.read()
-        merchant_ids = parse_merchant_csv(content)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"CSV parse error: {e}")
-
-    if not merchant_ids:
-        raise HTTPException(status_code=422, detail="No valid MerchantID rows found in CSV")
-
-    job_id = str(uuid.uuid4())
-    start_bulk_job(job_id, merchant_ids)
-    return {
-        "job_id": job_id, "merchant_count": len(merchant_ids), "status": "queued",
-        "poll_url": f"/merchant-job-status/{job_id}",
-        "download_url": f"/merchant-download/{job_id}",
-        "message": f"Processing {len(merchant_ids)} merchants in background.",
-    }
-
-
-@app.post("/submit-merchant-ids", tags=["Merchant Bulk"])
-def submit_merchant_ids(req: MerchantIDsRequest):
-    import re as _re2
-    clean_ids = [mid.strip() for mid in req.merchant_ids
-                 if mid and _re2.match(r"^\d+$", mid.strip())]
-    if not clean_ids:
-        raise HTTPException(status_code=422, detail="No valid numeric merchant IDs provided")
-
-    job_id = str(uuid.uuid4())
-    start_bulk_job(job_id, clean_ids)
-    return {
-        "job_id": job_id, "merchant_count": len(clean_ids), "status": "queued",
-        "poll_url": f"/merchant-job-status/{job_id}",
-        "download_url": f"/merchant-download/{job_id}",
-        "message": f"Processing {len(clean_ids)} merchants in background.",
-    }
-
-
-@app.get("/merchant-job-status/{job_id}", tags=["Merchant Bulk"])
-def merchant_job_status(job_id: str):
-    job = get_job_status(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    return {
-        "job_id":   job_id,
-        "status":   job.get("status", "unknown"),
-        "total":    job.get("total_merchants", job.get("total", 0)),
-        "done":     job.get("merchants_done", 0),
-        "progress_pct":   job.get("progress_pct", 0.0),
-        "batches_total":  job.get("batches_total", 0),
-        "batches_done":   job.get("batches_done", 0),
-        "batches_failed": job.get("batches_failed", 0),
-        "download_ready": job.get("download_ready", False),
-        "download_url":   job.get("download_url"),
-    }
-
-
-@app.get("/merchant-download/{job_id}", tags=["Merchant Bulk"])
-def merchant_download(job_id: str):
-    job = get_job_status(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    if job.get("status") != "done":
-        raise HTTPException(status_code=202,
-                            detail=f"Job not complete yet — status: {job['status']}")
-
-    out_path = get_output_path(job_id)
-    if not out_path:
-        raise HTTPException(status_code=404, detail="Output file not found on disk")
-
-    return FastAPIResponse(
-        content=out_path.read_bytes(),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="merchants_{job_id[:8]}.csv"'},
-    )
-
-
-@app.get("/merchant-jobs", tags=["Merchant Bulk"])
-def list_merchant_jobs():
-    jobs = list_all_jobs()
-    return {"jobs": jobs, "count": len(jobs)}
-
-
-@app.post("/merchant-stop/{job_id}", tags=["Merchant Bulk"])
-def stop_merchant_job(job_id: str):
-    """Gracefully stop a running or queued bulk merchant job."""
-    result = stop_job(job_id)
-    if not result.get("success"):
-        status_code = 404 if "not found" in result.get("error", "").lower() else 409
-        raise HTTPException(status_code=status_code,
-                            detail=result.get("error", "Could not stop job"))
-    return result
-
-
-# =============================================================================
-# SCREENSHOT ENDPOINT
-# =============================================================================
-
-@app.get("/merchant-screenshot/{filename}", tags=["Merchant Bulk"])
-def serve_merchant_screenshot(filename: str):
-    if not _re.match(r'^[\w\-\.]+\.png$', filename):
-        raise HTTPException(status_code=400, detail="Invalid filename")
-
-    path = SCREENSHOTS_DIR / filename
-    if not path.exists():
-        raise HTTPException(status_code=404, detail=f"Screenshot not found: {filename}")
-
-    return FileResponse(str(path), media_type="image/png",
-                        headers={"Content-Disposition": f'inline; filename="{filename}"'})
-
-
-# =============================================================================
-# MERCHANT DEBUG  v6.0
-# =============================================================================
-
-@app.post("/merchant-debug", tags=["Merchant Bulk"])
-def merchant_debug(req: MerchantDebugRequest):
-    """DEBUG v6.0 — scrape ONE merchant with full diagnostics."""
-    from camoufox.sync_api import Camoufox
-
-    merchant_id = str(req.merchant_id).strip()
-    if not merchant_id.isdigit():
-        raise HTTPException(status_code=400, detail="merchant_id must be numeric")
-
-    url      = STORE_URL_TEMPLATE.format(merchant_id=merchant_id)
-    ua       = random.choice(USER_AGENTS)
-    t0       = time.time()
-    input_id = merchant_id
-
-    debug: Dict[str, Any] = {
-        "url":              url,
-        "page_loaded":      False,
-        "final_url":        None,
-        "html_size_bytes":  0,
-        "blocked":          False,
-        "networkidle":      None,
-        "poll_result":      None,
-        "response_hits":    [],
-        "global_hits":      [],
-        "dom_dump":         None,
-        "canonical_store_id": None,
-        "alias_warning":    None,
-        "load_time_sec":    None,
-        "nav_error":        None,
-        "screenshot_filename": None,
-        "screenshot_url":      None,
-        "screenshot_b64":      None,
-    }
-
-    try:
-        with Camoufox(headless=True, os="windows") as browser:
-            ctx  = _make_context(browser, ua, merchant_id)
-            page = ctx.new_page()
-
-            response_hits: List[Dict] = []
-            landed_id = input_id
-
-            def _on_response(resp):
-                try:
-                    ct    = (resp.headers or {}).get("content-type", "")
-                    url_r = resp.url
-                    if not _is_valid_response_url(url_r, ct):
-                        return
-                    data = None
-                    try:
-                        data = resp.json()
-                    except Exception:
-                        pass
-                    if data is not None:
-                        cand = _best_count_from_json(data, expected_ids={input_id, landed_id})
-                        if cand:
-                            response_hits.append({"source": "response", "url": url_r, **cand})
-                    else:
-                        try:
-                            raw_text = resp.text()
-                            for pattern in RAW_HTML_COUNT_PATTERNS:
-                                m = _re.search(pattern, raw_text, _re.I)
-                                if m:
-                                    val = int(m.group(1))
-                                    if 1 <= val <= 500_000:
-                                        response_hits.append({
-                                            "source": "response_text_regex",
-                                            "url": url_r, "count": val,
-                                            "path": "raw_text_regex", "score": 15,
-                                        })
-                                        break
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-            page.on("response", _on_response)
-
-            try:
-                page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
-                debug["page_loaded"] = True
-            except Exception as nav_err:
-                es = str(nav_err)
-                debug["nav_error"] = es[:200]
-                if any(x in es for x in [
-                    "blockedbyclient", "ERR_BLOCKED",
-                    "NS_BINDING_ABORTED", "ERR_ABORTED"
-                ]):
-                    debug["page_loaded"] = True
-                    debug["nav_error"]   = "Nav aborted/redirected — continuing"
-                elif any(x in es for x in ["ERR_NAME_NOT_RESOLVED", "NS_ERROR_UNKNOWN_HOST"]):
-                    screenshot_path = _save_screenshot(page, merchant_id, "dns_error")
-                    _attach_screenshot(debug, screenshot_path, merchant_id)
-                    page.close(); ctx.close()
-                    return {"success": False, "merchant_id": merchant_id,
-                            "total_items": None, "error": "Page Not Found", "debug": debug}
-                else:
-                    screenshot_path = _save_screenshot(page, merchant_id, "nav_error")
-                    _attach_screenshot(debug, screenshot_path, merchant_id)
-                    page.close(); ctx.close()
-                    return {"success": False, "merchant_id": merchant_id,
-                            "total_items": None, "error": f"Nav: {es[:150]}", "debug": debug}
-
-            landed_id = _extract_store_id(page.url) or input_id
-            if landed_id != input_id:
-                debug["alias_warning"]      = f"AliExpress canonicalised {input_id} → {landed_id}"
-                debug["canonical_store_id"] = landed_id
-
-            try:
-                page.wait_for_load_state("networkidle", timeout=NETWORKIDLE_TIMEOUT)
-                debug["networkidle"] = "reached"
-            except Exception:
-                debug["networkidle"] = "timeout"
-
-            for _ in range(3):
-                page.mouse.wheel(0, 600)
-                page.wait_for_timeout(400)
-            page.wait_for_timeout(1_000)
-
-            landed_id = _extract_store_id(page.url) or landed_id
-            debug["canonical_store_id"] = landed_id
-            if landed_id != input_id and not debug.get("alias_warning"):
-                debug["alias_warning"] = f"AliExpress canonicalised {input_id} → {landed_id}"
-
-            global_hits: List[Dict] = []
-            try:
-                global_hits = page.evaluate(_JS_GLOBAL_CANDIDATES, [input_id, landed_id])
-            except Exception as e:
-                logger.debug(f"[debug] global scan failed: {e}")
-
-            polled = _wait_for_item_count(page, poll_timeout_ms=POLL_TIMEOUT_MS)
-
-            try:
-                debug["dom_dump"] = page.evaluate(_JS_DOM_DUMP)
-            except Exception as e:
-                debug["dom_dump"] = {"error": str(e)[:80]}
-
-            debug["final_url"]        = page.url
-            debug["load_time_sec"]    = round(time.time() - t0, 2)
-            debug["response_hits"]    = response_hits[:5]
-            debug["global_hits"]      = global_hits[:5]
-            debug["poll_result"]      = polled
-
-            html = page.content()
-            debug["html_size_bytes"] = len(html)
-            lower = html.lower()
-            debug["blocked"] = any(sig in lower for sig in REAL_BLOCK_SIGNALS)
-
-            if debug["blocked"]:
-                screenshot_path = _save_screenshot(page, merchant_id, "captcha")
-                _attach_screenshot(debug, screenshot_path, merchant_id)
-                page.close(); ctx.close()
-                return {"success": False, "merchant_id": merchant_id,
-                        "canonical_store_id": landed_id,
-                        "total_items": None, "error": "Blocked/CAPTCHA", "debug": debug}
-
-            page.close()
-            ctx.close()
-
-            best_count:  Optional[int] = None
-            best_source: Optional[str] = None
-
-            if response_hits:
-                best_count  = response_hits[0]["count"]
-                best_source = "response_json"
-            if best_count is None and global_hits:
-                best_count  = global_hits[0]["count"]
-                best_source = "global_state"
-            if best_count is None and polled is not None:
-                best_count  = polled
-                best_source = "dom_poll"
-
-            if best_count is not None:
-                return {
-                    "success":            True,
-                    "merchant_id":        input_id,
-                    "canonical_store_id": landed_id,
-                    "total_items":        best_count,
-                    "extraction_source":  best_source,
-                    "warning":            debug.get("alias_warning"),
-                    "error":              None,
-                    "debug":              debug,
-                }
-
-            debug["html_head_500"] = html[:500].replace("\n", " ")
-            return {
-                "success":            False,
-                "merchant_id":        input_id,
-                "canonical_store_id": landed_id,
-                "total_items":        None,
-                "error":              "Selector Missing — check debug.dom_dump and debug.global_hits",
-                "debug":              debug,
-            }
-
+        cursor.execute("""
+            INSERT OR IGNORE INTO compliance_info (
+                product_id, compliance_product_id,
+                manufacturer_name, manufacturer_address,
+                manufacturer_email, manufacturer_phone,
+                eu_responsible_name, eu_responsible_address,
+                eu_responsible_email, eu_responsible_phone
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            compliance_data.get('compliance_product_id', ''),
+            compliance_data.get('manufacturer_name', ''),
+            compliance_data.get('manufacturer_address', ''),
+            compliance_data.get('manufacturer_email', ''),
+            compliance_data.get('manufacturer_phone', ''),
+            compliance_data.get('eu_responsible_name', ''),
+            compliance_data.get('eu_responsible_address', ''),
+            compliance_data.get('eu_responsible_email', ''),
+            compliance_data.get('eu_responsible_phone', ''),
+        ))
+        conn.commit()
+        if cursor.rowcount > 0:
+            print(f"Compliance info saved (product_id={product_id})")
+        return True
     except Exception as exc:
-        debug["load_time_sec"] = round(time.time() - t0, 2)
-        return {"success": False, "merchant_id": merchant_id,
-                "total_items": None, "error": str(exc)[:300], "debug": debug}
+        print(f"Compliance info error: {exc}")
+        return False
+    finally:
+        conn.close()
 
 
-def _attach_screenshot(debug: dict, screenshot_path: Optional[str], merchant_id: str) -> None:
-    if not screenshot_path:
-        return
-    from pathlib import Path as _Path
-    filename = _Path(screenshot_path).name
-    debug["screenshot_filename"] = filename
-    debug["screenshot_url"]      = f"/merchant-screenshot/{filename}"
-    debug["screenshot_b64"]      = _screenshot_to_b64(screenshot_path)
+def get_compliance_info(product_id: int) -> list:
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM compliance_info WHERE product_id = ?", (product_id,))
+        return [dict(r) for r in cursor.fetchall()]
+    except Exception:
+        return []
+    finally:
+        conn.close()
 
 
 # =============================================================================
-# VARIANT ENDPOINTS  (uses the `varient` table via db.py)
+# SCRAPED PRODUCTS
 # =============================================================================
 
-@app.post("/scrape-variants", tags=["Variants"])
-def scrape_variants(req: VariantScrapeRequest):
-    """
-    Scrape color swatches and sizes (including per-country dropdown) for an
-    AliExpress product ID and persist to the `varient` table.
+def insert_scraped_product(url: str, attributes: dict):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO scraped_products (
+                url, title, description, brand,
+                image_1, image_2, image_3, image_4, image_5, image_6,
+                color, dimensions, weight, material,
+                age_from, age_to, certifications, country_of_origin,
+                bullet_points, price, shipping, warranty, product_type,
+                store_name, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            url,
+            attributes.get("title", ""),
+            attributes.get("description", ""),
+            attributes.get("brand", ""),
+            attributes.get("image_1", ""),
+            attributes.get("image_2", ""),
+            attributes.get("image_3", ""),
+            attributes.get("image_4", ""),
+            attributes.get("image_5", ""),
+            attributes.get("image_6", ""),
+            attributes.get("color", ""),
+            attributes.get("dimensions", ""),
+            attributes.get("weight", ""),
+            attributes.get("material", ""),
+            attributes.get("age_from", ""),
+            attributes.get("age_to", ""),
+            attributes.get("certifications", ""),
+            attributes.get("country_of_origin", ""),
+            json.dumps(attributes.get("bullet_points", [])),
+            attributes.get("price", ""),
+            attributes.get("shipping", ""),
+            attributes.get("warranty", ""),
+            attributes.get("product_type", ""),
+            attributes.get("store_name", ""),
+            json.dumps(attributes),
+        ))
+        conn.commit()
+        product_id = cursor.lastrowid
+        print(f"Scraped product saved (product_id={product_id})")
+        return product_id
+    except sqlite3.IntegrityError:
+        cursor.execute("SELECT product_id FROM scraped_products WHERE url = ?", (url,))
+        row = cursor.fetchone()
+        product_id = row[0] if row else None
+        print(f"Product already exists (product_id={product_id})")
+        return product_id
+    except Exception as exc:
+        print(f"Error inserting scraped product: {exc}")
+        return None
+    finally:
+        conn.close()
 
-    - Returns cached data from the DB unless force_rescrape=true.
-    - The `varient` table is keyed by the AliExpress numeric ID string, so the
-      product does NOT need to exist in scraped_products first.
 
-    Size types returned:
-      "plain"         — simple tiles: S / M / L / XL
-      "country_mapped"— tiles carry country codes: S(EU 36), M(US 6) …
-                        (either from inline labels or the country dropdown)
+# =============================================================================
+# CATEGORY ASSIGNMENT
+# =============================================================================
 
-    Returns the full variant JSON:
-    {
-      "product_id": "1005012117886583",
-      "variants": {
-        "color": [{"name": "Navy Blue", "image_url": "...",
-                   "sku_col_id": "14-193", "selected": false}],
-        "size": {
-          "type": "plain" | "country_mapped",
-          "systems": [{"country": "EU", "options": ["S(EU 36)", ...]}],
-          "plain_options": ["S", "M", "L", "XL"]
+def insert_category_assignment(product_id, orig_cat_id, orig_cat_name,
+                                enh_cat_id, enh_cat_name, confidence):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO category_assignments
+            (product_id, original_category_id, original_category_name,
+             enhanced_category_id, enhanced_category_name, confidence)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (product_id, orig_cat_id, orig_cat_name,
+              enh_cat_id, enh_cat_name, confidence))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# MAPPED PRODUCTS
+# =============================================================================
+
+def insert_mapped_product(product_id, category_id, mapped_data):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO mapped_products (
+                product_id, titre, description, marque,
+                url_image_1, couleur_principale, dimensions, poids, matiere,
+                age_from, age_to, certifications, pays_origine,
+                fabricant_nom, garantie, notes, additional_fields
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            mapped_data.get("title", ""),
+            mapped_data.get("description", ""),
+            mapped_data.get("brand", ""),
+            mapped_data.get("sellerPictureUrls_1", ""),
+            mapped_data.get("3264", ""),
+            mapped_data.get("24069", ""),
+            mapped_data.get("5403", ""),
+            mapped_data.get("24061", ""),
+            mapped_data.get("11335", ""),
+            mapped_data.get("24947", ""),
+            mapped_data.get("38412", ""),
+            mapped_data.get("37045", ""),
+            mapped_data.get("47456", ""),
+            mapped_data.get("37937", ""),
+            mapped_data.get("6587", ""),
+            json.dumps({k: v for k, v in mapped_data.items()}),
+        ))
+        conn.commit()
+        print(f"Mapped product saved (product_id={product_id})")
+        return True
+    except Exception as exc:
+        print(f"Mapped product error: {exc}")
+        return False
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# TEMPLATE OUTPUT
+# =============================================================================
+
+def insert_template_output(product_id, category_id, output_type,
+                            file_path, file_name, status="success"):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO template_outputs
+            (product_id, category_id, output_type, file_path, file_name, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (product_id, category_id, output_type, file_path, file_name, status))
+        conn.commit()
+        return True
+    except Exception as exc:
+        print(f"Template output error: {exc}")
+        return False
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# PROCESSING LOGS
+# =============================================================================
+
+def log_processing(product_id, url, step, status, message=""):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO processing_logs (product_id, url, step, status, message)
+            VALUES (?, ?, ?, ?, ?)
+        """, (product_id, url, step, status, message))
+        conn.commit()
+    except Exception as exc:
+        print(f"Log error: {exc}")
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# SPECIFICATIONS
+# =============================================================================
+
+SPEC_FIELDS = [
+    'brand', 'color', 'dimensions', 'weight', 'material',
+    'certifications', 'country_of_origin', 'warranty',
+    'product_type', 'age_from', 'age_to', 'gender'
+]
+
+
+def insert_enhanced_content(product_id, enhanced_data):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO enhanced_content (
+                product_id, title, description, bullet_points, html_description,
+                brand, color, dimensions, weight, material, certifications,
+                country_of_origin, warranty, product_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            enhanced_data.get('title', ''),
+            enhanced_data.get('description', ''),
+            json.dumps(enhanced_data.get('bullet_points', [])),
+            enhanced_data.get('html_description', ''),
+            enhanced_data.get('brand', ''),
+            enhanced_data.get('color', ''),
+            enhanced_data.get('dimensions', ''),
+            enhanced_data.get('weight', ''),
+            enhanced_data.get('material', ''),
+            enhanced_data.get('certifications', ''),
+            enhanced_data.get('country_of_origin', ''),
+            enhanced_data.get('warranty', ''),
+            enhanced_data.get('product_type', ''),
+        ))
+        conn.commit()
+        print(f"Enhanced content saved (product_id={product_id})")
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as exc:
+        print(f"Enhanced content error: {exc}")
+        return False
+    finally:
+        conn.close()
+
+
+def insert_original_specifications(product_id, original_specs):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO original_specifications (
+                product_id, brand, color, dimensions, weight, material,
+                certifications, country_of_origin, warranty, product_type,
+                age_from, age_to, gender
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            original_specs.get("brand", ""),
+            original_specs.get("color", ""),
+            original_specs.get("dimensions", ""),
+            original_specs.get("weight", ""),
+            original_specs.get("material", ""),
+            original_specs.get("certifications", ""),
+            original_specs.get("country_of_origin", ""),
+            original_specs.get("warranty", ""),
+            original_specs.get("product_type", ""),
+            original_specs.get("age_from", ""),
+            original_specs.get("age_to", ""),
+            original_specs.get("gender", ""),
+        ))
+        conn.commit()
+        print(f"Original specs saved (product_id={product_id})")
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as exc:
+        print(f"Original specs error: {exc}")
+        return False
+    finally:
+        conn.close()
+
+
+def insert_enhanced_specifications(product_id, enhanced_specs):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO enhanced_specifications (
+                product_id, brand, color, dimensions, weight, material,
+                certifications, country_of_origin, warranty, product_type,
+                age_from, age_to, gender
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            product_id,
+            enhanced_specs.get("brand", ""),
+            enhanced_specs.get("color", ""),
+            enhanced_specs.get("dimensions", ""),
+            enhanced_specs.get("weight", ""),
+            enhanced_specs.get("material", ""),
+            enhanced_specs.get("certifications", ""),
+            enhanced_specs.get("country_of_origin", ""),
+            enhanced_specs.get("warranty", ""),
+            enhanced_specs.get("product_type", ""),
+            enhanced_specs.get("age_from", ""),
+            enhanced_specs.get("age_to", ""),
+            enhanced_specs.get("gender", ""),
+        ))
+        conn.commit()
+        print(f"Enhanced specs saved (product_id={product_id})")
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as exc:
+        print(f"Enhanced specs error: {exc}")
+        return False
+    finally:
+        conn.close()
+
+
+def log_specification_audit(product_id, spec_field, original_value,
+                             enhanced_value, template_value, source_used, notes=""):
+    conn   = create_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO specification_audit_log (
+                product_id, spec_field, original_value,
+                enhanced_value, template_value, source_used, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (product_id, spec_field, original_value or "",
+              enhanced_value or "", template_value or "", source_used, notes))
+        conn.commit()
+    except Exception as exc:
+        print(f"Audit log error: {exc}")
+    finally:
+        conn.close()
+
+
+def log_all_spec_audits(product_id, scraped_data, specs_enhanced, enriched_data_for_template):
+    audit_fields = [
+        'brand', 'color', 'dimensions', 'weight', 'material',
+        'certifications', 'country_of_origin', 'warranty', 'product_type'
+    ]
+    for field in audit_fields:
+        original_val = scraped_data.get(field, "")
+        enhanced_val = specs_enhanced.get(field, "")
+        template_val = enriched_data_for_template.get(field, "")
+        source       = "enhanced" if template_val else "empty"
+        log_specification_audit(product_id, field, original_val,
+                                enhanced_val, template_val, source)
+    print(f"Audit log written (product_id={product_id})")
+
+
+def get_all_manufacturer_info(limit: int = 10) -> list:
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM compliance_info ORDER BY extracted_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        print(f"[db] get_all_manufacturer_info error: {exc}")
+        return []
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# BACKWARD COMPAT
+# =============================================================================
+
+def create_table():
+    create_all_tables()
+
+
+def create_categories_table():
+    pass
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == 'load-keywords':
+        csv_file = sys.argv[2] if len(sys.argv) > 2 else 'restricted_keywords.csv'
+        create_all_tables()
+        n = load_restricted_keywords_from_csv(csv_file)
+        print(f"Loaded {n} keywords from {csv_file}")
+    elif len(sys.argv) > 1 and sys.argv[1] == 'test-variants':
+        # Quick smoke test: insert sample data and read it back
+        create_all_tables()
+        sample = {
+            "product_id": "1005010435033239",
+            "variants": {
+                "color": [
+                    {"name": "White", "image_url": "https://example.com/white.jpg",
+                     "sku_col_id": "14-29", "selected": True},
+                    {"name": "Black", "image_url": "https://example.com/black.jpg",
+                     "sku_col_id": "14-193", "selected": False},
+                ],
+                "size": {
+                    "type": "country_mapped",
+                    "systems": [
+                        {"country": "EU", "options": ["S(EU 36)", "M(EU 38)", "L(EU 40/42)"]},
+                        {"country": "US", "options": ["S(US 4)", "M(US 6)", "L(US 08/10)"]},
+                        {"country": "UK", "options": ["S(UK 8)", "M(UK 10)", "L(UK 12/14)"]},
+                    ],
+                    "plain_options": [],
+                },
+            },
         }
-      },
-      "source": "cache" | "scraped",
-      "db_product_id": 42 | null
-    }
-    """
-    from variant_scraper import scrape_product_variants
-    from db import save_variants, get_variants
-
-    pid = req.product_id.strip()
-    if not pid.isdigit():
-        raise HTTPException(status_code=400, detail="product_id must be a numeric string")
-
-    # ── Optional FK: link to scraped_products if the product was already scraped
-    db_product_id = _lookup_db_product_id(pid)
-
-    # ── Return cached data unless force_rescrape requested ───────────────────
-    if not req.force_rescrape:
-        cached = get_variants(pid)
-        if cached:
-            logger.info(f"[variants] Returning cached variants for aliexpress_id={pid}")
-            return {**cached, "source": "cache", "db_product_id": db_product_id}
-
-    # ── Scrape ────────────────────────────────────────────────────────────────
-    logger.info(f"[variants] Scraping variants for aliexpress_id={pid}")
-    result = scrape_product_variants(pid)
-
-    if result.get("error"):
-        raise HTTPException(
-            status_code=502,
-            detail=f"Variant scraping failed: {result['error']}"
-        )
-
-    # ── Persist to the `varient` table via db.save_variants() ────────────────
-    save_result = save_variants(result)
-    logger.info(
-        f"[variants] Save → inserted={save_result['inserted']} "
-        f"skipped={save_result['skipped']} errors={save_result['errors']}"
-    )
-
-    return {
-        **result,
-        "source":        "scraped",
-        "db_product_id": db_product_id,
-        "save_result":   save_result,
-        "timestamp":     datetime.now().isoformat(),
-    }
-
-
-@app.get("/db/variants/{aliexpress_id}", tags=["Variants"])
-def db_get_variants(aliexpress_id: str):
-    """
-    Return the stored variant data for an AliExpress product ID directly from
-    the `varient` table. No scraping is performed.
-
-    Returns 404 if no variant rows exist — call POST /scrape-variants first.
-
-    Response shape:
-    {
-      "product_id":    "1005012117886583",
-      "db_product_id": 42,               // scraped_products FK (null if never scraped)
-      "variants": {
-        "color": [{"name": ..., "image_url": ..., "sku_col_id": ..., "selected": bool}],
-        "size": {
-          "type": "plain" | "country_mapped",
-          "systems": [{"country": "EU", "options": ["S(EU 36)", ...]}],
-          "plain_options": [...]
-        }
-      }
-    }
-    """
-    from db import get_variants
-
-    pid = aliexpress_id.strip()
-    if not pid.isdigit():
-        raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
-
-    data = get_variants(pid)
-    if not data:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No variants stored for product {pid}. "
-                f"Call POST /scrape-variants with product_id={pid} first."
-            ),
-        )
-
-    db_product_id = _lookup_db_product_id(pid)
-    return {**data, "db_product_id": db_product_id}
-
-
-@app.get("/db/variants/{aliexpress_id}/summary", tags=["Variants"])
-def db_get_variant_summary(aliexpress_id: str):
-    """
-    Return a lightweight summary of stored variants: color count, total size
-    rows, and the list of country codes available.
-
-    Useful for dashboards or a quick status check without transferring the full
-    variant payload.
-
-    Example response:
-    {
-      "aliexpress_id":  "1005012117886583",
-      "db_product_id":  42,
-      "color_count":    3,
-      "size_count":     78,
-      "countries":      ["AU", "BR", "DE", "ES", "EU", "FR", "IT", "JP",
-                         "KR", "MX", "SG", "UK", "US"]
-    }
-    """
-    from db import get_variant_summary
-
-    pid = aliexpress_id.strip()
-    if not pid.isdigit():
-        raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
-
-    summary = get_variant_summary(pid)
-    if not summary:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No variants stored for product {pid}. "
-                f"Call POST /scrape-variants with product_id={pid} first."
-            ),
-        )
-
-    db_product_id = _lookup_db_product_id(pid)
-    return {**summary, "aliexpress_id": pid, "db_product_id": db_product_id}
-
-
-@app.delete("/db/variants/{aliexpress_id}", tags=["Variants"])
-def db_delete_variants(aliexpress_id: str):
-    """
-    Delete all variant rows for an AliExpress product ID from the `varient`
-    table.  Useful before a forced re-scrape or when a product is delisted.
-
-    Returns the number of rows deleted.
-
-    Response:
-    {
-      "aliexpress_id": "1005012117886583",
-      "rows_deleted":  84,
-      "message":       "Variants deleted"
-    }
-    """
-    from db import delete_variants
-
-    pid = aliexpress_id.strip()
-    if not pid.isdigit():
-        raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
-
-    rows_deleted = delete_variants(pid)
-    return {
-        "aliexpress_id": pid,
-        "rows_deleted":  rows_deleted,
-        "message":       "Variants deleted" if rows_deleted else "No variant rows found",
-    }
-
-
-# =============================================================================
-# RELOAD FILTERS
-# =============================================================================
-
-@app.post("/reload-filters", tags=["Product Processing"])
-def reload_filters():
-    reload_filter_data()
-    return {"status": "ok", "message": "Filter data reloaded from DB"}
-
-
-# =============================================================================
-# EXPORT TEMPLATES
-# =============================================================================
-
-@app.post("/export-templates", tags=["Export"])
-def export_templates(only_new: bool = False):
-    """
-    Batch-export all categorized products to per-category .xlsm files.
-    Pass ?only_new=true to export only products not yet exported (incremental).
-    """
-    from batch_export import run_export
-    return run_export(only_new=only_new)
-
-
-# =============================================================================
-# MANUFACTURER INFO
-# =============================================================================
-
-@app.get("/manufacturer", tags=["Database"])
-def get_manufacturers(limit: int = 10):
-    """Return manufacturer/compliance info collected during scraping."""
-    from db import get_all_manufacturer_info
-    return get_all_manufacturer_info(limit=limit)
-
-
-# =============================================================================
-# DATABASE VIEW ENDPOINTS
-# =============================================================================
-
-@app.get("/scraped-products", tags=["Database"])
-def view_scraped_products(limit: int = 100):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM scraped_products ORDER BY scraped_at DESC LIMIT {min(limit, 1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/seller-info", tags=["Database"])
-def view_seller_info(limit: int = 100):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM seller_info ORDER BY scraped_at DESC LIMIT {min(limit, 1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/seller-info/{product_id}", tags=["Database"])
-def get_seller_info_by_product(product_id: int):
-    try:
-        conn = get_db_connection()
-        row  = conn.execute(
-            "SELECT * FROM seller_info WHERE product_id = ?", (product_id,)
-        ).fetchone()
-        conn.close()
-        return dict(row) if row else {"message": f"No seller info for product {product_id}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/compliance-info", tags=["Database"])
-def view_compliance_info(limit: int = 100):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM compliance_info ORDER BY extracted_at DESC LIMIT {min(limit, 1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/compliance-info/{product_id}", tags=["Database"])
-def get_compliance_by_product(product_id: int):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            "SELECT * FROM compliance_info WHERE product_id = ?", (product_id,)
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": f"No compliance for product {product_id}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/stats", tags=["Database"])
-def get_stats():
-    try:
-        conn   = get_db_connection()
-        tables = [
-            "scraped_products", "mapped_products", "template_outputs",
-            "processing_logs", "category_assignments", "enhanced_content",
-            "original_specifications", "enhanced_specifications",
-            "specification_audit_log", "seller_info", "compliance_info",
-            "translation", "varient",
-        ]
-        stats = {}
-        for table in tables:
-            try:
-                stats[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            except Exception:
-                stats[table] = 0
-        conn.close()
-        return stats
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/processing-logs", tags=["Database"])
-def view_processing_logs(limit: int = 500):
-    try:
-        conn = get_db_connection()
-        rows = conn.execute(
-            f"SELECT * FROM processing_logs ORDER BY log_time DESC LIMIT {min(limit, 1000)}"
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows] if rows else {"message": "No records"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# =============================================================================
-# MAIN
-# =============================================================================
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v3.4")
-    logger.info(f"📡 Server: http://0.0.0.0:{port}")
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+        result = save_variants(sample)
+        print(f"Save result: {result}")
+        summary = get_variant_summary("1005010435033239")
+        print(f"Summary: {summary}")
+        recovered = get_variants("1005010435033239")
+        print(json.dumps(recovered, indent=2, ensure_ascii=False))
+    else:
+        create_all_tables()
+        print("Tables created. Commands: load-keywords <csv> | test-variants")
