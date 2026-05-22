@@ -73,18 +73,16 @@ jobs:
             fi
 
             # ────────────────────────────────────────────────
-            # Activate virtual environment
+            # Activate virtual environment and update deps
             # ────────────────────────────────────────────────
             source venv/bin/activate || { echo "Failed to activate virtualenv"; exit 1; }
-
-            # ────────────────────────────────────────────────
-            # Update dependencies
-            # ────────────────────────────────────────────────
             pip install --upgrade pip
             pip install -r requirements.txt || { echo "Failed to install dependencies"; exit 1; }
+            echo "✅ Dependencies updated"
 
             # ────────────────────────────────────────────────
-            # Write all secrets to .env (one file, fresh each deploy)
+            # Write secrets to .env (fresh each deploy)
+            # The systemd service reads this file via EnvironmentFile=
             # ────────────────────────────────────────────────
             cat > .env << 'ENVEOF'
             OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
@@ -94,43 +92,27 @@ jobs:
 
             # Write GCP service account key
             echo '${{ secrets.GCP_SA_KEY }}' > gcp-service-account.json
-            export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/gcp-service-account.json"
             echo "✅ GCP credentials written"
 
             # ────────────────────────────────────────────────
-            # Stop old uvicorn using PID file
+            # Restart via systemd — this is the ONLY process
+            # manager. No nohup, no PID files.
+            # sudo is allowed passwordless for this command only
+            # (see sudoers note below).
             # ────────────────────────────────────────────────
-            PID_FILE="/home/aimanbatool114/Project_pipeline/uvicorn.pid"
+            sudo systemctl restart project-pipeline.service || { echo "systemctl restart failed"; exit 1; }
+            sleep 3
 
-            if [ -f "$PID_FILE" ]; then
-              OLD_PID=$(cat "$PID_FILE")
-              if kill -0 "$OLD_PID" 2>/dev/null; then
-                echo "Stopping old uvicorn (PID $OLD_PID)..."
-                kill "$OLD_PID" || echo "Could not kill old PID (already gone?)"
-                sleep 4
-              else
-                echo "Old PID $OLD_PID not running anymore"
-              fi
-              rm -f "$PID_FILE"
+            # ────────────────────────────────────────────────
+            # Verify the service actually came up
+            # ────────────────────────────────────────────────
+            if sudo systemctl is-active --quiet project-pipeline.service; then
+              echo "✅ Service is running"
             else
-              echo "No PID file found — first deploy or already stopped"
+              echo "❌ Service failed to start — showing last 30 log lines:"
+              sudo journalctl -u project-pipeline.service -n 30 --no-pager
+              exit 1
             fi
 
-            # ────────────────────────────────────────────────
-            # Start FastAPI server with env vars loaded
-            # ────────────────────────────────────────────────
-            export $(grep -v '^#' .env | xargs)
-
-            nohup /home/aimanbatool114/Project_pipeline/venv/bin/python -m uvicorn main:app \
-              --host 0.0.0.0 \
-              --port 8686 \
-              --log-level info \
-              --access-log \
-              > uvicorn.log 2>&1 &
-
-            NEW_PID=$!
-            echo "$NEW_PID" > "$PID_FILE"
-            disown
-
-            echo "✅ Deployment complete. PID $NEW_PID"
-            echo "Logs: tail -f /home/aimanbatool114/Project_pipeline/uvicorn.log"
+            echo "✅ Deployment complete"
+            echo "Logs: sudo journalctl -u project-pipeline.service -f"
