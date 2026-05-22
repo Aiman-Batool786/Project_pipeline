@@ -1,30 +1,23 @@
 """
-variant_scraper.py  (anti-block edition)
-─────────────────────────────────────────
+variant_scraper.py  (anti-block edition v2)
+─────────────────────────────────────────────
 Extracts structured product variant data from AliExpress product pages.
 
-Anti-blocking techniques (ported from scraper.py):
-  ✅ Camoufox with os='windows' fingerprint spoofing
-  ✅ Random User-Agent rotation
+Anti-blocking techniques:
+  ✅ Camoufox with OS-matched User-Agent (windows UA ↔ os='windows', etc.)
+  ✅ Random User-Agent rotation per OS bucket
   ✅ Region URL rotation (REGIONS_SAFE / REGIONS_EU + SERVER_IS_EU flag)
+  ✅ Optional residential proxy support (PROXY_LIST)
   ✅ GDPR / cookie-banner auto-dismissal (_dismiss_gdpr_banner)
   ✅ EU-page detection → auto-triggers consent flow
   ✅ ThreadPoolExecutor with hard timeout → no zombie browser hangs
   ✅ page.on('response') mtop interceptor → confirms real page load vs bot wall
+  ✅ Early bot-wall detection via page title check after navigation
   ✅ Scroll-to-top retry when SKU tiles not found on first pass
-  ✅ max_retries=3 with randomised jitter sleeps between attempts
-  ✅ Extra HTTP headers (Accept-Language) for naturalness
-
-Handles:
-  • Color variants  — image-based swatches (sku-item--image)
-  • Size variants   — text tiles (sku-item--text)
-  • Country dropdown — Size(EU), Size(US), etc.
-      ✅ Opens dropdown using correct selector
-      ✅ Reads ALL country options from .comet-v2-menu-item
-      ✅ Clicks each country, waits for DOM refresh
-      ✅ Extracts sizes after each selection
-      ✅ Avoids stale element issues by re-querying each loop
-  • Plain sizes — "S", "M", "L", "XL"
+  ✅ max_retries=3 with exponential + jitter sleeps between attempts
+  ✅ Extra HTTP headers (Accept-Language, Accept, Sec-Fetch-*) for naturalness
+  ✅ Randomised viewport size to avoid fingerprint uniformity
+  ✅ Human-like mouse movement before scraping
 
 Output JSON contract:
 {
@@ -77,6 +70,11 @@ _SIZE_BTN_COUNTRY_RE = re.compile(r'Size\s*\(([A-Z]{2})\)', re.IGNORECASE)
 # Strip AliExpress thumbnail/avif suffixes
 _AVIF_THUMB_RE = re.compile(r'(_\d+x\d+q\d+\.jpg_\.avif|_\.avif)$', re.IGNORECASE)
 
+# Bot-wall page title keywords
+_BOT_WALL_TITLES = ['verify', 'captcha', 'robot', 'security check', 'blocked',
+                    'access denied', 'unusual traffic', 'are you human']
+
+
 # ── Anti-block config ─────────────────────────────────────────────────────────
 
 # Set True when running on an EU server so region rotation favours EU IPs
@@ -85,17 +83,32 @@ SERVER_IS_EU = False
 REGIONS_SAFE = ["AE", "US", "AU", "CA", "PK", "SA", "TR"]
 REGIONS_EU   = ["DE", "FR", "NL", "IT", "ES"]
 
-USER_AGENTS = [
+# ── OS-matched User-Agent buckets (IMPORTANT: must match Camoufox os= param) ──
+WINDOWS_USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+    "Gecko/20100101 Firefox/125.0",
+]
+
+MACOS_USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/16.6 Safari/605.1.15",
+]
+
+# ── Proxy list (optional) ─────────────────────────────────────────────────────
+# Format: "http://user:pass@host:port"  or  "http://host:port"
+# Leave empty to run without proxies (expect higher block rate from servers).
+PROXY_LIST: list[str] = [
+    # "http://user:pass@residential-proxy-host:port",
 ]
 
 MAX_RETRIES   = 3
@@ -110,7 +123,38 @@ _SKU_ROW_SEL      = '[data-sku-row]'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# URL / FINGERPRINT HELPERS
+# FINGERPRINT HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pick_os_and_ua() -> tuple[str, str]:
+    """
+    Pick a random OS and a matching User-Agent string.
+    Camoufox os= param must match the UA OS to avoid fingerprint mismatch.
+    """
+    os_choice = random.choice(['windows', 'macos'])
+    ua = random.choice(
+        WINDOWS_USER_AGENTS if os_choice == 'windows' else MACOS_USER_AGENTS
+    )
+    return os_choice, ua
+
+
+def _pick_proxy() -> Optional[dict]:
+    """Return a random proxy dict for Playwright context, or None."""
+    if not PROXY_LIST:
+        return None
+    raw = random.choice(PROXY_LIST)
+    return {"server": raw}
+
+
+def _random_viewport() -> dict:
+    """Randomise viewport slightly to avoid a uniform fingerprint."""
+    width  = random.randint(1366, 1920)
+    height = random.randint(768, 1080)
+    return {"width": width, "height": height}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# URL HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_product_url(product_id: str) -> str:
@@ -149,6 +193,27 @@ def _normalise_image_url(url: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ANTI-BLOCK: BOT-WALL DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_bot_wall_page(page) -> bool:
+    """
+    Return True if the current page looks like a CAPTCHA / bot-wall.
+    Checks page title and URL for known challenge indicators.
+    """
+    try:
+        title = (page.title() or '').lower()
+        url   = (page.url or '').lower()
+        combined = title + ' ' + url
+        if any(kw in combined for kw in _BOT_WALL_TITLES):
+            print(f'[variant_scraper] ⚠ Bot wall detected — title="{page.title()}"')
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ANTI-BLOCK: BANNER / CONSENT DISMISSAL
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -180,6 +245,28 @@ def _dismiss_banners(page) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ANTI-BLOCK: HUMAN-LIKE MOUSE MOVEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _human_mouse_warmup(page) -> None:
+    """
+    Perform a few small random mouse movements to simulate a real user.
+    Runs before interacting with any elements.
+    """
+    try:
+        vp     = page.viewport_size or {'width': 1440, 'height': 900}
+        width  = vp.get('width',  1440)
+        height = vp.get('height', 900)
+        for _ in range(random.randint(3, 6)):
+            x = random.randint(100, width  - 100)
+            y = random.randint(100, height - 100)
+            page.mouse.move(x, y)
+            page.wait_for_timeout(random.randint(80, 220))
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ANTI-BLOCK: mtop RESPONSE INTERCEPTOR
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -188,9 +275,6 @@ def _attach_mtop_interceptor(page) -> list:
     Attach a response listener that captures the AliExpress mtop PDP API call.
     Returns a shared list; non-empty means the page loaded real product data
     (not a bot-wall / CAPTCHA page).
-
-    The listener fires when the browser receives:
-      mtop.aliexpress.pdp.pc.query  (or pdp.pc.query)
     """
     captured = []
 
@@ -441,7 +525,6 @@ def _scrape_all_country_sizes(page) -> dict:
            d. Scrape the new labels
       3. Assemble & return a country_mapped size block
     """
-    # Step 1: open once, read the full country list
     if not _open_dropdown(page):
         print('[variant_scraper] Could not open dropdown — falling back to plain parse')
         return _parse_plain_size_variants(page.content())
@@ -456,7 +539,6 @@ def _scrape_all_country_sizes(page) -> dict:
             pass
         return _parse_plain_size_variants(page.content())
 
-    # Close dropdown before loop
     try:
         page.keyboard.press('Escape')
         page.wait_for_timeout(400)
@@ -469,7 +551,6 @@ def _scrape_all_country_sizes(page) -> dict:
     baseline_soup   = BeautifulSoup(page.content(), 'html.parser')
     previous_labels = _scrape_size_labels_from_soup(baseline_soup)
 
-    # Step 2: iterate every country
     for country in countries:
         norm = country.strip()
         if not norm or norm in seen_countries:
@@ -531,25 +612,40 @@ def _scrape_in_thread(product_id: str, url: str) -> dict:
     """
     Single browser session wrapped so it can be killed by a ThreadPoolExecutor
     timeout.  Returns dict with keys: color_variants, size_variants,
-    mtop_captured (bool), html_len.
+    mtop_captured (bool), bot_wall (bool).
     """
     from camoufox.sync_api import Camoufox
 
-    ua     = random.choice(USER_AGENTS)
-    is_eu  = _is_eu_url(url)
+    os_choice, ua = _pick_os_and_ua()
+    proxy         = _pick_proxy()
+    is_eu         = _is_eu_url(url)
 
     color_variants: list = []
     size_variants:  dict = {'type': 'plain', 'systems': [], 'plain_options': []}
     mtop_captured         = False
+    bot_wall              = False
 
     try:
-        with Camoufox(headless=True, os='windows') as browser:
-            ctx = browser.new_context(
-                viewport={'width': 1440, 'height': 900},
+        with Camoufox(headless=True, os=os_choice) as browser:
+            ctx_kwargs = dict(
+                viewport=_random_viewport(),
                 locale='en-US',
                 user_agent=ua,
-                extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
+                extra_http_headers={
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept':          'text/html,application/xhtml+xml,application/xml;'
+                                       'q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Sec-Fetch-Dest':  'document',
+                    'Sec-Fetch-Mode':  'navigate',
+                    'Sec-Fetch-Site':  'none',
+                    'Sec-Fetch-User':  '?1',
+                },
             )
+            if proxy:
+                ctx_kwargs['proxy'] = proxy
+                print(f'[variant_scraper] Using proxy: {proxy["server"]}')
+
+            ctx  = browser.new_context(**ctx_kwargs)
             page = ctx.new_page()
 
             # ── Anti-block: attach mtop interceptor ───────────────────────
@@ -558,12 +654,27 @@ def _scrape_in_thread(product_id: str, url: str) -> dict:
             # ── Navigate ──────────────────────────────────────────────────
             page.goto(url, timeout=PAGE_TIMEOUT, wait_until='domcontentloaded')
 
+            # ── Anti-block: early bot-wall check ──────────────────────────
+            if _is_bot_wall_page(page):
+                bot_wall = True
+                page.close()
+                ctx.close()
+                return {
+                    'color_variants': color_variants,
+                    'size_variants':  size_variants,
+                    'mtop_captured':  False,
+                    'bot_wall':       True,
+                }
+
             # ── Anti-block: handle EU / GDPR consent ─────────────────────
             detected_eu = _detect_eu_page(page.url, page.content()[:5000]) or is_eu
             if detected_eu:
                 page.wait_for_timeout(2_000)
                 _dismiss_banners(page)
                 page.wait_for_timeout(1_000)
+
+            # ── Human-like mouse warmup ───────────────────────────────────
+            _human_mouse_warmup(page)
 
             # ── Wait for SKU tiles ────────────────────────────────────────
             sku_found = False
@@ -579,22 +690,31 @@ def _scrape_in_thread(product_id: str, url: str) -> dict:
                 page.wait_for_timeout(random.randint(400, 700))
             page.wait_for_timeout(1_500)
 
-            # ── Anti-block: scroll-to-top retry (mirrors scraper.py) ──────
-            # If SKU tiles still absent OR mtop API not triggered yet,
-            # scroll back to top and wait — this re-fires the lazy loader.
+            # ── Anti-block: scroll-to-top retry ──────────────────────────
             if not sku_found or not captured_api:
                 print('[variant_scraper] Scroll-to-top retry...')
                 page.mouse.wheel(0, -9_999)
                 page.wait_for_timeout(3_000)
                 page.mouse.wheel(0, 600)
                 page.wait_for_timeout(2_000)
-                # Second attempt at SKU selector after retry
                 if not sku_found:
                     try:
                         page.wait_for_selector(_SKU_ROW_SEL, timeout=8_000)
                         sku_found = True
                     except Exception:
                         print('[variant_scraper] SKU tiles still absent after retry')
+
+            # ── Second bot-wall check after full load ─────────────────────
+            if _is_bot_wall_page(page):
+                bot_wall = True
+                page.close()
+                ctx.close()
+                return {
+                    'color_variants': color_variants,
+                    'size_variants':  size_variants,
+                    'mtop_captured':  False,
+                    'bot_wall':       True,
+                }
 
             mtop_captured = bool(captured_api)
             print(f'[variant_scraper] mtop captured: {mtop_captured} | '
@@ -624,7 +744,30 @@ def _scrape_in_thread(product_id: str, url: str) -> dict:
         'color_variants': color_variants,
         'size_variants':  size_variants,
         'mtop_captured':  mtop_captured,
+        'bot_wall':       bot_wall,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RETRY SLEEP  (exponential backoff + jitter)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _retry_sleep(attempt: int, bot_wall: bool) -> None:
+    """
+    Sleep between retries.
+    - Normal failure:   8–20 s (short — may just be a transient load issue)
+    - Bot-wall hit:     45–90 s (long — give AliExpress rate-limiter time to cool)
+    Exponential multiplier doubles each attempt.
+    """
+    if bot_wall:
+        base  = random.uniform(45, 90)
+    else:
+        base  = random.uniform(8, 20)
+    sleep = base * (1.5 ** (attempt - 1))
+    sleep = min(sleep, 180)   # hard cap at 3 min
+    print(f'[variant_scraper] Sleeping {sleep:.1f}s before retry '
+          f'({"bot-wall" if bot_wall else "soft-fail"} back-off)...')
+    time.sleep(sleep)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -637,13 +780,20 @@ def scrape_product_variants(product_id: str, max_retries: int = MAX_RETRIES) -> 
 
     Anti-blocking flow per attempt:
       1. Rotate shipFromCountry param on URL
-      2. Random User-Agent
-      3. Camoufox os='windows' fingerprint
-      4. Attach mtop interceptor (detect bot wall vs real page)
-      5. Dismiss GDPR / cookie banners (EU pages)
-      6. Scroll-to-top retry when SKU tiles absent on first pass
-      7. ThreadPoolExecutor timeout = 200 s to prevent zombie hangs
-      8. Randomised jitter sleep between retries (4–9 s)
+      2. OS-matched random User-Agent (no fingerprint mismatch)
+      3. Camoufox os= matches chosen UA OS
+      4. Randomised viewport dimensions
+      5. Optional residential proxy (configure PROXY_LIST above)
+      6. Rich extra HTTP headers (Sec-Fetch-*, Accept)
+      7. Attach mtop interceptor (detect bot wall vs real page)
+      8. Early bot-wall detection via page title after navigation
+      9. Human-like mouse movement before interacting
+     10. Dismiss GDPR / cookie banners (EU pages)
+     11. Scroll-to-top retry when SKU tiles absent on first pass
+     12. Second bot-wall check after full page load
+     13. ThreadPoolExecutor timeout = 200 s to prevent zombie hangs
+     14. Exponential + jitter sleep between retries
+         (short for soft fails, long for confirmed bot-walls)
 
     Args:
         product_id:  AliExpress numeric product ID.
@@ -668,25 +818,25 @@ def scrape_product_variants(product_id: str, max_retries: int = MAX_RETRIES) -> 
         url = _get_rotated_url(base_url)
 
         try:
-            # ── Anti-block: hard timeout via ThreadPoolExecutor ──────────
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_scrape_in_thread, product_id, url)
-                thread_result = future.result(timeout=200)   # kill if hung
+                future        = executor.submit(_scrape_in_thread, product_id, url)
+                thread_result = future.result(timeout=200)
 
         except concurrent.futures.TimeoutError:
             print(f'[variant_scraper] Attempt {attempt} timed out (200 s)')
             if attempt < max_retries:
-                time.sleep(random.uniform(4, 9))
+                _retry_sleep(attempt, bot_wall=False)
             continue
         except Exception as e:
             print(f'[variant_scraper] Attempt {attempt} executor error: {e}')
             if attempt < max_retries:
-                time.sleep(random.uniform(4, 9))
+                _retry_sleep(attempt, bot_wall=False)
             continue
 
         color_variants = thread_result['color_variants']
         size_variants  = thread_result['size_variants']
         mtop_captured  = thread_result['mtop_captured']
+        is_bot_wall    = thread_result.get('bot_wall', False)
 
         result = {
             'product_id': product_id,
@@ -699,16 +849,19 @@ def scrape_product_variants(product_id: str, max_retries: int = MAX_RETRIES) -> 
             size_variants.get('systems')
         )
 
-        # If mtop API was NOT captured the page was likely a bot wall —
-        # treat as a soft failure even if some DOM scraping succeeded,
-        # unless we actually got usable variant data.
+        # Confirmed bot-wall → long sleep before retry
+        if is_bot_wall:
+            print(f'[variant_scraper] ✗ Confirmed bot-wall on attempt {attempt}')
+            if attempt < max_retries:
+                _retry_sleep(attempt, bot_wall=True)
+            continue
+
+        # mtop not captured + no variants → likely soft bot-wall
         if not mtop_captured and not has_colors and not has_sizes:
             print(f'[variant_scraper] Bot wall suspected (no mtop + no variants) '
                   f'on attempt {attempt}')
             if attempt < max_retries:
-                sleep = random.uniform(4, 9)
-                print(f'[variant_scraper] Sleeping {sleep:.1f}s before retry...')
-                time.sleep(sleep)
+                _retry_sleep(attempt, bot_wall=True)
             continue
 
         if has_colors or has_sizes:
@@ -723,9 +876,7 @@ def scrape_product_variants(product_id: str, max_retries: int = MAX_RETRIES) -> 
 
         print(f'[variant_scraper] No variants on attempt {attempt}')
         if attempt < max_retries:
-            sleep = random.uniform(4, 9)
-            print(f'[variant_scraper] Sleeping {sleep:.1f}s before retry...')
-            time.sleep(sleep)
+            _retry_sleep(attempt, bot_wall=False)
 
     empty['error'] = 'No variants extracted after all retries'
     return empty
