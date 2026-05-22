@@ -1,36 +1,25 @@
 """
-FastAPI Server - HYBRID APPROACH v3.3
+FastAPI Server - HYBRID APPROACH v3.4
 Pipeline: Scrape → Store → Enhance → Categorize → Map → Excel → Translate
 
+v3.4 changes (variant table migration):
+  CHANGED — /scrape-variants now uses db.save_variants() and db.get_variants()
+             (the new `varient` table) instead of the legacy product_variants
+             helpers in variant_scraper.py.
+  REMOVED — GET /variants/{aliexpress_id}  (replaced by DB endpoint below)
+  REMOVED — POST /extract-variants-from-html  (dev-only, not needed in prod)
+  NEW     — GET  /db/variants/{aliexpress_id}   returns stored variant JSON
+  NEW     — GET  /db/variants/{aliexpress_id}/summary   color/size/country counts
+  NEW     — DELETE /db/variants/{aliexpress_id}  wipe variant rows for a product
+
 v3.3 changes (translation refactor):
-  REFACTOR — All inline translation helpers (_build_translation_prompt,
-             _translate_product_fields, _translate_with_anthropic) removed
-             from main.py and replaced by a single import from the new
-             self-contained translation.py module.
-
-             translation.py:
-               • No project-specific imports — works standalone
-               • Tries OpenAI first (OPENAI_API_KEY), falls back to Anthropic
-                 (ANTHROPIC_API_KEY) automatically
-               • Per-language retry with exponential back-off (2s/4s/8s)
-               • Returns empty strings per field on failure rather than
-                 crashing the whole request
-
-  FIX — filter_restricted_keywords import: main.py always uses the version
-        from product_filter (for title/keyword checks on ingested products);
-        db.filter_restricted_keywords is only called from within db.py itself.
+  REFACTOR — All inline translation helpers removed from main.py and replaced
+             by a single import from translation.py.
 
 v3.2 changes (translation feature):
   NEW — /translate-product/{aliexpress_id} endpoint.
   NEW — GET /translations/{aliexpress_id}
   NEW — GET /translations/{aliexpress_id}/{language}
-
-v3.1 changes (merchant debug fixes):
-  FIX D — /merchant-debug _on_response now uses _is_valid_response_url().
-  FIX E — Removed dead BLOCKED_SIZE_BYTES reference.
-
-v3.1.1 dedup patch:
-  DEDUP-STARTUP — _init_dedup_db() called inside startup_event().
 """
 
 from fastapi import FastAPI, HTTPException
@@ -47,12 +36,11 @@ from scraper import scrape_search_results, MAX_SEARCH_PAGES
 from product_filter import (
     filter_product,
     filter_products,
-    filter_restricted_keywords,   # ← always product_filter's version for keyword checks
+    filter_restricted_keywords,
     validate_category_confidence,
     reload_filter_data,
 )
 
-# Self-contained translation module (no project-specific deps)
 from translation import translate_product_fields, SUPPORTED_LANGUAGES as _TRANSLATION_LANGS
 
 import uuid
@@ -96,7 +84,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Octopia Template Pipeline", version="3.3")
+app = FastAPI(title="Octopia Template Pipeline", version="3.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -175,6 +163,19 @@ class MerchantDebugRequest(BaseModel):
         json_schema_extra = {"example": {"merchant_id": "1104990029"}}
 
 
+class VariantScrapeRequest(BaseModel):
+    product_id: str
+    force_rescrape: bool = False
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "product_id": "1005012117886583",
+                "force_rescrape": False
+            }
+        }
+
+
 # =============================================================================
 # DB HELPERS
 # =============================================================================
@@ -183,6 +184,22 @@ def get_db_connection():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _lookup_db_product_id(aliexpress_id: str) -> Optional[int]:
+    """
+    Return the scraped_products.product_id for a given AliExpress numeric ID,
+    or None if the product has never been scraped.
+    """
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT product_id FROM scraped_products WHERE url LIKE ?",
+            (f"%/item/{aliexpress_id}.html%",)
+        ).fetchone()
+        return row["product_id"] if row else None
+    finally:
+        conn.close()
 
 
 # =============================================================================
@@ -197,7 +214,7 @@ def startup_event():
         SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         _init_dedup_db()
         logger.info("✅ Deduplication DB initialised (dedup.db)")
-        logger.info("✅ API Ready — v3.3")
+        logger.info("✅ API Ready — v3.4")
     except Exception as e:
         logger.error(f"Startup error: {e}")
 
@@ -211,7 +228,7 @@ def root():
     return {
         "status":  "running",
         "service": "Octopia Template Pipeline",
-        "version": "3.3",
+        "version": "3.4",
     }
 
 
@@ -434,22 +451,15 @@ def process_product_complete(url: str, extract_compliance: bool = True) -> Dict[
 # =============================================================================
 
 def _build_spec_text(product_id: int) -> str:
-    """
-    Build a plain-text specification string for *product_id*.
-
-    Tries enhanced_specifications first; falls back to the raw columns in
-    scraped_products.  Returns an empty string if nothing is found.
-    """
     spec_columns = [
         "brand", "color", "dimensions", "weight", "material",
         "certifications", "country_of_origin", "warranty",
         "product_type", "age_from", "age_to", "gender",
     ]
-    scraped_columns = [c for c in spec_columns if c != "gender"]  # scraped_products has no gender
+    scraped_columns = [c for c in spec_columns if c != "gender"]
 
     conn = get_db_connection()
     try:
-        # 1. Try enhanced_specifications
         row = conn.execute(
             f"SELECT {', '.join(spec_columns)} "
             "FROM enhanced_specifications WHERE product_id = ?",
@@ -457,7 +467,6 @@ def _build_spec_text(product_id: int) -> str:
         ).fetchone()
 
         if not row:
-            # 2. Fall back to scraped_products
             row = conn.execute(
                 f"SELECT {', '.join(scraped_columns)} "
                 "FROM scraped_products WHERE product_id = ?",
@@ -487,39 +496,7 @@ def translate_product(aliexpress_id: str):
     Scrape (or reuse) a product by its AliExpress numeric ID, then translate
     title, description, and specification into all 5 supported languages:
     Romanian, German, Portuguese, Spanish, French.
-
-    Each translation is stored as one row in the `translation` table keyed by
-    (url_id, language):
-
-        {
-            "url_id":        <product_id in scraped_products>,
-            "language":      "<language>",
-            "title":         "<translated title>",
-            "description":   "<translated description>",
-            "specification": "<translated specification>"
-        }
-
-    Path parameter
-    --------------
-    aliexpress_id — numeric AliExpress item ID, e.g. 1005006395261235
-
-    Returns
-    -------
-    {
-        "aliexpress_id":        "1005006395261235",
-        "product_id":           42,
-        "url":                  "https://www.aliexpress.com/item/1005006395261235.html",
-        "original_title":       "...",
-        "languages_translated": ["Romanian", "German", ...],
-        "translations": {
-            "Romanian": {"url_id": 42, "language": "Romanian",
-                         "title": "...", "description": "...", "specification": "..."},
-            ...
-        },
-        "timestamp": "2026-..."
-    }
     """
-    # ── Validate the ID ───────────────────────────────────────────────────────
     aliexpress_id = aliexpress_id.strip()
     if not aliexpress_id.isdigit():
         raise HTTPException(
@@ -530,7 +507,6 @@ def translate_product(aliexpress_id: str):
     canonical_url = f"https://www.aliexpress.com/item/{aliexpress_id}.html"
     logger.info("[translate] Requested: %s → %s", aliexpress_id, canonical_url)
 
-    # ── Check if this product is already in the DB ────────────────────────────
     conn = get_db_connection()
     row = conn.execute(
         "SELECT product_id, title, description FROM scraped_products WHERE url = ?",
@@ -555,12 +531,8 @@ def translate_product(aliexpress_id: str):
         title       = result.get("enhanced_title") or result.get("original_title", "")
         description = result.get("enhanced", {}).get("description", "")
 
-    # ── Build specification string ────────────────────────────────────────────
     spec_text = _build_spec_text(product_id)
 
-    # ── Translate into all supported languages via translation.py ─────────────
-    # _TRANSLATION_LANGS is already imported at the top from translation.py;
-    # we do NOT import SUPPORTED_LANGUAGES from db to avoid version mismatch.
     from db import insert_translation
 
     raw_translations = translate_product_fields(
@@ -570,7 +542,6 @@ def translate_product(aliexpress_id: str):
         languages=_TRANSLATION_LANGS,
     )
 
-    # ── Persist each language row ─────────────────────────────────────────────
     saved_translations: Dict[str, Dict] = {}
     languages_translated: List[str] = []
 
@@ -614,17 +585,7 @@ def translate_product(aliexpress_id: str):
 
 @app.get("/translations/{aliexpress_id}", tags=["Translation"])
 def get_all_translations(aliexpress_id: str):
-    """
-    Return all stored translations for a product.
-
-    Path parameter
-    --------------
-    aliexpress_id — numeric AliExpress item ID (e.g. 1005006395261235)
-
-    Returns a list of translation rows, one per language, each with keys
-    matching the translation table column names:
-        url_id, language, title, description, specification, translated_at
-    """
+    """Return all stored translations for a product."""
     if not aliexpress_id.strip().isdigit():
         raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
 
@@ -645,7 +606,7 @@ def get_all_translations(aliexpress_id: str):
             ),
         )
 
-    from db import get_translations  # SUPPORTED_LANGUAGES sourced from translation.py
+    from db import get_translations
     translations = get_translations(row["product_id"])
     return {
         "aliexpress_id": aliexpress_id,
@@ -657,20 +618,8 @@ def get_all_translations(aliexpress_id: str):
 
 @app.get("/translations/{aliexpress_id}/{language}", tags=["Translation"])
 def get_single_translation(aliexpress_id: str, language: str):
-    """
-    Return one translation row for a specific product + language.
-
-    Path parameters
-    ---------------
-    aliexpress_id — numeric AliExpress item ID
-    language      — one of: Romanian, German, Portuguese, Spanish, French
-                    (case-sensitive)
-
-    Returns a dict with keys matching the translation table column names:
-        url_id, language, title, description, specification, translated_at
-    """
+    """Return one translation row for a specific product + language."""
     from db import get_translation
-    # _TRANSLATION_LANGS imported at module top from translation.py
     if not aliexpress_id.strip().isdigit():
         raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
 
@@ -1289,66 +1238,55 @@ def _attach_screenshot(debug: dict, screenshot_path: Optional[str], merchant_id:
 
 
 # =============================================================================
-# PRODUCT VARIANT ENDPOINTS
+# VARIANT ENDPOINTS  (uses the `varient` table via db.py)
 # =============================================================================
-
-class VariantScrapeRequest(BaseModel):
-    product_id: str
-    force_rescrape: bool = False
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "product_id": "1005012117886583",
-                "force_rescrape": False
-            }
-        }
-
 
 @app.post("/scrape-variants", tags=["Variants"])
 def scrape_variants(req: VariantScrapeRequest):
     """
-    Scrape product variants (color swatches + sizes) for an AliExpress product ID.
+    Scrape color swatches and sizes (including per-country dropdown) for an
+    AliExpress product ID and persist to the `varient` table.
 
-    - Checks the DB first; returns cached data unless force_rescrape=true.
-    - Variant data is linked to the scraped_products row if it exists, or stored
-      with product_id=0 as a standalone extract.
+    - Returns cached data from the DB unless force_rescrape=true.
+    - The `varient` table is keyed by the AliExpress numeric ID string, so the
+      product does NOT need to exist in scraped_products first.
 
-    Returns the full variant structure:
+    Size types returned:
+      "plain"         — simple tiles: S / M / L / XL
+      "country_mapped"— tiles carry country codes: S(EU 36), M(US 6) …
+                        (either from inline labels or the country dropdown)
+
+    Returns the full variant JSON:
     {
       "product_id": "1005012117886583",
       "variants": {
-        "color": [{"name": "Navy Blue", "image_url": "...", "sku_col_id": "14-173", "selected": false}],
+        "color": [{"name": "Navy Blue", "image_url": "...",
+                   "sku_col_id": "14-193", "selected": false}],
         "size": {
           "type": "plain" | "country_mapped",
-          "systems": [{"country": "US", "options": ["M (US 38)", ...]}],
+          "systems": [{"country": "EU", "options": ["S(EU 36)", ...]}],
           "plain_options": ["S", "M", "L", "XL"]
         }
-      }
+      },
+      "source": "cache" | "scraped",
+      "db_product_id": 42 | null
     }
     """
-    from variant_scraper import scrape_product_variants, save_variants_to_db, get_variants_from_db
+    from variant_scraper import scrape_product_variants
+    from db import save_variants, get_variants
 
     pid = req.product_id.strip()
     if not pid.isdigit():
         raise HTTPException(status_code=400, detail="product_id must be a numeric string")
 
-    # ── Look up the DB product_id (FK) from scraped_products ─────────────────
-    canonical_url = f"https://www.aliexpress.com/item/{pid}.html"
-    conn          = get_db_connection()
-    row           = conn.execute(
-        "SELECT product_id FROM scraped_products WHERE url LIKE ?",
-        (f"%/item/{pid}.html%",)
-    ).fetchone()
-    conn.close()
+    # ── Optional FK: link to scraped_products if the product was already scraped
+    db_product_id = _lookup_db_product_id(pid)
 
-    db_product_id = row["product_id"] if row else 0
-
-    # ── Return cached unless force_rescrape ───────────────────────────────────
-    if not req.force_rescrape and db_product_id:
-        cached = get_variants_from_db(db_product_id)
+    # ── Return cached data unless force_rescrape requested ───────────────────
+    if not req.force_rescrape:
+        cached = get_variants(pid)
         if cached:
-            logger.info(f"[variants] Returning cached variants for product_id={db_product_id}")
+            logger.info(f"[variants] Returning cached variants for aliexpress_id={pid}")
             return {**cached, "source": "cache", "db_product_id": db_product_id}
 
     # ── Scrape ────────────────────────────────────────────────────────────────
@@ -1361,79 +1299,130 @@ def scrape_variants(req: VariantScrapeRequest):
             detail=f"Variant scraping failed: {result['error']}"
         )
 
-    # ── Persist ───────────────────────────────────────────────────────────────
-    save_ok = save_variants_to_db(db_product_id or 0, result)
-    logger.info(f"[variants] Saved={save_ok} for db_product_id={db_product_id}")
+    # ── Persist to the `varient` table via db.save_variants() ────────────────
+    save_result = save_variants(result)
+    logger.info(
+        f"[variants] Save → inserted={save_result['inserted']} "
+        f"skipped={save_result['skipped']} errors={save_result['errors']}"
+    )
 
     return {
         **result,
-        "source":         "scraped",
-        "db_product_id":  db_product_id,
-        "timestamp":      datetime.now().isoformat(),
+        "source":        "scraped",
+        "db_product_id": db_product_id,
+        "save_result":   save_result,
+        "timestamp":     datetime.now().isoformat(),
     }
 
 
-@app.get("/variants/{aliexpress_id}", tags=["Variants"])
-def get_variants(aliexpress_id: str):
+@app.get("/db/variants/{aliexpress_id}", tags=["Variants"])
+def db_get_variants(aliexpress_id: str):
     """
-    Return stored variant data for an AliExpress product ID (no scraping).
-    Returns 404 if no variants are stored yet — call POST /scrape-variants first.
+    Return the stored variant data for an AliExpress product ID directly from
+    the `varient` table. No scraping is performed.
+
+    Returns 404 if no variant rows exist — call POST /scrape-variants first.
+
+    Response shape:
+    {
+      "product_id":    "1005012117886583",
+      "db_product_id": 42,               // scraped_products FK (null if never scraped)
+      "variants": {
+        "color": [{"name": ..., "image_url": ..., "sku_col_id": ..., "selected": bool}],
+        "size": {
+          "type": "plain" | "country_mapped",
+          "systems": [{"country": "EU", "options": ["S(EU 36)", ...]}],
+          "plain_options": [...]
+        }
+      }
+    }
     """
-    from variant_scraper import get_variants_from_db
+    from db import get_variants
 
     pid = aliexpress_id.strip()
     if not pid.isdigit():
         raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
 
-    conn = get_db_connection()
-    row  = conn.execute(
-        "SELECT product_id FROM scraped_products WHERE url LIKE ?",
-        (f"%/item/{pid}.html%",)
-    ).fetchone()
-    conn.close()
-
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Product {pid} not found in DB. "
-                   f"Call POST /scrape-variants with product_id={pid} first."
-        )
-
-    data = get_variants_from_db(row["product_id"])
+    data = get_variants(pid)
     if not data:
         raise HTTPException(
             status_code=404,
-            detail=f"No variants stored for product {pid}. "
-                   f"Call POST /scrape-variants with product_id={pid} first."
+            detail=(
+                f"No variants stored for product {pid}. "
+                f"Call POST /scrape-variants with product_id={pid} first."
+            ),
         )
 
-    return {**data, "db_product_id": row["product_id"]}
+    db_product_id = _lookup_db_product_id(pid)
+    return {**data, "db_product_id": db_product_id}
 
 
-@app.post("/extract-variants-from-html", tags=["Variants"])
-def extract_variants_from_html_endpoint(payload: dict):
+@app.get("/db/variants/{aliexpress_id}/summary", tags=["Variants"])
+def db_get_variant_summary(aliexpress_id: str):
     """
-    Extract variants from raw HTML you provide (no browser needed).
-    Useful for testing or when you already have the rendered page HTML.
+    Return a lightweight summary of stored variants: color count, total size
+    rows, and the list of country codes available.
 
-    Body:
+    Useful for dashboards or a quick status check without transferring the full
+    variant payload.
+
+    Example response:
     {
-      "product_id": "1005012117886583",
-      "html": "<html>...</html>"
+      "aliexpress_id":  "1005012117886583",
+      "db_product_id":  42,
+      "color_count":    3,
+      "size_count":     78,
+      "countries":      ["AU", "BR", "DE", "ES", "EU", "FR", "IT", "JP",
+                         "KR", "MX", "SG", "UK", "US"]
     }
     """
-    from variant_scraper import extract_variants_from_html
+    from db import get_variant_summary
 
-    pid  = str(payload.get("product_id", "")).strip()
-    html = payload.get("html", "")
+    pid = aliexpress_id.strip()
+    if not pid.isdigit():
+        raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
 
-    if not html:
-        raise HTTPException(status_code=400, detail="html field is required")
-    if not pid:
-        raise HTTPException(status_code=400, detail="product_id field is required")
+    summary = get_variant_summary(pid)
+    if not summary:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No variants stored for product {pid}. "
+                f"Call POST /scrape-variants with product_id={pid} first."
+            ),
+        )
 
-    result = extract_variants_from_html(html, pid)
-    return result
+    db_product_id = _lookup_db_product_id(pid)
+    return {**summary, "aliexpress_id": pid, "db_product_id": db_product_id}
+
+
+@app.delete("/db/variants/{aliexpress_id}", tags=["Variants"])
+def db_delete_variants(aliexpress_id: str):
+    """
+    Delete all variant rows for an AliExpress product ID from the `varient`
+    table.  Useful before a forced re-scrape or when a product is delisted.
+
+    Returns the number of rows deleted.
+
+    Response:
+    {
+      "aliexpress_id": "1005012117886583",
+      "rows_deleted":  84,
+      "message":       "Variants deleted"
+    }
+    """
+    from db import delete_variants
+
+    pid = aliexpress_id.strip()
+    if not pid.isdigit():
+        raise HTTPException(status_code=400, detail="aliexpress_id must be numeric")
+
+    rows_deleted = delete_variants(pid)
+    return {
+        "aliexpress_id": pid,
+        "rows_deleted":  rows_deleted,
+        "message":       "Variants deleted" if rows_deleted else "No variant rows found",
+    }
 
 
 # =============================================================================
@@ -1444,8 +1433,12 @@ def extract_variants_from_html_endpoint(payload: dict):
 def reload_filters():
     reload_filter_data()
     return {"status": "ok", "message": "Filter data reloaded from DB"}
-  
-# ── EXPORT TEMPLATES ──────────────────────────────────────────────────────────
+
+
+# =============================================================================
+# EXPORT TEMPLATES
+# =============================================================================
+
 @app.post("/export-templates", tags=["Export"])
 def export_templates(only_new: bool = False):
     """
@@ -1456,12 +1449,16 @@ def export_templates(only_new: bool = False):
     return run_export(only_new=only_new)
 
 
-# ── MANUFACTURER INFO ─────────────────────────────────────────────────────────
+# =============================================================================
+# MANUFACTURER INFO
+# =============================================================================
+
 @app.get("/manufacturer", tags=["Database"])
 def get_manufacturers(limit: int = 10):
     """Return manufacturer/compliance info collected during scraping."""
     from db import get_all_manufacturer_info
     return get_all_manufacturer_info(limit=limit)
+
 
 # =============================================================================
 # DATABASE VIEW ENDPOINTS
@@ -1541,7 +1538,7 @@ def get_stats():
             "processing_logs", "category_assignments", "enhanced_content",
             "original_specifications", "enhanced_specifications",
             "specification_audit_log", "seller_info", "compliance_info",
-            "translation",
+            "translation", "varient",
         ]
         stats = {}
         for table in tables:
@@ -1575,6 +1572,6 @@ def view_processing_logs(limit: int = 500):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8686))
-    logger.info("🚀 Octopia Template Pipeline v3.3")
+    logger.info("🚀 Octopia Template Pipeline v3.4")
     logger.info(f"📡 Server: http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
