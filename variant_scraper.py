@@ -6,7 +6,7 @@ Extracts structured product variant data from AliExpress product pages.
 Handles:
   • Color variants  — image-based swatches (sku-item--image)
   • Size variants   — text tiles (sku-item--text) with optional country-based labels
-  • Country-mapped  — e.g. "M (US 38)", "M (EU 48)", etc.
+  • Country dropdown — Size(EU), Size(US), etc. → clicks each option and scrapes
   • Plain sizes     — e.g. "S", "M", "L", "XL" with no country prefix
 
 Output JSON contract:
@@ -19,9 +19,10 @@ Output JSON contract:
     "size": {
       "type": "country_mapped" | "plain",
       "systems": [
-        {"country": "US", "options": ["M (US 38)", "L (US 40)"]}
+        {"country": "EU", "options": ["S(EU 36)", "M(EU 38)", "L(EU 40/42)"]},
+        {"country": "US", "options": ["S(US 4)", "M(US 6)", "L(US 08/10)"]}
       ],
-      "plain_options": ["S", "M", "L", "XL"]   // only when type == "plain"
+      "plain_options": []   // only when type == "plain"
     }
   }
 }
@@ -39,31 +40,29 @@ from bs4 import BeautifulSoup
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Known country codes that appear inside size labels
 COUNTRY_SIZE_CODES = {
     "US", "EU", "AU", "UK", "CA", "FR", "DE", "IT", "ES",
-    "JP", "CN", "RU", "BR", "IN", "KR"
+    "JP", "CN", "RU", "BR", "IN", "KR", "MX", "SG"
 }
 
-# Regex: detect country in size label like "M (US 38)" or "L (EU 44)"
+# Matches: "S(EU 36)", "M(US 6)", "L(UK 12/14)", "XL(SG SG-3XL)", "M(MX M)"
 _COUNTRY_IN_SIZE_RE = re.compile(
     r'\(('
     + '|'.join(re.escape(c) for c in COUNTRY_SIZE_CODES)
-    + r')\s+[\d\-]+\)',
+    + r')\b',
     re.IGNORECASE
 )
 
-# AliExpress CDN — strip the thumbnail+avif suffix to get the base .jpg URL
-# Input:  ...S134b54c50b9f4fbfb64d346cbf11b1352.jpg_220x220q75.jpg_.avif
-# Output: ...S134b54c50b9f4fbfb64d346cbf11b1352.jpg
+# AliExpress CDN thumbnail suffix stripper
 _AVIF_THUMB_RE = re.compile(r'(_\d+x\d+q\d+\.jpg_\.avif|_\.avif)$', re.IGNORECASE)
+
+# Matches the current country shown in the size button: Size(FR), Size(EU), etc.
+_SIZE_BTN_COUNTRY_RE = re.compile(r'Size\(([A-Z]{2})\)', re.IGNORECASE)
 
 
 def _normalise_image_url(url: str) -> str:
-    """Strip the thumbnail size/avif suffix to get the base image URL."""
     if not url:
         return url
-    # Remove avif+thumbnail suffix (the base already ends in .jpg)
     url = _AVIF_THUMB_RE.sub('', url)
     if url.startswith('//'):
         url = 'https:' + url
@@ -75,138 +74,105 @@ def _normalise_image_url(url: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_color_variants(soup: BeautifulSoup) -> list:
-    """
-    Extract color variants from sku-item--image divs.
-
-    HTML pattern:
-      <div class="sku-item--skus--..." data-sku-row="14">
-        <div data-sku-col="14-193" class="sku-item--image--...">
-          <img src="..." alt="black">
-        </div>
-        ...
-      </div>
-    """
+    """Extract color variants from sku-item--image divs."""
     colors = []
     seen   = set()
 
-    # Find the container div for image-based variants (data-sku-row present)
     sku_rows = soup.find_all('div', attrs={'data-sku-row': True,
                                            'class': re.compile(r'sku-item--skus')})
-
     for row in sku_rows:
         items = row.find_all('div', attrs={'data-sku-col': True,
                                             'class': re.compile(r'sku-item--image')})
         if not items:
             continue
-
         for item in items:
             img = item.find('img')
             if not img:
                 continue
-
-            alt = (img.get('alt') or '').strip()
-            src = _normalise_image_url(img.get('src', ''))
+            alt     = (img.get('alt') or '').strip()
+            src     = _normalise_image_url(img.get('src', ''))
             sku_col = item.get('data-sku-col', '')
-
-            # is this item currently selected?
-            cls = ' '.join(item.get('class', []))
+            cls     = ' '.join(item.get('class', []))
             selected = 'sku-item--selected' in cls
-
             key = alt.lower() or src
             if key in seen:
                 continue
             seen.add(key)
-
             colors.append({
                 'name':       alt or sku_col,
                 'image_url':  src,
                 'sku_col_id': sku_col,
                 'selected':   selected,
             })
-
     return colors
 
 
-def _parse_size_variants(soup: BeautifulSoup) -> dict:
+def _scrape_sizes_from_soup(soup: BeautifulSoup) -> list[str]:
     """
-    Extract size variants from sku-item--text divs.
-
-    Two modes:
-      1. Country-mapped: "M (US 38)", "L (US 40)"  → grouped by country code
-      2. Plain:          "S", "M", "L", "XL"
-
-    HTML pattern:
-      <div class="sku-item--skus--..." data-sku-row="5">
-        <div data-sku-col="5-100014064" class="sku-item--text--..." title="S"><span>S</span></div>
-        ...
-      </div>
+    Read all size labels currently visible in the DOM.
+    Returns a flat list of title strings, e.g. ["S(EU 36)", "M(EU 38)", ...].
     """
+    labels = []
     size_rows = soup.find_all('div', attrs={'data-sku-row': True,
                                              'class': re.compile(r'sku-item--skus')})
-
-    raw_labels = []  # all size text labels in DOM order
-
     for row in size_rows:
         items = row.find_all('div', attrs={'data-sku-col': True,
                                             'class': re.compile(r'sku-item--text')})
         if not items:
             continue
-
         for item in items:
-            # prefer title attribute, fall back to inner text
             label = (item.get('title') or '').strip()
             if not label:
-                span = item.find('span')
+                span  = item.find('span')
                 label = (span.get_text(strip=True) if span else item.get_text(strip=True))
             if label:
-                raw_labels.append(label)
+                labels.append(label)
+    return labels
 
-    if not raw_labels:
-        return {'type': 'plain', 'systems': [], 'plain_options': []}
 
-    # Determine if labels contain country codes
-    country_hits = {}
-    for label in raw_labels:
+def _detect_country_from_labels(labels: list[str]) -> Optional[str]:
+    """Return the country code found in the first matching label, or None."""
+    for label in labels:
         m = _COUNTRY_IN_SIZE_RE.search(label)
         if m:
-            code = m.group(1).upper()
-            country_hits.setdefault(code, []).append(label)
+            return m.group(1).upper()
+    return None
 
-    if country_hits:
-        # Country-mapped mode: group by country code
-        systems = [
-            {'country': code, 'options': opts}
-            for code, opts in country_hits.items()
-        ]
+
+def _parse_size_variants_from_html(html: str) -> dict:
+    """
+    Parse size variants from a single HTML snapshot (no browser interaction).
+    Used when there is no country dropdown — i.e. plain sizes only.
+    """
+    soup   = BeautifulSoup(html, 'html.parser')
+    labels = _scrape_sizes_from_soup(soup)
+
+    if not labels:
+        return {'type': 'plain', 'systems': [], 'plain_options': []}
+
+    country = _detect_country_from_labels(labels)
+    if country:
         return {
             'type':          'country_mapped',
-            'systems':       systems,
+            'systems':       [{'country': country, 'options': labels}],
             'plain_options': [],
         }
-    else:
-        # Plain mode: return as-is
-        return {
-            'type':          'plain',
-            'systems':       [],
-            'plain_options': raw_labels,
-        }
+    return {
+        'type':          'plain',
+        'systems':       [],
+        'plain_options': labels,
+    }
 
 
 def extract_variants_from_html(html: str, product_id: str) -> dict:
     """
-    Master entry: parse rendered HTML and return full variant structure.
-
-    Args:
-        html:       Full rendered page HTML string.
-        product_id: AliExpress product ID string.
-
-    Returns:
-        Structured variant dict matching the JSON contract above.
+    Parse rendered HTML (no browser) and return full variant structure.
+    NOTE: For country-dropdown products use scrape_product_variants() instead,
+    which clicks through each country option in the browser.
     """
-    soup = BeautifulSoup(html, 'html.parser')
-
+    soup           = BeautifulSoup(html, 'html.parser')
     color_variants = _parse_color_variants(soup)
-    size_variants  = _parse_size_variants(soup)
+    size_variants  = _parse_size_variants_from_html(html)
 
     return {
         'product_id': product_id,
@@ -214,6 +180,200 @@ def extract_variants_from_html(html: str, product_id: str) -> dict:
             'color': color_variants,
             'size':  size_variants,
         }
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BROWSER HELPERS — country dropdown interaction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_size_button_text(page) -> str:
+    """Return the visible text of the size-system button, e.g. 'Size(FR)'."""
+    try:
+        btn = page.query_selector(
+            'button.comet-v2-btn-important span[data-spm-anchor-id]'
+        )
+        if btn:
+            return (btn.inner_text() or '').strip()
+    except Exception:
+        pass
+    return ''
+
+
+def _has_country_size_dropdown(page) -> bool:
+    """
+    Return True if the page has a country-based size-system dropdown button
+    (e.g. 'Size(FR)', 'Size(EU)').
+    """
+    text = _get_size_button_text(page)
+    return bool(_SIZE_BTN_COUNTRY_RE.search(text))
+
+
+def _get_dropdown_country_options(page) -> list[str]:
+    """
+    Open the size-system dropdown and return all available country codes.
+    Closes the dropdown afterward (presses Escape).
+
+    Returns e.g. ["EU", "US", "ES", "FR", "UK", "DE", "IT", "MX", "BR", "AU", "SG", "JP", "KR"]
+    """
+    countries = []
+    try:
+        # Click the button to open the dropdown
+        btn = page.query_selector(
+            'button.comet-v2-btn-important'
+        )
+        if not btn:
+            return countries
+
+        btn.click()
+        page.wait_for_timeout(800)
+
+        # The dropdown items — AliExpress renders them in a popup/overlay list
+        # Selector covers both comet-v2-select-option and comet-dropdown-menu-item patterns
+        option_els = page.query_selector_all(
+            '.comet-v2-select-dropdown li, '
+            '.comet-v2-select-item, '
+            '.comet-dropdown-menu-item, '
+            '[class*="select-dropdown"] li, '
+            '[class*="dropdown-menu"] li'
+        )
+
+        for el in option_els:
+            text = (el.inner_text() or '').strip().upper()
+            if text in COUNTRY_SIZE_CODES or text == 'DEFAULT':
+                countries.append(text)
+
+        # Close the dropdown
+        page.keyboard.press('Escape')
+        page.wait_for_timeout(400)
+
+    except Exception as e:
+        print(f'[variant_scraper] Dropdown read error: {e}')
+        try:
+            page.keyboard.press('Escape')
+        except Exception:
+            pass
+
+    return countries
+
+
+def _select_country_option(page, country: str) -> bool:
+    """
+    Open the size-system dropdown and click the given country option.
+    Returns True on success.
+    """
+    try:
+        btn = page.query_selector('button.comet-v2-btn-important')
+        if not btn:
+            return False
+
+        btn.click()
+        page.wait_for_timeout(800)
+
+        # Find and click the matching li/option
+        option_els = page.query_selector_all(
+            '.comet-v2-select-dropdown li, '
+            '.comet-v2-select-item, '
+            '.comet-dropdown-menu-item, '
+            '[class*="select-dropdown"] li, '
+            '[class*="dropdown-menu"] li'
+        )
+
+        for el in option_els:
+            text = (el.inner_text() or '').strip().upper()
+            if text == country.upper():
+                el.click()
+                page.wait_for_timeout(900)
+                return True
+
+        # Not found — close and return False
+        page.keyboard.press('Escape')
+        page.wait_for_timeout(400)
+        return False
+
+    except Exception as e:
+        print(f'[variant_scraper] Select country "{country}" error: {e}')
+        try:
+            page.keyboard.press('Escape')
+        except Exception:
+            pass
+        return False
+
+
+def _scrape_all_country_sizes(page) -> dict:
+    """
+    Iterate through every country option in the size dropdown,
+    scrape the size labels for each, and return a complete size block.
+
+    Returns a size dict with type='country_mapped'.
+    """
+    systems = []
+
+    countries = _get_dropdown_country_options(page)
+    print(f'[variant_scraper] Found country options: {countries}')
+
+    if not countries:
+        # Fallback: read whatever is currently shown
+        soup   = BeautifulSoup(page.content(), 'html.parser')
+        labels = _scrape_sizes_from_soup(soup)
+        country = _detect_country_from_labels(labels) or 'DEFAULT'
+        return {
+            'type':          'country_mapped' if country != 'DEFAULT' else 'plain',
+            'systems':       [{'country': country, 'options': labels}] if labels else [],
+            'plain_options': labels if country == 'DEFAULT' else [],
+        }
+
+    seen_countries = set()
+
+    for country in countries:
+        if country in seen_countries:
+            continue
+        seen_countries.add(country)
+
+        if country == 'DEFAULT':
+            # Read current state without selecting
+            soup   = BeautifulSoup(page.content(), 'html.parser')
+            labels = _scrape_sizes_from_soup(soup)
+            if labels:
+                systems.append({'country': 'DEFAULT', 'options': labels})
+            continue
+
+        ok = _select_country_option(page, country)
+        if not ok:
+            print(f'[variant_scraper] Could not select country: {country}')
+            continue
+
+        # Wait for the size tiles to update
+        page.wait_for_timeout(600)
+
+        soup   = BeautifulSoup(page.content(), 'html.parser')
+        labels = _scrape_sizes_from_soup(soup)
+
+        print(f'[variant_scraper]   {country}: {labels}')
+
+        if labels:
+            # Verify the labels actually contain this country code
+            detected = _detect_country_from_labels(labels)
+            systems.append({
+                'country': detected or country,
+                'options': labels,
+            })
+
+    if not systems:
+        return {'type': 'plain', 'systems': [], 'plain_options': []}
+
+    # If all options are DEFAULT/plain, treat as plain
+    if len(systems) == 1 and systems[0]['country'] == 'DEFAULT':
+        return {
+            'type':          'plain',
+            'systems':       [],
+            'plain_options': systems[0]['options'],
+        }
+
+    return {
+        'type':          'country_mapped',
+        'systems':       systems,
+        'plain_options': [],
     }
 
 
@@ -245,7 +405,9 @@ def _get_rotated_url(url: str) -> str:
 
 def scrape_product_variants(product_id: str, max_retries: int = 2) -> dict:
     """
-    Full browser scrape: load the AliExpress product page and extract variants.
+    Full browser scrape: load the AliExpress product page, detect whether a
+    country-size dropdown is present, iterate through all country options if so,
+    and return the complete variant structure.
 
     Args:
         product_id:  AliExpress numeric product ID string.
@@ -264,46 +426,58 @@ def scrape_product_variants(product_id: str, max_retries: int = 2) -> dict:
     }
 
     for attempt in range(1, max_retries + 1):
-        print(f"[variant_scraper] Attempt {attempt}/{max_retries} for product {product_id}")
+        print(f'[variant_scraper] Attempt {attempt}/{max_retries} for product {product_id}')
 
         url = _get_rotated_url(base_url)
         ua  = random.choice(USER_AGENTS)
 
         try:
             with Camoufox(headless=True, os='windows') as browser:
-                ctx  = browser.new_context(
+                ctx = browser.new_context(
                     viewport={'width': 1440, 'height': 900},
                     locale='en-US',
                     user_agent=ua,
                     extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
                 )
                 page = ctx.new_page()
-
                 page.goto(url, timeout=90_000, wait_until='domcontentloaded')
 
-                # Wait for SKU rows to appear
+                # Wait for SKU rows
                 try:
-                    page.wait_for_selector(
-                        '[data-sku-row]',
-                        timeout=15_000
-                    )
+                    page.wait_for_selector('[data-sku-row]', timeout=15_000)
                 except Exception:
-                    print(f"[variant_scraper] SKU selector not found on attempt {attempt}")
+                    print(f'[variant_scraper] SKU selector not found on attempt {attempt}')
 
-                # Scroll slightly to trigger lazy loads
+                # Gentle scroll to trigger lazy loads
                 for _ in range(3):
                     page.mouse.wheel(0, random.randint(300, 600))
                     page.wait_for_timeout(random.randint(400, 700))
+                page.wait_for_timeout(1_500)
 
-                page.wait_for_timeout(1500)
+                # ── Color variants (HTML parse, no interaction needed) ──────
+                html           = page.content()
+                soup           = BeautifulSoup(html, 'html.parser')
+                color_variants = _parse_color_variants(soup)
 
-                html = page.content()
+                # ── Size variants ────────────────────────────────────────────
+                if _has_country_size_dropdown(page):
+                    print('[variant_scraper] Country-size dropdown detected — scraping all options')
+                    size_variants = _scrape_all_country_sizes(page)
+                else:
+                    print('[variant_scraper] No country dropdown — scraping plain sizes')
+                    size_variants = _parse_size_variants_from_html(page.content())
+
                 page.close()
                 ctx.close()
 
-            result = extract_variants_from_html(html, product_id)
+            result = {
+                'product_id': product_id,
+                'variants': {
+                    'color': color_variants,
+                    'size':  size_variants,
+                }
+            }
 
-            # Validate: if we got at least some variants, return
             has_colors = bool(result['variants']['color'])
             has_sizes  = bool(
                 result['variants']['size']['plain_options'] or
@@ -314,14 +488,15 @@ def scrape_product_variants(product_id: str, max_retries: int = 2) -> dict:
                 print(
                     f"[variant_scraper] OK — "
                     f"{len(result['variants']['color'])} colors, "
-                    f"size type={result['variants']['size']['type']}"
+                    f"size type={result['variants']['size']['type']}, "
+                    f"systems={[s['country'] for s in result['variants']['size']['systems']]}"
                 )
                 return result
 
-            print(f"[variant_scraper] No variants found on attempt {attempt}")
+            print(f'[variant_scraper] No variants found on attempt {attempt}')
 
         except Exception as e:
-            print(f"[variant_scraper] Browser error on attempt {attempt}: {e}")
+            print(f'[variant_scraper] Browser error on attempt {attempt}: {e}')
             import traceback
             traceback.print_exc()
 
@@ -343,28 +518,26 @@ def save_variants_to_db(product_id_int: int, variants_data: dict) -> bool:
     """
     Persist extracted variant data to the product_variants table.
 
-    Each color and each size option is stored as a separate row:
-
+    Schema
+    ──────
     product_variants
-    ─────────────────────────────────────────────────────────────────
-    id              INTEGER PK
-    product_id      INTEGER  (FK → scraped_products.product_id)
-    aliexpress_id   TEXT     (raw AliExpress numeric ID)
-    variant_type    TEXT     ('color' | 'size')
-    variant_name    TEXT     (color name OR size label)
-    variant_value   TEXT     (image_url for colors; empty for sizes)
-    image_url       TEXT     (color image or empty)
-    sku_col_id      TEXT     (raw data-sku-col attribute, colors only)
-    system_country  TEXT     (US/EU/AU for country-mapped sizes, else '')
-    is_selected     INTEGER  (1 if swatch was selected at scrape time)
-    created_at      TIMESTAMP
+      id             INTEGER PK AUTOINCREMENT
+      product_id     INTEGER  (FK → scraped_products.product_id)
+      aliexpress_id  TEXT
+      variant_type   TEXT     ('color' | 'size')
+      variant_name   TEXT     (color name OR full size label)
+      variant_value  TEXT     (image_url for colors; '' for sizes)
+      image_url      TEXT
+      sku_col_id     TEXT     (colors only)
+      system_country TEXT     (country code for country-mapped sizes; '' otherwise)
+      is_selected    INTEGER  (1 if selected at scrape time)
+      created_at     TIMESTAMP
     """
     import sqlite3
 
     conn   = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    # Ensure table exists
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS product_variants (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -387,21 +560,21 @@ def save_variants_to_db(product_id_int: int, variants_data: dict) -> bool:
 
     rows = []
 
-    # ── Color rows ──────────────────────────────────────────────────────────
+    # Color rows
     for c in color_list:
         rows.append((
             product_id_int,
             aliexpress_id,
             'color',
             c.get('name', ''),
-            c.get('image_url', ''),       # variant_value = image URL for colors
+            c.get('image_url', ''),
             c.get('image_url', ''),
             c.get('sku_col_id', ''),
-            '',                           # no country for colors
+            '',
             1 if c.get('selected') else 0,
         ))
 
-    # ── Size rows ────────────────────────────────────────────────────────────
+    # Size rows
     if size_data.get('type') == 'country_mapped':
         for system in size_data.get('systems', []):
             country = system.get('country', '')
@@ -411,7 +584,7 @@ def save_variants_to_db(product_id_int: int, variants_data: dict) -> bool:
                     aliexpress_id,
                     'size',
                     opt,
-                    '',         # no image for sizes
+                    '',
                     '',
                     '',
                     country,
@@ -432,7 +605,6 @@ def save_variants_to_db(product_id_int: int, variants_data: dict) -> bool:
             ))
 
     if rows:
-        # Remove old rows for this product before re-inserting
         cursor.execute(
             "DELETE FROM product_variants WHERE product_id = ?",
             (product_id_int,)
@@ -444,17 +616,14 @@ def save_variants_to_db(product_id_int: int, variants_data: dict) -> bool:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
         conn.commit()
-        print(f"[variant_scraper] Saved {len(rows)} variant rows for product_id={product_id_int}")
+        print(f'[variant_scraper] Saved {len(rows)} variant rows for product_id={product_id_int}')
 
     conn.close()
     return len(rows) > 0
 
 
 def get_variants_from_db(product_id_int: int) -> Optional[dict]:
-    """
-    Re-assemble the variant JSON from stored rows.
-    Returns None if nothing is stored.
-    """
+    """Re-assemble the variant JSON from stored rows. Returns None if nothing stored."""
     import sqlite3
 
     conn   = sqlite3.connect(DB_NAME)
@@ -480,7 +649,7 @@ def get_variants_from_db(product_id_int: int) -> Optional[dict]:
     aliexpress_id = rows[0]['aliexpress_id']
     colors        = []
     sizes_plain   = []
-    sizes_mapped  = {}   # country → [labels]
+    sizes_mapped  = {}
 
     for row in rows:
         if row['variant_type'] == 'color':
@@ -520,11 +689,11 @@ def get_variants_from_db(product_id_int: int) -> Optional[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI (quick test)
+# CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     import sys
-    pid = sys.argv[1] if len(sys.argv) > 1 else '1005012117886583'
+    pid    = sys.argv[1] if len(sys.argv) > 1 else '1005012117886583'
     result = scrape_product_variants(pid)
     print(json.dumps(result, indent=2, ensure_ascii=False))
