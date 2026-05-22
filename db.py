@@ -21,6 +21,8 @@ Tables:
                             and specification for each product.
                             Supported: Romanian, German, Portuguese, Spanish, French.
                             One row per (url_id, language) pair.
+  varient                 — Product variant data (colors + country-mapped sizes)
+                            One row per individual variant option.
 """
 
 import sqlite3
@@ -87,7 +89,6 @@ def create_all_tables():
         exported_at        DATETIME
     )""")
 
-    # Live-database migration: add exported_at if this DB was created before v3.4
     _add_columns_if_missing(cursor, "scraped_products", [
         ("exported_at", "DATETIME"),
     ])
@@ -156,7 +157,6 @@ def create_all_tables():
         FOREIGN KEY (product_id) REFERENCES scraped_products(product_id)
     )""")
 
-    # Migration: add spec columns if this table was created before they were added
     _add_columns_if_missing(cursor, "enhanced_content", [
         ("brand",             "TEXT"),
         ("color",             "TEXT"),
@@ -316,9 +316,6 @@ def create_all_tables():
     )""")
 
     # ── TRANSLATION ─────────────────────────────────────────────────────────
-    # One row per (url_id, language) pair.
-    # Supported languages: Romanian, German, Portuguese, Spanish, French.
-    # Populated by: POST /translate-product/{aliexpress_id}
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS translation (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -340,10 +337,54 @@ def create_all_tables():
         processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )""")
 
+    # ── VARIENT ─────────────────────────────────────────────────────────────
+    # Stores all product variants: colors and country-mapped sizes.
+    # One row per individual variant option.
+    #
+    # Color row:
+    #   variant_type = 'color'
+    #   name         = color name (e.g. "White", "Black")
+    #   image_url    = full CDN image URL (not downloaded)
+    #   sku_col_id   = raw data-sku-col value (e.g. "14-29")
+    #   country      = NULL
+    #   is_selected  = 1 if this swatch was selected at scrape time
+    #
+    # Size row:
+    #   variant_type = 'size'
+    #   name         = size label (e.g. "S(US 36)", "M(EU 38)")
+    #   country      = country code (e.g. "US", "EU", "FR")
+    #                  NULL when type is plain (no dropdown)
+    #   image_url    = NULL
+    #   sku_col_id   = NULL
+    #   is_selected  = 0
+    #
+    # Duplicate guard: UNIQUE(product_id, variant_type, name, country)
+    # ensures re-scraping the same product does not create duplicate rows.
+    # country is coalesced to '' in the unique index because SQLite treats
+    # NULL != NULL, which would allow infinite duplicate NULL-country rows.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS varient (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id   TEXT    NOT NULL,
+        variant_type TEXT    NOT NULL CHECK(variant_type IN ('color', 'size')),
+        name         TEXT    NOT NULL,
+        country      TEXT,
+        image_url    TEXT,
+        sku_col_id   TEXT,
+        is_selected  INTEGER NOT NULL DEFAULT 0 CHECK(is_selected IN (0, 1)),
+        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # Unique index: (product_id, variant_type, name, coalesce(country,''))
+    # Prevents duplicates on re-scrape while correctly handling NULL country.
+    cursor.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS uix_varient_dedup
+    ON varient (product_id, variant_type, name, COALESCE(country, ''))
+    """)
+
     conn.commit()
     conn.close()
-    print("All tables created (including restricted_keywords, restricted_categories, "
-          "translation, processed_ids, and exported_at on scraped_products)")
+    print("All tables created (including varient)")
 
 
 # ---------------------------------------------------------------------------
@@ -351,16 +392,295 @@ def create_all_tables():
 # ---------------------------------------------------------------------------
 
 def _add_columns_if_missing(cursor, table: str, columns: list) -> None:
-    """
-    Add each (column_name, column_type) pair to *table* if it does not
-    already exist.  Silently skips columns that are already present.
-    Safe to call on every startup — it is idempotent.
-    """
     for col_name, col_type in columns:
         try:
             cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
         except sqlite3.OperationalError:
-            pass  # column already exists
+            pass
+
+
+# =============================================================================
+# VARIENT — save / read helpers
+# =============================================================================
+
+def save_variants(data: dict) -> dict:
+    """
+    Persist all variant data from the scraper JSON into the varient table.
+
+    Args:
+        data: The full variant dict returned by scrape_product_variants().
+              Must contain at minimum:
+                {
+                  "product_id": "1005010435033239",
+                  "variants": {
+                    "color": [ {"name": ..., "image_url": ...,
+                                "sku_col_id": ..., "selected": bool} ],
+                    "size": {
+                      "type": "country_mapped" | "plain",
+                      "systems": [ {"country": "US", "options": ["S(US 36)", ...]} ],
+                      "plain_options": ["S", "M", "L"]
+                    }
+                  }
+                }
+
+    Returns:
+        {"inserted": N, "skipped": N, "errors": N}
+        inserted — new rows added
+        skipped  — duplicates silently ignored (ON CONFLICT DO NOTHING)
+        errors   — rows that raised an unexpected exception
+    """
+    product_id = str(data.get("product_id", "")).strip()
+    if not product_id:
+        print("[db.save_variants] No product_id in data — skipping")
+        return {"inserted": 0, "skipped": 0, "errors": 0}
+
+    variants   = data.get("variants", {})
+    color_list = variants.get("color", [])
+    size_data  = variants.get("size", {})
+
+    rows = []
+
+    # ── Build color rows ────────────────────────────────────────────────────
+    for c in color_list:
+        name = (c.get("name") or "").strip()
+        if not name:
+            continue
+        rows.append({
+            "product_id":   product_id,
+            "variant_type": "color",
+            "name":         name,
+            "country":      None,
+            "image_url":    (c.get("image_url") or "").strip() or None,
+            "sku_col_id":   (c.get("sku_col_id") or "").strip() or None,
+            "is_selected":  1 if c.get("selected") else 0,
+        })
+
+    # ── Build size rows ─────────────────────────────────────────────────────
+    size_type = size_data.get("type", "plain")
+
+    if size_type == "country_mapped":
+        # Each system is one country; each option is one size label
+        for system in size_data.get("systems", []):
+            country = (system.get("country") or "").strip() or None
+            for opt in system.get("options", []):
+                opt = (opt or "").strip()
+                if not opt:
+                    continue
+                rows.append({
+                    "product_id":   product_id,
+                    "variant_type": "size",
+                    "name":         opt,
+                    "country":      country,
+                    "image_url":    None,
+                    "sku_col_id":   None,
+                    "is_selected":  0,
+                })
+    else:
+        # Plain sizes — no country
+        for opt in size_data.get("plain_options", []):
+            opt = (opt or "").strip()
+            if not opt:
+                continue
+            rows.append({
+                "product_id":   product_id,
+                "variant_type": "size",
+                "name":         opt,
+                "country":      None,
+                "image_url":    None,
+                "sku_col_id":   None,
+                "is_selected":  0,
+            })
+
+    if not rows:
+        print(f"[db.save_variants] No rows to insert for product_id={product_id}")
+        return {"inserted": 0, "skipped": 0, "errors": 0}
+
+    # ── Insert with duplicate guard ─────────────────────────────────────────
+    inserted = skipped = errors = 0
+    conn = create_connection()
+
+    try:
+        cursor = conn.cursor()
+        for row in rows:
+            try:
+                cursor.execute("""
+                    INSERT INTO varient
+                        (product_id, variant_type, name, country,
+                         image_url, sku_col_id, is_selected)
+                    VALUES
+                        (:product_id, :variant_type, :name, :country,
+                         :image_url, :sku_col_id, :is_selected)
+                    ON CONFLICT(product_id, variant_type, name, COALESCE(country, ''))
+                    DO NOTHING
+                """, row)
+
+                if cursor.rowcount == 1:
+                    inserted += 1
+                else:
+                    skipped += 1
+
+            except Exception as exc:
+                errors += 1
+                print(f"[db.save_variants] Row error — {row}: {exc}")
+
+        conn.commit()
+
+    except Exception as exc:
+        print(f"[db.save_variants] Connection error: {exc}")
+        errors += len(rows)
+    finally:
+        conn.close()
+
+    print(
+        f"[db.save_variants] product_id={product_id} | "
+        f"inserted={inserted} skipped={skipped} errors={errors}"
+    )
+    return {"inserted": inserted, "skipped": skipped, "errors": errors}
+
+
+def get_variants(product_id: str) -> dict:
+    """
+    Re-assemble the full variant structure from the varient table.
+
+    Args:
+        product_id: AliExpress product ID string.
+
+    Returns:
+        {
+          "product_id": "...",
+          "variants": {
+            "color": [ {"name": ..., "image_url": ...,
+                        "sku_col_id": ..., "selected": bool} ],
+            "size": {
+              "type": "country_mapped" | "plain",
+              "systems": [ {"country": "US", "options": [...]} ],
+              "plain_options": [...]
+            }
+          }
+        }
+        Returns None if no rows exist for this product_id.
+    """
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("""
+            SELECT variant_type, name, country, image_url, sku_col_id, is_selected
+            FROM varient
+            WHERE product_id = ?
+            ORDER BY variant_type, id
+        """, (str(product_id),)).fetchall()
+    except Exception as exc:
+        print(f"[db.get_variants] Error: {exc}")
+        return None
+    finally:
+        conn.close()
+
+    if not rows:
+        return None
+
+    colors        = []
+    sizes_plain   = []
+    sizes_mapped  = {}   # country -> [label, ...]
+
+    for row in rows:
+        if row["variant_type"] == "color":
+            colors.append({
+                "name":       row["name"],
+                "image_url":  row["image_url"] or "",
+                "sku_col_id": row["sku_col_id"] or "",
+                "selected":   bool(row["is_selected"]),
+            })
+        elif row["variant_type"] == "size":
+            country = row["country"]
+            if country:
+                sizes_mapped.setdefault(country, []).append(row["name"])
+            else:
+                sizes_plain.append(row["name"])
+
+    if sizes_mapped:
+        size_block = {
+            "type":          "country_mapped",
+            "systems":       [{"country": c, "options": o} for c, o in sizes_mapped.items()],
+            "plain_options": [],
+        }
+    else:
+        size_block = {
+            "type":          "plain",
+            "systems":       [],
+            "plain_options": sizes_plain,
+        }
+
+    return {
+        "product_id": str(product_id),
+        "variants":   {"color": colors, "size": size_block},
+    }
+
+
+def delete_variants(product_id: str) -> int:
+    """
+    Delete all variant rows for a product.
+    Returns the number of rows deleted.
+    """
+    conn = create_connection()
+    try:
+        conn.execute("DELETE FROM varient WHERE product_id = ?", (str(product_id),))
+        conn.commit()
+        n = conn.execute("SELECT changes()").fetchone()[0]
+        print(f"[db.delete_variants] Deleted {n} rows for product_id={product_id}")
+        return n
+    except Exception as exc:
+        print(f"[db.delete_variants] Error: {exc}")
+        return 0
+    finally:
+        conn.close()
+
+
+def get_variant_summary(product_id: str) -> dict:
+    """
+    Return a quick summary: how many color and size rows exist per country.
+    Useful for a dashboard or API status check.
+
+    Returns e.g.:
+        {
+          "product_id": "...",
+          "color_count": 2,
+          "size_count": 84,
+          "countries": ["EU", "US", "FR", "DE", "IT", "ES", "UK",
+                        "MX", "BR", "AU", "SG", "JP", "KR"]
+        }
+    """
+    conn = create_connection()
+    try:
+        color_count = conn.execute(
+            "SELECT COUNT(*) FROM varient WHERE product_id = ? AND variant_type = 'color'",
+            (str(product_id),)
+        ).fetchone()[0]
+
+        size_count = conn.execute(
+            "SELECT COUNT(*) FROM varient WHERE product_id = ? AND variant_type = 'size'",
+            (str(product_id),)
+        ).fetchone()[0]
+
+        country_rows = conn.execute(
+            "SELECT DISTINCT country FROM varient "
+            "WHERE product_id = ? AND variant_type = 'size' AND country IS NOT NULL "
+            "ORDER BY country",
+            (str(product_id),)
+        ).fetchall()
+
+        countries = [r[0] for r in country_rows]
+
+        return {
+            "product_id":  str(product_id),
+            "color_count": color_count,
+            "size_count":  size_count,
+            "countries":   countries,
+        }
+    except Exception as exc:
+        print(f"[db.get_variant_summary] Error: {exc}")
+        return {}
+    finally:
+        conn.close()
 
 
 # =============================================================================
@@ -374,20 +694,6 @@ def insert_translation(
     description: str = "",
     specification: str = "",
 ) -> bool:
-    """
-    Insert or update one translation row for (url_id, language).
-
-    Column-name dict convention (matches table schema exactly):
-        {
-            "url_id":        url_id,
-            "language":      language,
-            "title":         title,
-            "description":   description,
-            "specification": specification,
-        }
-
-    Returns True on success, False on any error.
-    """
     conn = create_connection()
     try:
         conn.execute("""
@@ -410,11 +716,6 @@ def insert_translation(
 
 
 def get_translations(url_id: int) -> list:
-    """
-    Return all translation rows for *url_id* as a list of dicts.
-    Each dict key matches the translation table column name exactly.
-    Returns [] if no rows exist or on error.
-    """
     conn = create_connection()
     conn.row_factory = sqlite3.Row
     try:
@@ -432,10 +733,6 @@ def get_translations(url_id: int) -> list:
 
 
 def get_translation(url_id: int, language: str) -> Optional[dict]:
-    """
-    Return one translation row for (url_id, language) as a dict, or None.
-    Dict keys match the translation table column names exactly.
-    """
     conn = create_connection()
     conn.row_factory = sqlite3.Row
     try:
@@ -453,12 +750,6 @@ def get_translation(url_id: int, language: str) -> Optional[dict]:
 
 
 def delete_translations(url_id: int, language: str = None) -> int:
-    """
-    Delete translation rows for *url_id*.
-    If *language* is given, delete only that language row.
-    If *language* is None, delete all rows for this product.
-    Returns the number of rows deleted.
-    """
     conn = create_connection()
     try:
         if language:
@@ -482,15 +773,6 @@ def delete_translations(url_id: int, language: str = None) -> int:
 # =============================================================================
 
 def load_restricted_keywords_from_csv(csv_path: str) -> int:
-    """
-    Load restricted keywords from a CSV file into the restricted_keywords table.
-
-    CSV must have a column named 'desc_and_spec_restricted_keywords'.
-    Returns the number of new keywords inserted.
-
-    CLI usage:
-        python db.py load-keywords restricted_keywords.csv
-    """
     if not os.path.exists(csv_path):
         print(f"[db] CSV not found: {csv_path}")
         return 0
@@ -525,7 +807,7 @@ def load_restricted_keywords_from_csv(csv_path: str) -> int:
                     skipped += 1
 
         conn.commit()
-        print(f"[db] Keywords loaded: {count} inserted, {skipped} skipped (duplicates)")
+        print(f"[db] Keywords loaded: {count} inserted, {skipped} skipped")
         return count
 
     except Exception as exc:
@@ -536,7 +818,6 @@ def load_restricted_keywords_from_csv(csv_path: str) -> int:
 
 
 def get_restricted_keywords() -> list:
-    """Return all restricted keywords as a lowercase list."""
     conn = create_connection()
     try:
         cursor = conn.cursor()
@@ -550,40 +831,25 @@ def get_restricted_keywords() -> list:
 
 
 def filter_restricted_keywords(text: str, keywords: list = None) -> tuple:
-    """
-    Scan *text* for restricted keywords and replace matches with '[REMOVED]'.
-
-    Args:
-        text:     Text to scan (description, spec, bullet point, …).
-        keywords: Pre-loaded keyword list; fetched from DB if None.
-
-    Returns:
-        (cleaned_text, found_keywords_list)
-    """
     if not text:
         return text, []
-
     if keywords is None:
         keywords = get_restricted_keywords()
-
     found   = []
     cleaned = text
-
     for kw in keywords:
         pattern = re.compile(re.escape(kw), re.IGNORECASE)
         if pattern.search(cleaned):
             found.append(kw)
             cleaned = pattern.sub('[REMOVED]', cleaned)
-
     return cleaned, found
 
 
 # =============================================================================
-# DEDUPLICATION HELPERS (products.db mirror)
+# DEDUPLICATION HELPERS
 # =============================================================================
 
 def get_processed_ids(job_id: str = None) -> list:
-    """Return processed merchant IDs, optionally filtered by job_id."""
     conn = create_connection()
     try:
         cursor = conn.cursor()
@@ -603,7 +869,6 @@ def get_processed_ids(job_id: str = None) -> list:
 
 
 def get_processed_id_count(job_id: str = None) -> int:
-    """Return count of processed merchant IDs, optionally filtered by job_id."""
     conn = create_connection()
     try:
         cursor = conn.cursor()
@@ -1094,8 +1359,7 @@ def log_all_spec_audits(product_id, scraped_data, specs_enhanced, enriched_data_
         log_specification_audit(product_id, field, original_val,
                                 enhanced_val, template_val, source)
     print(f"Audit log written (product_id={product_id})")
-# =============================================================================
-# =============================================================================
+
 
 def get_all_manufacturer_info(limit: int = 10) -> list:
     conn = create_connection()
@@ -1136,6 +1400,35 @@ if __name__ == '__main__':
         create_all_tables()
         n = load_restricted_keywords_from_csv(csv_file)
         print(f"Loaded {n} keywords from {csv_file}")
+    elif len(sys.argv) > 1 and sys.argv[1] == 'test-variants':
+        # Quick smoke test: insert sample data and read it back
+        create_all_tables()
+        sample = {
+            "product_id": "1005010435033239",
+            "variants": {
+                "color": [
+                    {"name": "White", "image_url": "https://example.com/white.jpg",
+                     "sku_col_id": "14-29", "selected": True},
+                    {"name": "Black", "image_url": "https://example.com/black.jpg",
+                     "sku_col_id": "14-193", "selected": False},
+                ],
+                "size": {
+                    "type": "country_mapped",
+                    "systems": [
+                        {"country": "EU", "options": ["S(EU 36)", "M(EU 38)", "L(EU 40/42)"]},
+                        {"country": "US", "options": ["S(US 4)", "M(US 6)", "L(US 08/10)"]},
+                        {"country": "UK", "options": ["S(UK 8)", "M(UK 10)", "L(UK 12/14)"]},
+                    ],
+                    "plain_options": [],
+                },
+            },
+        }
+        result = save_variants(sample)
+        print(f"Save result: {result}")
+        summary = get_variant_summary("1005010435033239")
+        print(f"Summary: {summary}")
+        recovered = get_variants("1005010435033239")
+        print(json.dumps(recovered, indent=2, ensure_ascii=False))
     else:
         create_all_tables()
-        print("Tables created. To load keywords: python db.py load-keywords restricted_keywords.csv")
+        print("Tables created. Commands: load-keywords <csv> | test-variants")
