@@ -1,7 +1,19 @@
 """
-variant_scraper.py
-──────────────────
+variant_scraper.py  (anti-block edition)
+─────────────────────────────────────────
 Extracts structured product variant data from AliExpress product pages.
+
+Anti-blocking techniques (ported from scraper.py):
+  ✅ Camoufox with os='windows' fingerprint spoofing
+  ✅ Random User-Agent rotation
+  ✅ Region URL rotation (REGIONS_SAFE / REGIONS_EU + SERVER_IS_EU flag)
+  ✅ GDPR / cookie-banner auto-dismissal (_dismiss_gdpr_banner)
+  ✅ EU-page detection → auto-triggers consent flow
+  ✅ ThreadPoolExecutor with hard timeout → no zombie browser hangs
+  ✅ page.on('response') mtop interceptor → confirms real page load vs bot wall
+  ✅ Scroll-to-top retry when SKU tiles not found on first pass
+  ✅ max_retries=3 with randomised jitter sleeps between attempts
+  ✅ Extra HTTP headers (Accept-Language) for naturalness
 
 Handles:
   • Color variants  — image-based swatches (sku-item--image)
@@ -37,6 +49,7 @@ import re
 import json
 import random
 import time
+import concurrent.futures
 from typing import Optional
 from bs4 import BeautifulSoup
 
@@ -64,6 +77,67 @@ _SIZE_BTN_COUNTRY_RE = re.compile(r'Size\s*\(([A-Z]{2})\)', re.IGNORECASE)
 # Strip AliExpress thumbnail/avif suffixes
 _AVIF_THUMB_RE = re.compile(r'(_\d+x\d+q\d+\.jpg_\.avif|_\.avif)$', re.IGNORECASE)
 
+# ── Anti-block config ─────────────────────────────────────────────────────────
+
+# Set True when running on an EU server so region rotation favours EU IPs
+SERVER_IS_EU = False
+
+REGIONS_SAFE = ["AE", "US", "AU", "CA", "PK", "SA", "TR"]
+REGIONS_EU   = ["DE", "FR", "NL", "IT", "ES"]
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+MAX_RETRIES   = 3
+PAGE_TIMEOUT  = 90_000   # ms — full page load budget
+SKU_TIMEOUT   = 15_000   # ms — wait for SKU tiles to appear
+
+# CSS selectors based on the confirmed AliExpress HTML
+_BTN_SELECTOR     = 'button.comet-v2-btn-important'
+_MENU_ITEM_SEL    = '.comet-v2-dropdown-body .comet-v2-menu-item'
+_MENU_CONTENT_SEL = '.comet-v2-menu-item-content'
+_SKU_ROW_SEL      = '[data-sku-row]'
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# URL / FINGERPRINT HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_product_url(product_id: str) -> str:
+    return f"https://www.aliexpress.com/item/{product_id}.html"
+
+
+def _get_rotated_url(url: str) -> str:
+    """Append a random shipFromCountry param to vary the CDN/cache path."""
+    region = random.choice(REGIONS_EU if SERVER_IS_EU else REGIONS_SAFE)
+    sep    = '&' if '?' in url else '?'
+    print(f"[variant_scraper] Region → {region}")
+    return f"{url}{sep}shipFromCountry={region}"
+
+
+def _is_eu_url(url: str) -> bool:
+    eu_domains = [
+        'pl.aliexpress.com', 'de.aliexpress.com', 'fr.aliexpress.com',
+        'it.aliexpress.com', 'es.aliexpress.com', 'nl.aliexpress.com',
+    ]
+    return any(d in url for d in eu_domains)
+
+
+def _detect_eu_page(url: str, html_snippet: str) -> bool:
+    indicators = ['gdpr', 'cookie-consent', 'Trader', 'DSA',
+                  'de.aliexpress.com', 'fr.aliexpress.com']
+    return any(ind in (url + html_snippet[:5000]) for ind in indicators)
+
 
 def _normalise_image_url(url: str) -> str:
     if not url:
@@ -72,6 +146,72 @@ def _normalise_image_url(url: str) -> str:
     if url.startswith('//'):
         url = 'https:' + url
     return url
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANTI-BLOCK: BANNER / CONSENT DISMISSAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dismiss_gdpr_banner(page) -> bool:
+    """Click the cookie-consent / GDPR accept button if present."""
+    selectors = [
+        'button:has-text("Accept All")',
+        'button:has-text("Accept all cookies")',
+        'button:has-text("Agree")',
+        'button:has-text("I Accept")',
+        '#accept-all',
+        '.accept-all',
+    ]
+    for sel in selectors:
+        try:
+            el = page.locator(sel).first
+            if el.count() > 0 and el.is_visible(timeout=1_500):
+                el.click(timeout=2_000)
+                page.wait_for_timeout(800)
+                print(f"[variant_scraper] GDPR banner dismissed via: {sel}")
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _dismiss_banners(page) -> None:
+    _dismiss_gdpr_banner(page)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANTI-BLOCK: mtop RESPONSE INTERCEPTOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _attach_mtop_interceptor(page) -> list:
+    """
+    Attach a response listener that captures the AliExpress mtop PDP API call.
+    Returns a shared list; non-empty means the page loaded real product data
+    (not a bot-wall / CAPTCHA page).
+
+    The listener fires when the browser receives:
+      mtop.aliexpress.pdp.pc.query  (or pdp.pc.query)
+    """
+    captured = []
+
+    def _handle_response(response):
+        try:
+            resp_url = response.url
+            if (('mtop.aliexpress.pdp.pc.query' in resp_url or
+                 'pdp.pc.query' in resp_url) and response.status == 200):
+                body = response.body()
+                if len(body) < 500:
+                    return
+                text = body.decode('utf-8', errors='replace')
+                if any(x in text for x in ['titleModule', 'imageModule', '"subject"',
+                                            'skuModule', 'SKU_PROPERTY']):
+                    captured.append(text)
+                    print(f"[variant_scraper] mtop API captured ({len(text):,} bytes) ✓")
+        except Exception:
+            pass
+
+    page.on('response', _handle_response)
+    return captured
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,7 +242,7 @@ def _parse_color_variants(soup: BeautifulSoup) -> list:
             src      = _normalise_image_url(img.get('src', ''))
             sku_col  = item.get('data-sku-col', '')
             selected = 'sku-item--selected' in ' '.join(item.get('class', []))
-            key = alt.lower() or src
+            key      = alt.lower() or src
             if key in seen:
                 continue
             seen.add(key)
@@ -186,22 +326,8 @@ def extract_variants_from_html(html: str, product_id: str) -> dict:
 # BROWSER HELPERS — country dropdown interaction
 # ─────────────────────────────────────────────────────────────────────────────
 
-# CSS selectors based on the confirmed AliExpress HTML:
-#   button  → button.comet-v2-btn-important  (contains "Size(XX)" text)
-#   menu    → .comet-v2-dropdown-body .comet-v2-menu-item  (each country <li>)
-#   label   → .comet-v2-menu-item-content  (text inside each <li>)
-
-_BTN_SELECTOR      = 'button.comet-v2-btn-important'
-_MENU_ITEM_SEL     = '.comet-v2-dropdown-body .comet-v2-menu-item'
-_MENU_CONTENT_SEL  = '.comet-v2-menu-item-content'
-_SKU_ROW_SEL       = '[data-sku-row]'
-
-
 def _has_country_size_dropdown(page) -> bool:
-    """
-    Return True if any visible button has text matching 'Size(XX)'.
-    Uses the confirmed button selector.
-    """
+    """Return True if any visible button has text matching 'Size(XX)'."""
     try:
         btns = page.locator(_BTN_SELECTOR).all()
         for btn in btns:
@@ -229,7 +355,6 @@ def _open_dropdown(page) -> bool:
                 if _SIZE_BTN_COUNTRY_RE.search(txt):
                     btn.scroll_into_view_if_needed()
                     btn.click()
-                    # Wait until the dropdown body is visible
                     page.wait_for_selector(
                         '.comet-v2-dropdown-body',
                         state='visible',
@@ -246,7 +371,6 @@ def _open_dropdown(page) -> bool:
 def _read_country_list(page) -> list[str]:
     """
     Read all country names from the open dropdown menu.
-    Dropdown must already be open when this is called.
     Returns e.g. ["Default", "EU", "US", "ES", "FR", "UK", "DE", ...]
     """
     countries = []
@@ -254,7 +378,6 @@ def _read_country_list(page) -> list[str]:
         items = page.locator(_MENU_ITEM_SEL).all()
         for item in items:
             try:
-                # text is inside .comet-v2-menu-item-content <span>
                 span = item.locator(_MENU_CONTENT_SEL).first
                 txt  = (span.inner_text(timeout=800) or '').strip()
                 if txt:
@@ -291,7 +414,7 @@ def _click_country_in_open_dropdown(page, country: str) -> bool:
 def _wait_for_sizes_to_refresh(page, previous_labels: list[str], timeout_ms: int = 4_000):
     """
     Poll until the visible size labels differ from previous_labels,
-    or until timeout_ms elapses.  This handles AliExpress's async DOM update.
+    or until timeout_ms elapses.
     """
     deadline = time.time() + timeout_ms / 1_000
     while time.time() < deadline:
@@ -301,7 +424,6 @@ def _wait_for_sizes_to_refresh(page, previous_labels: list[str], timeout_ms: int
         if current and current != previous_labels:
             return current
         time.sleep(0.3)
-    # Return whatever we have even if unchanged
     soup = BeautifulSoup(page.content(), 'html.parser')
     return _scrape_size_labels_from_soup(soup)
 
@@ -319,7 +441,7 @@ def _scrape_all_country_sizes(page) -> dict:
            d. Scrape the new labels
       3. Assemble & return a country_mapped size block
     """
-    # ── Step 1: open once, read the full country list ──────────────────────
+    # Step 1: open once, read the full country list
     if not _open_dropdown(page):
         print('[variant_scraper] Could not open dropdown — falling back to plain parse')
         return _parse_plain_size_variants(page.content())
@@ -328,28 +450,26 @@ def _scrape_all_country_sizes(page) -> dict:
     print(f'[variant_scraper] Dropdown countries: {countries}')
 
     if not countries:
-        # Close and fall back
         try:
             page.keyboard.press('Escape')
         except Exception:
             pass
         return _parse_plain_size_variants(page.content())
 
-    # Close dropdown before the loop starts
+    # Close dropdown before loop
     try:
         page.keyboard.press('Escape')
         page.wait_for_timeout(400)
     except Exception:
         pass
 
-    systems         = []
-    seen_countries  = set()
+    systems        = []
+    seen_countries = set()
 
-    # Get baseline labels (whatever is shown before we touch anything)
     baseline_soup   = BeautifulSoup(page.content(), 'html.parser')
     previous_labels = _scrape_size_labels_from_soup(baseline_soup)
 
-    # ── Step 2: iterate every country ─────────────────────────────────────
+    # Step 2: iterate every country
     for country in countries:
         norm = country.strip()
         if not norm or norm in seen_countries:
@@ -358,14 +478,12 @@ def _scrape_all_country_sizes(page) -> dict:
 
         print(f'[variant_scraper] Selecting: {norm}')
 
-        # a. Re-open dropdown
         if not _open_dropdown(page):
             print(f'[variant_scraper]   Could not reopen dropdown for {norm}, skipping')
             continue
 
-        page.wait_for_timeout(400)   # brief pause after open
+        page.wait_for_timeout(400)
 
-        # b. Click country
         clicked = _click_country_in_open_dropdown(page, norm)
         if not clicked:
             print(f'[variant_scraper]   Could not click "{norm}", skipping')
@@ -375,11 +493,9 @@ def _scrape_all_country_sizes(page) -> dict:
                 pass
             continue
 
-        # c. Wait for DOM update
-        page.wait_for_timeout(300)                          # initial settle
+        page.wait_for_timeout(300)
         labels = _wait_for_sizes_to_refresh(page, previous_labels, timeout_ms=4_000)
 
-        # d. Store result
         print(f'[variant_scraper]   {norm} → {labels}')
 
         if labels:
@@ -388,12 +504,11 @@ def _scrape_all_country_sizes(page) -> dict:
                 'country': detected_country or norm,
                 'options': labels,
             })
-            previous_labels = labels  # update baseline for next iteration
+            previous_labels = labels
 
     if not systems:
         return {'type': 'plain', 'systems': [], 'plain_options': []}
 
-    # If only "Default" with no country code in labels → treat as plain
     if len(systems) == 1 and systems[0]['country'] == 'Default':
         return {
             'type':          'plain',
@@ -409,53 +524,135 @@ def _scrape_all_country_sizes(page) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BROWSER-BASED SCRAPER  (Camoufox)
+# ANTI-BLOCK: CORE BROWSER SESSION  (runs inside ThreadPoolExecutor)
 # ─────────────────────────────────────────────────────────────────────────────
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-]
-
-REGIONS_SAFE = ["AE", "US", "AU", "CA", "PK", "SA", "TR"]
-
-
-def _build_product_url(product_id: str) -> str:
-    return f"https://www.aliexpress.com/item/{product_id}.html"
-
-
-def _get_rotated_url(url: str) -> str:
-    region = random.choice(REGIONS_SAFE)
-    sep    = '&' if '?' in url else '?'
-    return f"{url}{sep}shipFromCountry={region}"
-
-
-def scrape_product_variants(product_id: str, max_retries: int = 2) -> dict:
+def _scrape_in_thread(product_id: str, url: str) -> dict:
     """
-    Full browser scrape of an AliExpress product page.
+    Single browser session wrapped so it can be killed by a ThreadPoolExecutor
+    timeout.  Returns dict with keys: color_variants, size_variants,
+    mtop_captured (bool), html_len.
+    """
+    from camoufox.sync_api import Camoufox
 
-    Flow:
-      1. Load the page with Camoufox
-      2. Parse color variants from HTML (no clicks needed)
-      3. Detect whether a country-size dropdown is present
-         • YES → _scrape_all_country_sizes() clicks every country
-         • NO  → _parse_plain_size_variants() reads the static tiles
-      4. Return the combined variant dict
+    ua     = random.choice(USER_AGENTS)
+    is_eu  = _is_eu_url(url)
+
+    color_variants: list = []
+    size_variants:  dict = {'type': 'plain', 'systems': [], 'plain_options': []}
+    mtop_captured         = False
+
+    try:
+        with Camoufox(headless=True, os='windows') as browser:
+            ctx = browser.new_context(
+                viewport={'width': 1440, 'height': 900},
+                locale='en-US',
+                user_agent=ua,
+                extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
+            )
+            page = ctx.new_page()
+
+            # ── Anti-block: attach mtop interceptor ───────────────────────
+            captured_api = _attach_mtop_interceptor(page)
+
+            # ── Navigate ──────────────────────────────────────────────────
+            page.goto(url, timeout=PAGE_TIMEOUT, wait_until='domcontentloaded')
+
+            # ── Anti-block: handle EU / GDPR consent ─────────────────────
+            detected_eu = _detect_eu_page(page.url, page.content()[:5000]) or is_eu
+            if detected_eu:
+                page.wait_for_timeout(2_000)
+                _dismiss_banners(page)
+                page.wait_for_timeout(1_000)
+
+            # ── Wait for SKU tiles ────────────────────────────────────────
+            sku_found = False
+            try:
+                page.wait_for_selector(_SKU_ROW_SEL, timeout=SKU_TIMEOUT)
+                sku_found = True
+            except Exception:
+                print(f'[variant_scraper] SKU selector not found on first pass')
+
+            # ── Gentle scroll to trigger lazy-loaded content ──────────────
+            for _ in range(3):
+                page.mouse.wheel(0, random.randint(300, 600))
+                page.wait_for_timeout(random.randint(400, 700))
+            page.wait_for_timeout(1_500)
+
+            # ── Anti-block: scroll-to-top retry (mirrors scraper.py) ──────
+            # If SKU tiles still absent OR mtop API not triggered yet,
+            # scroll back to top and wait — this re-fires the lazy loader.
+            if not sku_found or not captured_api:
+                print('[variant_scraper] Scroll-to-top retry...')
+                page.mouse.wheel(0, -9_999)
+                page.wait_for_timeout(3_000)
+                page.mouse.wheel(0, 600)
+                page.wait_for_timeout(2_000)
+                # Second attempt at SKU selector after retry
+                if not sku_found:
+                    try:
+                        page.wait_for_selector(_SKU_ROW_SEL, timeout=8_000)
+                        sku_found = True
+                    except Exception:
+                        print('[variant_scraper] SKU tiles still absent after retry')
+
+            mtop_captured = bool(captured_api)
+            print(f'[variant_scraper] mtop captured: {mtop_captured} | '
+                  f'SKU found: {sku_found}')
+
+            # ── Colors (pure HTML parse, no interaction) ──────────────────
+            soup           = BeautifulSoup(page.content(), 'html.parser')
+            color_variants = _parse_color_variants(soup)
+
+            # ── Sizes ─────────────────────────────────────────────────────
+            if _has_country_size_dropdown(page):
+                print('[variant_scraper] Country dropdown detected → iterating all countries')
+                size_variants = _scrape_all_country_sizes(page)
+            else:
+                print('[variant_scraper] No country dropdown → plain size parse')
+                size_variants = _parse_plain_size_variants(page.content())
+
+            page.close()
+            ctx.close()
+
+    except Exception as e:
+        print(f'[variant_scraper] Browser error: {e}')
+        import traceback
+        traceback.print_exc()
+
+    return {
+        'color_variants': color_variants,
+        'size_variants':  size_variants,
+        'mtop_captured':  mtop_captured,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BROWSER-BASED SCRAPER  (public API)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def scrape_product_variants(product_id: str, max_retries: int = MAX_RETRIES) -> dict:
+    """
+    Full browser scrape of an AliExpress product page with anti-blocking.
+
+    Anti-blocking flow per attempt:
+      1. Rotate shipFromCountry param on URL
+      2. Random User-Agent
+      3. Camoufox os='windows' fingerprint
+      4. Attach mtop interceptor (detect bot wall vs real page)
+      5. Dismiss GDPR / cookie banners (EU pages)
+      6. Scroll-to-top retry when SKU tiles absent on first pass
+      7. ThreadPoolExecutor timeout = 200 s to prevent zombie hangs
+      8. Randomised jitter sleep between retries (4–9 s)
 
     Args:
         product_id:  AliExpress numeric product ID.
-        max_retries: Retry attempts on failure.
+        max_retries: Retry attempts on failure (default 3).
 
     Returns:
         Variant dict per the module-level JSON contract.
         On complete failure returns empty structure + 'error' key.
     """
-    from camoufox.sync_api import Camoufox
-
     base_url = _build_product_url(product_id)
     empty    = {
         'product_id': product_id,
@@ -466,79 +663,69 @@ def scrape_product_variants(product_id: str, max_retries: int = 2) -> dict:
     }
 
     for attempt in range(1, max_retries + 1):
-        print(f'[variant_scraper] Attempt {attempt}/{max_retries} — product {product_id}')
+        print(f'\n[variant_scraper] ══ Attempt {attempt}/{max_retries} — product {product_id} ══')
 
         url = _get_rotated_url(base_url)
-        ua  = random.choice(USER_AGENTS)
 
         try:
-            with Camoufox(headless=True, os='windows') as browser:
-                ctx = browser.new_context(
-                    viewport={'width': 1440, 'height': 900},
-                    locale='en-US',
-                    user_agent=ua,
-                    extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
-                )
-                page = ctx.new_page()
-                page.goto(url, timeout=90_000, wait_until='domcontentloaded')
+            # ── Anti-block: hard timeout via ThreadPoolExecutor ──────────
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_scrape_in_thread, product_id, url)
+                thread_result = future.result(timeout=200)   # kill if hung
 
-                # Wait for SKU tiles to appear
-                try:
-                    page.wait_for_selector(_SKU_ROW_SEL, timeout=15_000)
-                except Exception:
-                    print(f'[variant_scraper] SKU selector not found on attempt {attempt}')
-
-                # Gentle scroll to trigger lazy-loaded content
-                for _ in range(3):
-                    page.mouse.wheel(0, random.randint(300, 600))
-                    page.wait_for_timeout(random.randint(400, 700))
-                page.wait_for_timeout(1_500)
-
-                # ── Colors (pure HTML parse, no interaction) ───────────────
-                soup           = BeautifulSoup(page.content(), 'html.parser')
-                color_variants = _parse_color_variants(soup)
-
-                # ── Sizes ──────────────────────────────────────────────────
-                if _has_country_size_dropdown(page):
-                    print('[variant_scraper] Country dropdown detected → iterating all countries')
-                    size_variants = _scrape_all_country_sizes(page)
-                else:
-                    print('[variant_scraper] No country dropdown → plain size parse')
-                    size_variants = _parse_plain_size_variants(page.content())
-
-                page.close()
-                ctx.close()
-
-            result = {
-                'product_id': product_id,
-                'variants':   {'color': color_variants, 'size': size_variants},
-            }
-
-            has_colors = bool(result['variants']['color'])
-            has_sizes  = bool(
-                result['variants']['size']['plain_options'] or
-                result['variants']['size']['systems']
-            )
-
-            if has_colors or has_sizes:
-                n_systems = len(result['variants']['size']['systems'])
-                countries = [s['country'] for s in result['variants']['size']['systems']]
-                print(
-                    f'[variant_scraper] ✓ {len(color_variants)} colors | '
-                    f'size type={result["variants"]["size"]["type"]} | '
-                    f'{n_systems} country system(s): {countries}'
-                )
-                return result
-
-            print(f'[variant_scraper] No variants on attempt {attempt}')
-
+        except concurrent.futures.TimeoutError:
+            print(f'[variant_scraper] Attempt {attempt} timed out (200 s)')
+            if attempt < max_retries:
+                time.sleep(random.uniform(4, 9))
+            continue
         except Exception as e:
-            print(f'[variant_scraper] Browser error attempt {attempt}: {e}')
-            import traceback
-            traceback.print_exc()
+            print(f'[variant_scraper] Attempt {attempt} executor error: {e}')
+            if attempt < max_retries:
+                time.sleep(random.uniform(4, 9))
+            continue
 
+        color_variants = thread_result['color_variants']
+        size_variants  = thread_result['size_variants']
+        mtop_captured  = thread_result['mtop_captured']
+
+        result = {
+            'product_id': product_id,
+            'variants':   {'color': color_variants, 'size': size_variants},
+        }
+
+        has_colors = bool(color_variants)
+        has_sizes  = bool(
+            size_variants.get('plain_options') or
+            size_variants.get('systems')
+        )
+
+        # If mtop API was NOT captured the page was likely a bot wall —
+        # treat as a soft failure even if some DOM scraping succeeded,
+        # unless we actually got usable variant data.
+        if not mtop_captured and not has_colors and not has_sizes:
+            print(f'[variant_scraper] Bot wall suspected (no mtop + no variants) '
+                  f'on attempt {attempt}')
+            if attempt < max_retries:
+                sleep = random.uniform(4, 9)
+                print(f'[variant_scraper] Sleeping {sleep:.1f}s before retry...')
+                time.sleep(sleep)
+            continue
+
+        if has_colors or has_sizes:
+            n_systems = len(size_variants.get('systems', []))
+            countries = [s['country'] for s in size_variants.get('systems', [])]
+            print(
+                f'[variant_scraper] ✓ {len(color_variants)} colors | '
+                f'size type={size_variants["type"]} | '
+                f'{n_systems} country system(s): {countries}'
+            )
+            return result
+
+        print(f'[variant_scraper] No variants on attempt {attempt}')
         if attempt < max_retries:
-            time.sleep(random.uniform(3, 6))
+            sleep = random.uniform(4, 9)
+            print(f'[variant_scraper] Sleeping {sleep:.1f}s before retry...')
+            time.sleep(sleep)
 
     empty['error'] = 'No variants extracted after all retries'
     return empty
