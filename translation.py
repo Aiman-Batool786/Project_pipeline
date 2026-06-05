@@ -38,6 +38,10 @@ TRANSLATION_OPENAI_MODEL    — default: gpt-4o-mini
 TRANSLATION_ANTHROPIC_MODEL — default: claude-sonnet-4-20250514
 TRANSLATION_TIMEOUT_SEC     — seconds before an API call is abandoned (default: 60)
 TRANSLATION_MAX_RETRIES     — extra retries on 429/5xx (default: 2 -> 3 attempts total)
+
+Supported languages (v3.5):
+  Romanian, German, Portuguese, Finnish, French
+  NOTE: Spanish was replaced with Finnish in v3.5.
 """
 
 from __future__ import annotations
@@ -64,12 +68,13 @@ ANTHROPIC_MODEL: str = os.environ.get(
 REQUEST_TIMEOUT: int = int(os.environ.get("TRANSLATION_TIMEOUT_SEC", "60"))
 MAX_RETRIES: int = int(os.environ.get("TRANSLATION_MAX_RETRIES", "2"))
 
-# Supported languages — must stay in sync with db.py translation table usage
+# Supported languages — must stay in sync with db.py translation table usage.
+# v3.5: Spanish replaced with Finnish.
 SUPPORTED_LANGUAGES: List[str] = [
     "Romanian",
     "German",
     "Portuguese",
-    "Spanish",
+    "Finnish",
     "French",
 ]
 
