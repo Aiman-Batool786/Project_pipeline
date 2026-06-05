@@ -19,8 +19,11 @@ Tables:
   processed_ids           — Global deduplication table for merchant scraper
   translation             — Per-language translations of title, description,
                             and specification for each product.
-                            Supported: Romanian, German, Portuguese, Spanish, French.
+                            Supported: Romanian, German, Portuguese, Finnish, French.
+                            (v3.5: Spanish replaced with Finnish.)
                             One row per (url_id, language) pair.
+  product_details         — Star rating and delivery date per product ID,
+                            scraped by star_rating_scraper.py.
   varient                 — Product variant data (colors + country-mapped sizes)
                             One row per individual variant option.
 """
@@ -335,6 +338,22 @@ def create_all_tables():
         id           TEXT PRIMARY KEY,
         job_id       TEXT,
         processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    # ── PRODUCT DETAILS (STAR RATING + DELIVERY DATE) ───────────────────────
+    # Populated by star_rating_scraper.py / POST /product-details endpoint.
+    # Keyed by AliExpress numeric product ID string.
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS product_details (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id   TEXT    NOT NULL UNIQUE,
+        star_rating  TEXT,
+        delivery     TEXT,
+        price        TEXT,
+        quantity     TEXT,
+        ship_country TEXT,
+        scraped_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        url          TEXT
     )""")
 
     # ── VARIENT ─────────────────────────────────────────────────────────────
@@ -679,6 +698,97 @@ def get_variant_summary(product_id: str) -> dict:
     except Exception as exc:
         print(f"[db.get_variant_summary] Error: {exc}")
         return {}
+    finally:
+        conn.close()
+
+
+# =============================================================================
+# PRODUCT DETAILS (STAR RATING + DELIVERY DATE)
+# =============================================================================
+
+def save_star_rating_delivery(product_id: str, data: dict) -> bool:
+    """
+    Upsert star rating, delivery date, price, quantity, and ship_country
+    for a given AliExpress product ID string.
+
+    Args:
+        product_id: AliExpress numeric ID string (e.g. "1005010435033239").
+        data: Dict returned by star_rating_scraper.scrape_product_details().
+              Expected keys: rating, delivery, price, quantity, ship_country,
+              url, scraped_at (all optional).
+
+    Returns:
+        True on success, False on error.
+    """
+    if not product_id:
+        print("[db.save_star_rating_delivery] No product_id — skipping")
+        return False
+
+    conn = create_connection()
+    try:
+        conn.execute("""
+            INSERT INTO product_details
+                (product_id, star_rating, delivery, price, quantity, ship_country, url)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(product_id) DO UPDATE SET
+                star_rating  = excluded.star_rating,
+                delivery     = excluded.delivery,
+                price        = excluded.price,
+                quantity     = excluded.quantity,
+                ship_country = excluded.ship_country,
+                url          = excluded.url,
+                scraped_at   = CURRENT_TIMESTAMP
+        """, (
+            str(product_id),
+            data.get("rating"),
+            data.get("delivery"),
+            data.get("price"),
+            data.get("quantity"),
+            data.get("ship_country"),
+            data.get("url"),
+        ))
+        conn.commit()
+        print(f"[db] product_details saved (product_id={product_id})")
+        return True
+    except Exception as exc:
+        print(f"[db] save_star_rating_delivery error: {exc}")
+        return False
+    finally:
+        conn.close()
+
+
+def get_product_details(product_id: str) -> Optional[dict]:
+    """
+    Return stored star-rating/delivery data for a product ID, or None.
+    """
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM product_details WHERE product_id = ?",
+            (str(product_id),),
+        ).fetchone()
+        return dict(row) if row else None
+    except Exception as exc:
+        print(f"[db] get_product_details error: {exc}")
+        return None
+    finally:
+        conn.close()
+
+
+def get_all_product_details(limit: int = 100) -> list:
+    """Return all rows from product_details ordered by most recent."""
+    conn = create_connection()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM product_details ORDER BY scraped_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        print(f"[db] get_all_product_details error: {exc}")
+        return []
     finally:
         conn.close()
 
