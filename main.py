@@ -110,7 +110,21 @@ SELLER_FIELDS = [
 # =============================================================================
 # PYDANTIC MODELS
 # =============================================================================
-
+class ProductDetailsRequest(BaseModel):
+    product_ids: List[str]
+ 
+    class Config:
+        json_schema_extra = {
+            "example": {"product_ids": ["1005010388288135", "1005006395261235"]}
+        }
+ 
+ 
+class BulkVariantRequest(BaseModel):
+    force_rescrape: bool = False
+ 
+    class Config:
+        json_schema_extra = {"example": {"force_rescrape": False}}
+      
 class ProductURLRequest(BaseModel):
     url: str
     extract_compliance: bool = True
